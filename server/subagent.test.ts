@@ -187,6 +187,10 @@ test('user-env mode accepts an existing key and the override prevents registry w
   process.env.ASTRA_API_KEY = previous; writeAstraUserEnvKey('must-not-be-written'); assert.equal(readAstraUserEnvKey(), previous);
   const f = subagentPaths(); const result = await api('subagent/apply', { targets: ['claude-code'], keyStorage: 'user-env' });
   assert.equal(result.status.config.keySource, 'user-env'); assert.equal(result.status.userEnvHasKey, true);
+  for (const route of ['preview-diff', 'apply', 'test']) {
+    const custom = { baseUrl: 'https://other.invalid' };
+    await api('subagent/' + route, route === 'test' ? { ...custom, testUpstream: true } : { ...custom, targets: ['cursor'], keepExistingKey: false }, 400);
+  }
   assert.equal(doc(f.claudeMcp).mcpServers[name].env.ASTRA_API_KEY, process.platform === 'win32' ? undefined : previous);
   const applied = await api('subagent/apply', { targets: [...ids], keyStorage: 'user-env', apiKey: secret }); noSecrets(applied, previous, secret);
   if (process.platform === 'win32') for (const h of applied.status.harnesses) { assert.ok(!read(h.mcpPath).includes('ASTRA_API_KEY')); assert.ok(!h.snippet.includes(secret)); }
@@ -228,6 +232,45 @@ test('saved provider inheritance, real MCP handshake and optional read-only upst
   upstream = async () => json({ error: secret }, 403); const denied = await api('subagent/test', { testUpstream: true }); assert.equal(denied.ok, false); assert.equal(denied.upstreamOk, false); noSecrets(denied, secret);
   const bad = await api('subagent/test', { pythonPath: path.join(home, 'missing', 'python') }); assert.ok(!bad.ok && bad.error); assert.equal(bad.toolsCount, 0);
   await api('subagent/test', { baseUrl: 'https://other.invalid', testUpstream: true }, 400);
+});
+
+test('custom model probes use the versioned prefix, protocol header and supplied key before deployment', async () => {
+  const cases = [
+    ['openai-chat', 'https://ark.cn-beijing.volces.com/api/v3', '/api/v3/models', 'authorization'],
+    ['openai-responses', 'https://ark.cn-beijing.volces.com/api/v3/CHAT/completions/', '/api/v3/models', 'authorization'],
+    ['anthropic-messages', 'https://open.bigmodel.cn/api/paas/v4/messages', '/api/paas/v4/models', 'x-api-key'],
+    ['openai-chat', 'https://relay.invalid', '/v1/models', 'authorization'],
+    ['openai-responses', 'https://relay.invalid/proxy/responses', '/proxy/v1/models', 'authorization'],
+    ['anthropic-messages', 'https://relay.invalid/proxy/V2beta1', '/proxy/V2beta1/models', 'x-api-key'],
+    ['gemini-native', 'https://generativelanguage.googleapis.com/V1BETA/', '/v1beta/models', 'x-goog-api-key'],
+  ];
+  for (const [protocol, baseUrl, models, header] of cases) {
+    const calls: string[] = [];
+    upstream = async (u, init) => {
+      calls.push(String(u)); assert.equal(new Headers(init?.headers).get(header), header === 'authorization' ? `Bearer ${secret}` : secret);
+      return json(protocol === 'gemini-native' ? { models: [] } : { data: [] });
+    };
+    const result = await api('subagent/test', { protocol, baseUrl, apiKey: secret, testUpstream: true });
+    assert.deepEqual(calls, [new URL(baseUrl).origin + models]); assert.equal(result.upstreamOk, true); noSecrets(result, secret);
+  }
+  assert.equal(runtime.db.state('subagent').apiKey, '');
+});
+
+test('switching a saved provider to a manual third-party endpoint writes only its new connection settings', async () => {
+  const provider = runtime.db.createProvider({ appType: 'codex', protocol: 'openai-responses', name: 'Saved', baseUrl: 'https://original.invalid', apiKey: previous });
+  const target = { targets: ['cursor'], keyStorage: 'mcp-env' };
+  for (const [protocol, baseUrl] of [
+    ['openai-chat', 'https://api.deepseek.com/v1'], ['openai-responses', 'https://relay.invalid/api/v3/responses'],
+    ['anthropic-messages', 'https://relay.invalid/proxy/v2'], ['gemini-native', 'https://generativelanguage.googleapis.com/v1beta'],
+  ]) {
+    await api('subagent/apply', { ...target, providerId: provider.id });
+    const request = { ...target, protocol, baseUrl, apiKey: secret, model: 'my-custom:8b' };
+    noSecrets(await api('subagent/preview-diff', request), previous, secret);
+    const { status } = await api('subagent/apply', request); noSecrets(status, previous, secret);
+    const c = status.config, e = doc(subagentPaths().cursorMcp).mcpServers[name].env;
+    assert.deepEqual([c.keySource, c.providerId, c.groupId, c.keyId], ['manual', null, null, null]);
+    assert.deepEqual([e.ASTRA_BASE_URL, e.ASTRA_PROTOCOL, e.ASTRA_API_KEY, e.ASTRA_MODEL], [baseUrl, protocol, secret, request.model]);
+  }
 });
 
 test('clearing the saved Python path tests and deploys using automatic detection', async () => {

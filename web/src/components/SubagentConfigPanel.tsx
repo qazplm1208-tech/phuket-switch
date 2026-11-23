@@ -1,22 +1,35 @@
-import { useState } from 'react';
-import { ChevronDown, ChevronUp, LogIn } from 'lucide-react';
+import { useId, useLayoutEffect, useRef, useState } from 'react';
+import { ChevronDown, ChevronUp, Eye, EyeOff, KeyRound, LogIn } from 'lucide-react';
 import { allowedGroupModels, MODEL_SLUG, providerModelNames } from '@shared/constants';
 import { subagentProtocols, type PhuketApiKeyView, type PhuketGroup, type ProviderView, type SubagentStatus } from '@shared/types';
 import { appName } from '../lib/display';
-import { fallbacks, groupDefaults, maskOnly, protocols, providerDefaults, triggerTokenHint, type Draft } from '../lib/subagent';
+import { endpointPresets, fallbacks, groupDefaults, maskOnly, needsOriginKey, origin, protocols, providerDefaults, resolvedEndpointPreview, triggerTokenHint, type Draft } from '../lib/subagent';
 import { useStudio } from '../lib/studio';
-import { Btn, Choices, Disclosure, Empty, Field, Notice, Section, Toggle } from './ui';
+import { Btn, Choices, Disclosure, Empty, Field, IconBtn, Notice, Section, Toggle } from './ui';
+
+function SecretField({ label, hint, secret, setSecret }: { label: string; hint?: string; secret: string; setSecret: (v: string) => void }) {
+  const [visible, setVisible] = useState(false), input = useRef<HTMLInputElement>(null), hintId = useId();
+  // Sync the live input property without copying the key into a serializable HTML attribute.
+  useLayoutEffect(() => { if (input.current && input.current.value !== secret) input.current.value = secret; }, [secret]);
+  return <div className="subagent-secret-field">
+    <Field label={label}><input ref={input} type={visible ? 'text' : 'password'} autoComplete="off" spellCheck={false} maxLength={16384}
+      placeholder="输入密钥" aria-describedby={hint ? hintId : undefined} onChange={e => setSecret(e.target.value)} /></Field>
+    <IconBtn icon={visible ? EyeOff : Eye} label={`${visible ? '隐藏' : '显示'}${label}`} aria-pressed={visible} onClick={() => setVisible(v => !v)} />
+    {hint && <small id={hintId}>{hint}</small>}
+  </div>;
+}
 
 const sources = [['provider','已有供应商'], ['phuket-group','PhuketAI 分组'], ['manual','手动 / 环境变量']] as const;
 interface Props {
   d: Draft; status: SubagentStatus; edit: (patch: Partial<Draft>) => void; busy: boolean;
   groups: PhuketGroup[]; activeKeys: PhuketApiKeyView[]; groupsLoading: boolean; keysLoading: boolean;
   groupsError: boolean; keysError: boolean; reloadGroups: () => void; reloadKeys: () => void;
-  provider?: ProviderView; group?: PhuketGroup; setSecret: (key: string) => void; secretEpoch: number;
+  provider?: ProviderView; group?: PhuketGroup; secret: string; setSecret: (key: string) => void; secretEpoch: number;
 }
-export default function SubagentConfigPanel({ d, status, edit, busy, groups, activeKeys, groupsLoading, keysLoading, groupsError, keysError, reloadGroups, reloadKeys, provider, group, setSecret, secretEpoch }: Props) {
+export default function SubagentConfigPanel({ d, status, edit, busy, groups, activeKeys, groupsLoading, keysLoading, groupsError, keysError, reloadGroups, reloadKeys, provider, group, secret, setSecret, secretEpoch }: Props) {
   const s = useStudio(), providers = s.providers.data ?? [], [allModels, setAllModels] = useState(false);
-  const picks = [...new Set([...(d.source === 'provider' && provider ? providerModelNames(provider) : d.source === 'phuket-group' ? allowedGroupModels(group) : []), ...fallbacks[d.protocol]])].filter(m => MODEL_SLUG.test(m));
+  const originKey = needsOriginKey(d, status, provider), endpoint = resolvedEndpointPreview(d.baseUrl, d.protocol, d.model);
+  const picks = [...new Set([...(originKey ? [] : d.source === 'provider' && provider ? providerModelNames(provider) : d.source === 'phuket-group' ? allowedGroupModels(group) : []), ...fallbacks[d.protocol]])].filter(m => MODEL_SLUG.test(m));
   const source = (v: Draft['source']) => {
     if (v === d.source) return;
     const p = provider ?? providers.find(p => p.isCurrent) ?? providers[0], g = group ?? groups[0];
@@ -58,11 +71,25 @@ export default function SubagentConfigPanel({ d, status, edit, busy, groups, act
           <option value="saved" disabled={!status.config.maskedKey}>沿用已保存密钥{status.config.maskedKey ? ` · ${maskOnly(status.config.maskedKey)}` : '（未配置）'}</option>
           <option value="env" disabled={!status.userEnvHasKey}>使用 ASTRA_API_KEY 环境变量{status.userEnvHasKey ? '' : '（未配置）'}</option><option value="new">输入新的 API 密钥</option>
         </select></Field>
-        {d.manual === 'new' && <Field label="API 密钥"><input key={secretEpoch} type="password" autoComplete="off" spellCheck={false} maxLength={16384} placeholder="输入密钥" onChange={e => setSecret(e.target.value)} /></Field>}
+        {d.manual === 'new' && <SecretField key={secretEpoch} label="API 密钥" secret={secret} setSecret={setSecret} />}
       </div>}
       <div className="form-grid subagent-model-fields">
         <Field label="接口协议"><select value={d.protocol} onChange={e => edit({ protocol: e.target.value as Draft['protocol'] })}>{subagentProtocols.map(p => <option value={p} key={p}>{protocols[p][0]} ({protocols[p][1]})</option>)}</select></Field>
-        <Field label="接口 Base URL"><input className="mono" type="text" inputMode="url" spellCheck={false} maxLength={4096} value={d.baseUrl} placeholder="http://127.0.0.1:15722" onChange={e => edit({ baseUrl: e.target.value })} /></Field>
+        <div className="subagent-endpoint">
+          <Field label="接口 Base URL"><input className="mono" type="text" inputMode="url" spellCheck={false} maxLength={4096} value={d.baseUrl} placeholder="http://127.0.0.1:15722" onChange={e => edit({ baseUrl: e.target.value })} /></Field>
+          <div className="subagent-chips" role="group" aria-label="接口地址预设">{endpointPresets.map(({ label, baseUrl, protocol }) =>
+            <button type="button" key={label} className="subagent-chip" aria-pressed={d.baseUrl.trim() === baseUrl && (!protocol || protocol === d.protocol)}
+              onClick={() => edit({ baseUrl, protocol: protocol ?? d.protocol })}>{label}</button>)}</div>
+          {endpoint && <small>实际请求：<code>{endpoint}</code></small>}
+          {originKey && <div className="subagent-origin-key">
+            <SecretField key={secretEpoch} label="新地址 API 密钥" secret={secret} setSecret={setSecret}
+              hint={`已切换为其他 API 地址（${origin(d.baseUrl.trim())}），请填写对应的 API 密钥；部署与探测将直接使用此密钥，不会将原地址密钥发往新接口。`} />
+            {d.keyStorage === 'user-env' && status.harnesses.some(h => h.installed && !d.targets.includes(h.id)) && <div className="subagent-storage-hint">
+              <small>还有已部署的客户端未选中。独立存储可避免更改它们共用的 Windows 环境变量。</small>
+              <Btn kind="ghost" icon={KeyRound} onClick={() => edit({ keyStorage: 'mcp-env' })}>改用独立 MCP 密钥存储（mcp-env）</Btn>
+            </div>}
+          </div>}
+        </div>
         <div className="subagent-model-choice"><Field label="默认子代理模型"><input className="mono" value={d.model} maxLength={256} spellCheck={false} placeholder="输入模型标识" onChange={e => edit({ model: e.target.value })} /></Field>
           <div className="subagent-chips" aria-label="推荐模型">{(allModels ? picks : picks.slice(0, 6)).map(m => <button type="button" key={m} className="subagent-chip mono" aria-pressed={d.model === m} onClick={() => edit({ model: m })}>{m}</button>)}
             {picks.length > 6 && <Btn kind="ghost" icon={allModels ? ChevronUp : ChevronDown} aria-expanded={allModels} onClick={() => setAllModels(!allModels)}>{allModels ? '收起' : `更多（${picks.length - 6}）`}</Btn>}
@@ -89,7 +116,7 @@ export default function SubagentConfigPanel({ d, status, edit, busy, groups, act
         <div className="subagent-advanced">
           <div className="spread"><div><b>允许单次任务覆写模型</b><small className="subagent-path">ASTRA_ALLOW_MODEL_OVERRIDE</small></div><Toggle label="允许单次任务覆写模型" on={d.allowModelOverride} change={() => edit({ allowModelOverride: !d.allowModelOverride })} /></div>
           <div className="spread"><b>同步写入分工规则 / 系统提示词</b><Toggle label="同步写入分工规则 / 系统提示词" on={d.writeRules} change={() => edit({ writeRules: !d.writeRules })} /></div>
-          <Field label="密钥存储方式" hint={d.keyStorage === 'user-env' ? 'Windows 上不向配置文件写入密钥；其他系统将使用客户端 MCP 环境变量。' : '客户端配置将包含密钥，请妥善保管配置和备份。'}><select value={d.keyStorage} onChange={e => { const keyStorage = e.target.value as Draft['keyStorage']; edit({ keyStorage, ...(d.manual === 'env' && keyStorage === 'mcp-env' ? { manual: status.config.maskedKey ? 'saved' : 'new' } : {}) }); }}>
+          <Field label="密钥存储方式" hint={d.keyStorage === 'user-env' ? 'Windows 上不向配置文件写入密钥；其他系统将使用客户端 MCP 环境变量。' : '客户端配置将包含密钥，请妥善保管配置和备份。'}><select value={d.keyStorage} onChange={e => { const keyStorage = e.target.value as Draft['keyStorage']; edit({ keyStorage, ...(!originKey && d.source === 'manual' && d.manual === 'env' && keyStorage === 'mcp-env' ? { manual: status.config.maskedKey ? 'saved' : 'new' } : {}) }); }}>
             <option value="user-env">Windows 用户环境变量 ASTRA_API_KEY（推荐）</option><option value="mcp-env">写入各客户端 MCP 环境变量（独立 / 跨平台）</option>
           </select></Field>
           <Field label="自定义 Python 解释器路径"><input className="mono" spellCheck={false} value={d.pythonPath} maxLength={4096} placeholder="留空自动检测" onChange={e => edit({ pythonPath: e.target.value })} /></Field>

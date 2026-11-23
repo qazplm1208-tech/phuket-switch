@@ -1,10 +1,20 @@
-import { allowedGroupModels, defaultBaseUrlForApp, MODEL_SLUG, PHUKET_BASE_URL, pickRecommendedModel } from '@shared/constants';
+import { allowedGroupModels, defaultBaseUrlForApp, DEFAULT_PROXY_PORT, MODEL_SLUG, PHUKET_BASE_URL, PHUKET_GPT_BASE_URL, pickRecommendedModel } from '@shared/constants';
+import { parseSubagentBase, subagentApiRoot } from '@shared/subagentEndpoint';
 import type { ApplySubagentRequest, PhuketApiKeyView, PhuketGroup, ProviderView, SubagentConfig, SubagentHarnessId, SubagentProtocol, SubagentStatus, SubagentTestRequest } from '@shared/types';
 
 export const protocols: Record<SubagentProtocol, readonly [string, string]> = {
   'openai-responses': ['OpenAI Responses', '/v1/responses'], 'openai-chat': ['OpenAI Chat', '/v1/chat/completions'],
   'anthropic-messages': ['Anthropic Messages', '/v1/messages'], 'gemini-native': ['Gemini 原生', '/v1beta/models'],
 };
+export const endpointPresets: ReadonlyArray<{ label: string; baseUrl: string; protocol?: SubagentProtocol }> = [
+  { label: 'PhuketAI', baseUrl: PHUKET_GPT_BASE_URL },
+  { label: 'OpenAI', baseUrl: 'https://api.openai.com/v1', protocol: 'openai-responses' },
+  { label: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', protocol: 'openai-chat' },
+  { label: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1', protocol: 'openai-chat' },
+  { label: 'Anthropic', baseUrl: 'https://api.anthropic.com', protocol: 'anthropic-messages' },
+  { label: 'Gemini', baseUrl: 'https://generativelanguage.googleapis.com', protocol: 'gemini-native' },
+  { label: '本地代理', baseUrl: `http://127.0.0.1:${DEFAULT_PROXY_PORT}` },
+];
 export const fallbacks: Record<SubagentProtocol, string[]> = {
   'openai-responses': ['gpt-6.2-astra', 'gpt-6.2-sol'], 'openai-chat': ['deepseek-reasoner', 'deepseek-chat', 'gpt-6.2-sol'],
   'anthropic-messages': ['claude-opus-4-6', 'claude-sonnet-4-6'], 'gemini-native': ['gemini-2.5-pro', 'gemini-2.5-flash'],
@@ -33,7 +43,26 @@ export function groupDefaults(g: PhuketGroup): Partial<Draft> {
     model: pickRecommendedModel(allowedGroupModels(g), g.protocol) ?? fallbacks[g.protocol][0] };
 }
 export function origin(value: string) {
-  try { const u = new URL(value); return /^https?:$/.test(u.protocol) && !u.username && !u.password && !/[\s\\?#]/.test(value) ? u.origin : ''; } catch { return ''; }
+  return parseSubagentBase(value)?.origin ?? '';
+}
+export function resolvedEndpointPreview(baseUrl: string, protocol: SubagentProtocol, model: string) {
+  const base = parseSubagentBase(baseUrl.trim());
+  if (!base) return '';
+  const root = subagentApiRoot(base, protocol);
+  if (protocol === 'gemini-native') {
+    if (!MODEL_SLUG.test(model.trim())) return '';
+    return `${root}/models/${encodeURIComponent(model.trim()).replace(/%3A/g, ':')}:generateContent`;
+  }
+  return root + { 'openai-responses': '/responses', 'openai-chat': '/chat/completions', 'anthropic-messages': '/messages' }[protocol];
+}
+export function boundOrigin(d: Draft, status: SubagentStatus, provider?: ProviderView) {
+  if (d.source === 'provider') return provider ? origin(provider.baseUrl) : '';
+  if (d.source === 'phuket-group') return origin(PHUKET_BASE_URL);
+  return d.manual === 'new' ? '' : origin(status.config.baseUrl);
+}
+export function needsOriginKey(d: Draft, status: SubagentStatus, provider?: ProviderView) {
+  const bound = boundOrigin(d, status, provider), destination = origin(d.baseUrl.trim());
+  return !!bound && !!destination && destination !== bound;
 }
 export function endpointIssue(d: Draft) {
   if (!MODEL_SLUG.test(d.model.trim())) return '请输入有效的模型标识，可包含字母、数字和 . _ : / @ -。';
@@ -41,18 +70,18 @@ export function endpointIssue(d: Draft) {
   return '';
 }
 export function sourceIssue(d: Draft, s: SubagentStatus, key: string, logged: boolean, p?: ProviderView, g?: PhuketGroup, keys: PhuketApiKeyView[] = []) {
-  let bound: string | undefined;
-  if (d.source === 'provider') { if (!p) return '请选择已有供应商。'; bound = p.baseUrl; }
+  const validKey = /^[\x21-\x7e]{1,16384}$/.test(key.trim());
+  if (needsOriginKey(d, s, p)) return validKey ? '' : '已切换为其他 API 地址，请填写该地址对应的 API 密钥。';
+  if (d.source === 'provider') { if (!p) return '请选择已有供应商。'; }
   else if (d.source === 'phuket-group') {
     if (!logged) return '请先登录 PhuketAI，再选择分组密钥。';
     if (!g?.protocol) return '请选择支持推理的分组。';
     if (d.keyChoice.startsWith('key:') && !keys.some(k => d.keyChoice === `key:${k.id}`)) return '所选密钥不在此分组的可用列表中，请重新选择。';
-    bound = PHUKET_BASE_URL;
   } else if (d.manual === 'new') {
-    if (!/^[\x21-\x7e]{1,16384}$/.test(key.trim())) return '请输入有效的 API 密钥，或切换凭据来源。';
-  } else if (d.manual === 'saved') { if (!s.config.maskedKey) return '尚未保存密钥。'; bound = s.config.baseUrl; }
+    if (!validKey) return '请输入有效的 API 密钥，或切换凭据来源。';
+  } else if (d.manual === 'saved') { if (!s.config.maskedKey) return '尚未保存密钥。'; }
   else if (!s.userEnvHasKey || d.keyStorage !== 'user-env') return '请配置用户环境变量 ASTRA_API_KEY，或改用手动密钥。';
-  return bound && origin(d.baseUrl.trim()) !== origin(bound) ? '基础地址的来源已改变。请改为手动填写与新地址匹配的密钥。' : '';
+  return '';
 }
 function inRange(raw: string, min: number, max: number) {
   return raw.trim() !== '' && Number.isInteger(+raw) && +raw >= min && +raw <= max;
@@ -69,26 +98,31 @@ export function triggerTokenHint(d: Draft) {
   return requested < 5584 ? '受运行时下限限制，达到 5,584 词元时自动兜底压缩。'
     : `达到 ${d.compactTriggerPct}%（约 ${requested.toLocaleString('zh-CN')} 词元）时自动兜底压缩。`;
 }
-export function buildRequest(d: Draft, key: string): ApplySubagentRequest {
-  const source = d.source === 'provider' ? { providerId: d.providerId } : d.source === 'phuket-group' ? { groupId: Number(d.groupId),
-    ...(d.keyChoice === 'create' ? { autoCreatePhuketKey: true } : d.keyChoice.startsWith('key:') ? { phuketKeyId: Number(d.keyChoice.slice(4)) } : {}) }
-    : d.manual === 'new' ? { apiKey: key.trim() } : { keepExistingKey: d.manual === 'saved' };
+function usesManualKey(d: Draft, status: SubagentStatus, provider?: ProviderView) {
+  return (d.source === 'manual' && d.manual === 'new') || needsOriginKey(d, status, provider);
+}
+export function buildRequest(d: Draft, key: string, status: SubagentStatus, provider?: ProviderView): ApplySubagentRequest {
+  const source = usesManualKey(d, status, provider) ? { apiKey: key.trim() } : d.source === 'provider' ? { providerId: d.providerId }
+    : d.source === 'phuket-group' ? { groupId: Number(d.groupId),
+      ...(d.keyChoice === 'create' ? { autoCreatePhuketKey: true } : d.keyChoice.startsWith('key:') ? { phuketKeyId: Number(d.keyChoice.slice(4)) } : {}) }
+    : { keepExistingKey: d.manual === 'saved' };
   return { ...source, protocol: d.protocol, baseUrl: d.baseUrl.trim(), model: d.model.trim(), reasoningEffort: d.reasoningEffort, defaultMode: d.defaultMode,
     enableChunkCompaction: d.enableChunkCompaction, compactTriggerPct: Number(d.compactTriggerPct), compactKeepRecentGroups: Number(d.compactKeepRecentGroups),
     maxContextTokens: Number(d.context), allowModelOverride: d.allowModelOverride, keyStorage: d.keyStorage, writeRules: d.writeRules,
     pythonPath: d.pythonPath.trim(), customInstructions: d.customInstructions.trim(), targets: [...d.targets] };
 }
-export function probeIssue(d: Draft, status: SubagentStatus, sourceError: string) {
-  if (sourceError) return sourceError;
+export function probeIssue(d: Draft, status: SubagentStatus, sourceError: string, provider?: ProviderView) {
+  if (sourceError || needsOriginKey(d, status, provider)) return sourceError;
   const c = status.config;
   if (d.source === 'phuket-group' && !(c.keySource === 'phuket-group' && c.groupId === Number(d.groupId) && c.maskedKey && d.keyChoice !== 'create' && (d.keyChoice === 'auto' || d.keyChoice === `key:${c.keyId}`))) return '部署所选分组密钥后可探测上游。';
   if (d.source === 'manual' && d.manual === 'env' && (c.keyStorage !== 'user-env' || (c.maskedKey && c.keySource !== 'user-env') || origin(c.baseUrl) !== origin(d.baseUrl.trim()))) return '部署环境变量配置后可探测上游。';
   return '';
 }
-export function testRequest(d: Draft, key: string, testUpstream: boolean): SubagentTestRequest {
+export function testRequest(d: Draft, key: string, testUpstream: boolean, status: SubagentStatus, provider?: ProviderView): SubagentTestRequest {
+  const manualKey = usesManualKey(d, status, provider);
   return { pythonPath: d.pythonPath.trim(), model: d.model.trim(), protocol: d.protocol, baseUrl: d.baseUrl.trim(), testUpstream,
-    ...(d.source === 'provider' && d.providerId ? { providerId: d.providerId } : {}),
-    ...(testUpstream && d.source === 'manual' && d.manual === 'new' ? { apiKey: key.trim() } : {}) };
+    ...(!manualKey && d.source === 'provider' && d.providerId ? { providerId: d.providerId } : {}),
+    ...(testUpstream && manualKey ? { apiKey: key.trim() } : {}) };
 }
 export const maskOnly = (s?: string) => !s ? '' : /\*{2,}|•{2,}|\.{3}|…|\[REDACTED\]/i.test(s) ? s : '••••';
 export function safePreview(text: string, secret: string) {

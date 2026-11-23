@@ -9,7 +9,7 @@ import { ms, supportedGroup, systemNote, time } from '../lib/display';
 import { useAction, useFeedback } from '../lib/feedback';
 import { useResource } from '../lib/resource';
 import { useStudio } from '../lib/studio';
-import { buildRequest, compactionIssue, draftFrom, endpointIssue, harnessName, maskOnly, probeIssue, protocols, sourceIssue, sourceNames, testRequest, type Draft } from '../lib/subagent';
+import { buildRequest, compactionIssue, draftFrom, endpointIssue, harnessName, maskOnly, origin, probeIssue, protocols, sourceIssue, sourceNames, testRequest, type Draft } from '../lib/subagent';
 
 function actionError(error: unknown) {
   if (error instanceof ApiFailure) {
@@ -63,11 +63,12 @@ function Editor({ status, replace, stale, loading, reload, groups, keys }: { sta
   const endpointError = endpointIssue(d), sourceError = sourceIssue(d, status, secret, logged, p, g, activeKeys);
   const invalid = endpointError || sourceError || compactionIssue(d) ||
     (d.customInstructions.includes('PHUKET_SWITCH_SUBAGENT_') ? '补充指令不能包含配置管理标记。' : '') || (!d.targets.length ? '请选择要部署的客户端。' : '');
-  const probeHint = probeIssue(d, status, sourceError), pythonReady = status.python.meetsMinimum && status.python.available;
+  const probeHint = probeIssue(d, status, sourceError, p), pythonReady = status.python.meetsMinimum && status.python.available;
   const pythonIssue = !pythonReady && d.pythonPath.trim() === (c.pythonPath || '') ? '部署前请先配置 Python 3.10+。' : '';
   function clearSecret() { setSecret(''); bumpSecret(i => i + 1); }
   function edit(patch: Partial<Draft>) {
-    if ((patch.source && patch.source !== d.source) || (patch.manual && patch.manual !== d.manual)) { clearSecret(); setProbe(false); }
+    const changedOrigin = patch.baseUrl !== undefined && origin(patch.baseUrl.trim()) !== origin(d.baseUrl.trim());
+    if (changedOrigin || (patch.source && patch.source !== d.source) || (patch.manual && patch.manual !== d.manual)) { clearSecret(); setProbe(false); }
     setEdited({ ...d, ...patch }); setResult(null); setFailure('');
   }
   function refresh() { reload(); groups.reload(); if (logged) keys.reload(); s.providers.reload(); setResult(null); }
@@ -98,7 +99,7 @@ function Editor({ status, replace, stale, loading, reload, groups, keys }: { sta
         <Metric label="分块压缩" value={c.enableChunkCompaction ? `已开启 · ${c.compactTriggerPct}% 兜底` : `仅自动压缩 · ${c.compactTriggerPct}%`}/>
         <Metric label="凭据来源" value={<>{sourceNames[c.keySource]}<small>{maskOnly(c.maskedKey) || (status.userEnvHasKey ? '环境变量已配置' : '未配置密钥')}</small></>}/><Metric label="已部署客户端" value={`${installed.length} / ${status.harnesses.length}`}/><Metric label="最近更新" value={c.updatedAt ? time(c.updatedAt, true) : '尚未部署'}/></div>
       <div className="subagent-test-actions"><Btn icon={PlugZap} busy={pending === 'test'} disabled={busy || !!endpointError} onClick={() => action('test', async () => {
-        const r = await api.testSubagent(testRequest(d, secret, probe && !probeHint)); if (alive.current) setResult(r);
+        const r = await api.testSubagent(testRequest(d, secret, probe && !probeHint, status, p)); if (alive.current) setResult(r);
       })}>验证子代理</Btn>
         <label className="check"><input type="checkbox" checked={probe && !probeHint} disabled={busy || !!probeHint} onChange={e => { setProbe(e.target.checked); setResult(null); }} />同时探测上游模型列表</label>
         {probeHint && <small>{probeHint}</small>}
@@ -106,12 +107,12 @@ function Editor({ status, replace, stale, loading, reload, groups, keys }: { sta
       {result && <ResultPanel r={result}/>}
     </section>
     <SubagentConfigPanel d={d} status={status} edit={edit} busy={busy} groups={rows} activeKeys={activeKeys} groupsLoading={groups.loading} keysLoading={keys.loading}
-      groupsError={!!groups.error} keysError={!!keys.error} reloadGroups={groups.reload} reloadKeys={keys.reload} provider={p} group={g} setSecret={v => { setSecret(v); setResult(null); setFailure(''); }} secretEpoch={secretEpoch} />
+      groupsError={!!groups.error} keysError={!!keys.error} reloadGroups={groups.reload} reloadKeys={keys.reload} provider={p} group={g} secret={secret} setSecret={v => { setSecret(v); setResult(null); setFailure(''); }} secretEpoch={secretEpoch} />
     <HarnessPanel status={status} draft={d} select={targets => edit({ targets })} snippet={setSnippet} remove={remove} busy={busy}/>
     <footer className="subagent-footer"><div className="subagent-footer-state" role="status">{failure || invalid || pythonIssue || (edited ? '有尚未部署的更改' : `已选择 ${d.targets.length} 个客户端`)}</div>
       <div className="actions">{removable.length > 0 && <Btn kind="ghost" className="danger-hover" icon={Trash2} disabled={busy} onClick={() => remove(removable.map(h => h.id))}>移除全部已部署</Btn>}
-        <Btn icon={FileDiff} busy={pending === 'preview'} disabled={busy || !!invalid} onClick={() => action('preview', async () => { const request = buildRequest(d, secret); const diff = await api.previewSubagent(request); if (alive.current) setPreview({ diff, request }); })}>预览变更 Diff</Btn>
-        <Btn kind="primary" icon={CheckCheck} busy={pending === 'apply'} disabled={busy || !!(invalid || pythonIssue)} onClick={() => apply(buildRequest(d, secret))}>部署到所选客户端（{d.targets.length}）</Btn></div>
+        <Btn icon={FileDiff} busy={pending === 'preview'} disabled={busy || !!invalid} onClick={() => action('preview', async () => { const request = buildRequest(d, secret, status, p); const diff = await api.previewSubagent(request); if (alive.current) setPreview({ diff, request }); })}>预览变更 Diff</Btn>
+        <Btn kind="primary" icon={CheckCheck} busy={pending === 'apply'} disabled={busy || !!(invalid || pythonIssue)} onClick={() => apply(buildRequest(d, secret, status, p))}>部署到所选客户端（{d.targets.length}）</Btn></div>
     </footer>
     {snippet && <SnippetDialog h={snippet} secret={secret} close={() => setSnippet(null)} />}
     {preview && <PreviewDialog diff={preview.diff} secret={secret} error={failure} issue={preview.diff.warnings.some(w => w.includes('Python 3.10')) ? '请先检查解释器路径。' : pythonIssue} busy={pending === 'apply'} close={() => setPreview(null)} apply={() => apply(preview.request)} />}

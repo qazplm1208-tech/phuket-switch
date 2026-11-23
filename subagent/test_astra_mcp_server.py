@@ -126,12 +126,36 @@ class AstraTests(unittest.TestCase):
             for base in ['', '/v1', endpoint + '/']:
                 self.assertEqual(astra.build_api_url('https://example.invalid/relay' + base, protocol, 'm'), 'https://example.invalid/relay' + endpoint)
         for base in ['', '/v1', '/v1/responses', '/v1/chat/completions', '/v1/messages', '/v1beta/']:
-            self.assertEqual(astra.build_api_url('https://v1/relay' + base, 'openai-responses', 'm'), 'https://v1/relay/v1/responses')
+            version = 'v1beta' if base == '/v1beta/' else 'v1'
+            self.assertEqual(astra.build_api_url('https://v1/relay' + base, 'openai-responses', 'm'), f'https://v1/relay/{version}/responses')
         for base in ['/v1beta/', '/v1', '']:
             self.assertEqual(astra.build_api_url('https://example.invalid/relay' + base, 'gemini-native', 'acme/m:1'), 'https://example.invalid/relay/v1beta/models/acme%2Fm:1:generateContent')
         for base in ['file:///tmp', 'https://user:password@h', 'https://h/v1?key=bad', 'https://@h', 'https://h/#', 'https://h:bad', 'https://h/\npath']:
             with self.assertRaises(ValueError):
                 astra.build_api_url(base, 'openai-chat', 'm')
+
+    def test_third_party_endpoint_versions_and_pasted_leaves(self):
+        for base, root in [
+            ('https://ark.cn-beijing.volces.com/api/v3', 'https://ark.cn-beijing.volces.com/api/v3'),
+            ('https://ark.cn-beijing.volces.com/api/v3/chat/completions', 'https://ark.cn-beijing.volces.com/api/v3'),
+            ('https://open.bigmodel.cn/api/paas/v4', 'https://open.bigmodel.cn/api/paas/v4'),
+            ('https://dashscope.aliyuncs.com/compatible-mode/v1', 'https://dashscope.aliyuncs.com/compatible-mode/v1'),
+            ('https://openrouter.ai/api/v1', 'https://openrouter.ai/api/v1'),
+            ('https://api.deepseek.com', 'https://api.deepseek.com/v1'),
+            ('https://relay.invalid/proxy/MESSAGES/', 'https://relay.invalid/proxy/v1'),
+            ('https://relay.invalid/V2alpha3/Responses///', 'https://relay.invalid/V2alpha3'),
+            ('https://v2', 'https://v2/v1'),
+        ]:
+            for protocol, leaf in [('openai-chat', '/chat/completions'), ('openai-responses', '/responses'), ('anthropic-messages', '/messages')]:
+                with self.subTest(base=base, protocol=protocol):
+                    self.assertEqual(astra.build_api_url(base, protocol, 'm'), root + leaf)
+
+    def test_gemini_native_version_and_model_path(self):
+        root = 'https://generativelanguage.googleapis.com'
+        for suffix in ['', '/v1', '/v1beta', '/V1BETA/']:
+            with self.subTest(suffix=suffix):
+                self.assertEqual(astra.build_api_url(root + suffix, 'gemini-native', 'org/model:1@tag'),
+                                 root + '/v1beta/models/org%2Fmodel:1%40tag:generateContent')
 
     def request(self, protocol, reply):
         history = [astra.message('one', 'user'), astra.message('two', 'user'), astra.message('checking'), astra.call_item('read_file', {'path': 'notes'}, 'first'),

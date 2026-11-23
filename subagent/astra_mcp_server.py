@@ -131,10 +131,16 @@ def build_api_url(base_url: str, protocol: str, model: str) -> str:
     if url.scheme not in ("http", "https") or not url.hostname or url.username is not None or url.password is not None:
         raise ValueError("Expected an HTTP(S) base URL without credentials or a query.")
     _ = url.port  # Also validate a supplied port.
-    root = re.sub(r"/v1(?:beta|/responses|/chat/completions|/messages)?$", "", url.path.rstrip("/"), flags=re.I)
-    endpoint = {"openai-responses": "/v1/responses", "openai-chat": "/v1/chat/completions", "anthropic-messages": "/v1/messages",
-                "gemini-native": "/v1beta/models/" + quote(model, safe=".-_:") + ":generateContent"}[protocol]
-    return urlunsplit((url.scheme, url.netloc, root + endpoint, "", ""))
+    path = url.path.rstrip("/")
+    if protocol == "gemini-native":
+        root = re.sub(r"/v1(?:beta)?$", "", path, flags=re.I) + "/v1beta"
+        leaf = "/models/" + quote(model, safe=".-_:") + ":generateContent"
+    else:
+        root = re.sub(r"/(?:responses|chat/completions|messages)$", "", path, flags=re.I)
+        if not re.search(r"/v\d+(?:alpha\d*|beta\d*)?$", root, flags=re.I | re.ASCII):
+            root += "/v1"
+        leaf = {"openai-responses": "/responses", "openai-chat": "/chat/completions", "anthropic-messages": "/messages"}[protocol]
+    return urlunsplit((url.scheme, url.netloc, root + leaf, "", ""))
 
 
 def _log_stderr(msg: str) -> None:

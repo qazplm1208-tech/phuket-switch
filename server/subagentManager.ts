@@ -2,7 +2,8 @@ import fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import { allowedGroupModels, canCreateGroupKey, defaultBaseUrlForApp, PHUKET_BASE_URL, pickRecommendedModel } from '../shared/constants.js';
 import { type ApplySubagentRequest, type ApplySubagentResult, type RemoveSubagentRequest, type SubagentDiffPreview, type SubagentStatus, type SubagentTestRequest, type SubagentTestResult } from '../shared/types.js';
-import { ApiError, bad, conflict, elapsed, httpBase, isRecord, now, redactRecognizable, secretField } from './common.js';
+import { parseSubagentBase, subagentApiRoot } from '../shared/subagentEndpoint.js';
+import { ApiError, bad, conflict, elapsed, isRecord, now, redactRecognizable, secretField } from './common.js';
 import { commitFiles, jsonText, managedText, parseJson, subagentPaths, type Plan } from './configFiles.js';
 import { maskApiKey, type SwitchDb } from './db.js';
 import type { PhuketClient } from './phuketClient.js';
@@ -46,7 +47,8 @@ export function getSubagentStatus(db: SwitchDb): SubagentStatus {
   return status;
 }
 function sameOrigin(base: string, credentialBase: string) {
-  if (!httpBase(base) || !httpBase(credentialBase) || new URL(base).origin !== new URL(credentialBase).origin) throw bad('Supply a new manual key when changing the provider origin.');
+  const origin = parseSubagentBase(base)?.origin;
+  if (!origin || origin !== parseSubagentBase(credentialBase)?.origin) throw bad('Supply a new manual key when changing the provider origin.');
 }
 const resetSource = { keyId: null, keyName: '', providerId: null, groupId: null, groupName: '' };
 async function groupCredential(db: SwitchDb, phuket: PhuketClient, req: ApplySubagentRequest, c: StoredConfig, preview: boolean) {
@@ -94,12 +96,13 @@ async function resolveConfig(db: SwitchDb, phuket: PhuketClient, req: ApplySubag
   else if (phuketKeyId || groupId || autoCreatePhuketKey) await groupCredential(db, phuket, req, c, preview);
   else if (keepExistingKey !== false && old.apiKey) sameOrigin(c.baseUrl, old.baseUrl);
   else if (c.keyStorage === 'user-env' && hasAstraUserEnvKey()) {
+    sameOrigin(c.baseUrl, old.baseUrl);
     Object.assign(c, resetSource, { keySource: 'user-env', apiKey: useUserEnv(c) ? '' : readAstraUserEnvKey()! });
   } else if (preview) c.apiKey = mask;
   else throw bad('Choose a provider or supply an API key.');
   // Old saved configurations could exceed the Python runtime's hard context bounds.
   c.maxContextTokens = Math.max(5712, Math.min(272000, c.maxContextTokens));
-  if (!httpBase(c.baseUrl) || (c.apiKey && !/^[\x21-\x7e]{1,16384}$/.test(c.apiKey))) throw bad('Invalid subagent connection settings.');
+  if (!parseSubagentBase(c.baseUrl) || (c.apiKey && !/^[\x21-\x7e]{1,16384}$/.test(c.apiKey))) throw bad('Invalid subagent connection settings.');
   c.maskedKey = maskApiKey(c.apiKey); for (const id of targets) c.targets[id] = true;
   return c;
 }
@@ -141,6 +144,8 @@ export async function testSubagent(db: SwitchDb, req: SubagentTestRequest, send:
   const start = performance.now(), c = db.state('subagent'), p = req.providerId ? db.provider(req.providerId) : null;
   const model = req.model ?? p?.model ?? c.model, protocol = req.protocol ?? p?.protocol ?? c.protocol;
   const python = detectPython(req.pythonPath ?? c.pythonPath), base = req.baseUrl ?? p?.baseUrl ?? c.baseUrl;
+  const parsedBase = parseSubagentBase(base);
+  if (!parsedBase) throw bad('Invalid subagent API base URL.');
   const result: SubagentTestResult = { ok: false, latencyMs: 0, pythonExecutable: python.executable, pythonVersion: python.version, serverVersion: null, toolsCount: 0, tools: [], effectiveModel: model, effectiveProtocol: protocol, testedAt: now() };
   if (!python.meetsMinimum || !python.executable) result.error = python.error;
   else try {
@@ -153,10 +158,10 @@ export async function testSubagent(db: SwitchDb, req: SubagentTestRequest, send:
     result.upstreamOk = null;
     if (key) {
       if (!req.apiKey) sameOrigin(base, p?.baseUrl ?? c.baseUrl);
-      const root = base.replace(/\/+$/, '').replace(/\/v1(?:beta|\/responses|\/chat\/completions|\/messages)?$/i, '');
+      const modelsUrl = subagentApiRoot(parsedBase, protocol) + '/models';
       const headers = new Headers(protocol === 'gemini-native' ? { 'x-goog-api-key': key } : protocol === 'anthropic-messages' ? { 'x-api-key': key, 'anthropic-version': '2023-06-01' } : { authorization: `Bearer ${key}` });
       try {
-        const response = await adaptiveFetch(root + (protocol === 'gemini-native' ? '/v1beta/models' : '/v1/models'), { method: 'GET', headers, redirect: 'error', signal: AbortSignal.timeout(10000) }, send);
+        const response = await adaptiveFetch(modelsUrl, { method: 'GET', headers, redirect: 'error', signal: AbortSignal.timeout(10000) }, send);
         if (!response.ok) { await response.body?.cancel(); result.upstreamError = `Models request returned HTTP ${response.status}.`; result.upstreamOk = false; }
         else {
           const data = JSON.parse((await readBodyBytes(response, 1024 * 1024)).toString());

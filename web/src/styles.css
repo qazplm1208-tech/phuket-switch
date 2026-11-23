@@ -20,6 +20,14 @@
 .subagent-source .segments { flex-wrap: wrap; }
 .subagent-model-fields { padding-top: 12px; border-top: 1px solid var(--divider); }
 .subagent-model-choice, .subagent-model-fields > div { min-width: 0; }
+.subagent-endpoint { display: grid; align-content: start; gap: 6px; }
+.subagent-endpoint .subagent-chips { margin: 0; }
+.subagent-endpoint small, .subagent-secret-field small { color: var(--muted); overflow-wrap: anywhere; }
+.subagent-origin-key { display: grid; gap: 8px; margin-top: 3px; padding-inline-start: 10px; border-inline-start: 2px solid var(--accent); }
+.subagent-secret-field { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 4px; }
+.subagent-secret-field small { grid-column: 1 / -1; }
+.subagent-storage-hint { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.subagent-storage-hint .btn { max-width: 100%; height: auto; min-height: 28px; white-space: normal; }
 .subagent-chips { gap: 5px; margin-top: 6px; }
 .subagent-chip { max-width: 100%; overflow-wrap: anywhere; padding: 2px 7px; border: 1px solid var(--border); border-radius: 5px; background: var(--soft); color: var(--secondary); font-size: 11.5px; }
 .subagent-chip:hover:enabled { border-color: var(--strong-border); }

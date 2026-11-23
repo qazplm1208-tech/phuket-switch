@@ -11,7 +11,7 @@ import { DatabaseSync } from 'node:sqlite';
 import TOML from '@iarna/toml';
 import { effectiveSpeedMode, hybridBase, parseVirtualSpeedModel, resolveRequestSpeedMode } from './fastMode.js';
 import { account as accountView, metadata } from './phuketViews.js';
-import { buildAllFastModelMap, classifyPhuketGroup, defaultBaseUrlForApp, protocolForApp, canCreateGroupKey, isSpeedVariantCandidateModel, isUltraFastGroup, pickRecommendedModel, sortModelsNewestFirst, DEFAULT_GPT_FAST_CONFIG, DEFAULT_PROXY_SETTINGS, FALLBACK_PHUKET_GROUPS, PHUKET_GPT_BASE_URL } from '../shared/constants.js';
+import { APP_VERSION, buildAllFastModelMap, classifyPhuketGroup, defaultBaseUrlForApp, protocolForApp, canCreateGroupKey, isSpeedVariantCandidateModel, isUltraFastGroup, pickRecommendedModel, sortModelsNewestFirst, DEFAULT_GPT_FAST_CONFIG, DEFAULT_PROXY_SETTINGS, FALLBACK_PHUKET_GROUPS, PHUKET_GPT_BASE_URL } from '../shared/constants.js';
 import type { AppType, CreateProviderRequest, GptFastConfig, ModelRouteInput, ModelRouteRule, SpeedMode } from '../shared/types.js';
 import { createManagementApp, createRuntime } from './app.js';
 import { CLAUDE_DESKTOP_PROFILE_ID, CLAUDE_DESKTOP_PROFILE_NAME, cliPaths } from './configFiles.js';
@@ -1536,7 +1536,7 @@ test('password login normalizes full-width email punctuation and preserves ordin
   };
   const result = await api('phuket/login', 'POST', { email: ' \u3000pa\u200bste＠\u3000example.test\ufeff ', password: `\ufeff${password}\u200d\r\n` });
   assert.equal(result.authenticated, true); assert.deepEqual(sent, { email, password });
-  assert.equal(headers?.get('user-agent'), 'PhuketSwitch/1.0.0 (Windows; +https://ai.pukitcore.com)');
+  assert.equal(headers?.get('user-agent'), `PhuketSwitch/${APP_VERSION} (Windows; +https://ai.pukitcore.com)`);
   assert.equal(headers?.get('accept'), 'application/json'); assert.equal(headers?.get('accept-language'), 'zh-CN');
   assert.ok(!JSON.stringify(result).includes(password));
 });
@@ -1581,7 +1581,7 @@ test('non-JSON 403 and 503 login responses show browser and Token login guidance
   }
 });
 
-const phuketDesktopUA = 'PhuketSwitch/1.0.0 (Windows; +https://ai.pukitcore.com)';
+const phuketDesktopUA = `PhuketSwitch/${APP_VERSION} (Windows; +https://ai.pukitcore.com)`;
 const sessionAccount = () => accountView({ id: 38, email: 'refresh@example.test', balance: 5 });
 function seedRefreshSession(remaining = 3_600_000) {
   const s = { token: 'old-access-fixture', refreshToken: 'rt_original_session_fixture', expiresAt: Date.now() + remaining, account: sessionAccount() };
@@ -1961,7 +1961,14 @@ test('current provider and Fast configuration persist across connections, and pr
   try {
     assert.equal(second.current('codex')?.id, p.id); assert.deepEqual(second.state('fastMode'), DEFAULT_GPT_FAST_CONFIG);
     for (let n = 0; n < 1004; n++) second.addLog({ id: `log${n}`, createdAt: new Date(n).toISOString(), appType: 'codex', protocol: 'openai-responses', providerId: p.id, model: 'gpt-test', effectiveModel: 'gpt-test', statusCode: 200, latencyMs: 2, failoverCount: 0 });
-    const page = await api('proxy/logs?limit=1000'); assert.equal(page.total, 1000); assert.equal(page.items[0].id, 'log1003'); assert.equal(page.items.at(-1).id, 'log4');
+    // Windows may reset an idle loopback socket during the inserts. Only replay the read-only GET.
+    const readLogs = () => api('proxy/logs?limit=1000');
+    const page = await readLogs().catch((err: unknown) => {
+      if (!(err instanceof TypeError) || !isRecord(err.cause) || err.cause.code !== 'ECONNRESET') throw err;
+      return readLogs();
+    });
+    assert.equal(page.total, 1000);
+    assert.deepEqual(page.items.map((log: { id: string }) => log.id), Array.from({ length: 1000 }, (_, i) => `log${1003 - i}`));
   } finally { second.close(); }
 });
 

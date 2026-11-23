@@ -8,7 +8,7 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
-const root = path.resolve(import.meta.dirname, '..'), secret = 'opaque-ui-only-credential-93';
+const root = path.resolve(import.meta.dirname, '..'), secret = 'opaque-ui-only-credential-93', customBase = 'https://api.deepseek.com/v1';
 async function host() {
   const scratch = path.join(root, '.desktop'); fs.mkdirSync(scratch, { recursive: true });
   const temp = fs.mkdtempSync(path.join(scratch, 'subagent-ui-')), home = path.join(temp, 'user');
@@ -20,6 +20,7 @@ async function host() {
   const runtime = createRuntime({ fetch: async (u, init) => {
     const url = new URL(String(u)); let value = {};
     if (url.hostname === 'catalog.invalid') { assert.equal(new Headers(init.headers).get('authorization'), 'Bearer fixture-provider-credential'); return Response.json({ data: [] }); }
+    if (url.href === customBase + '/models') { assert.equal(new Headers(init.headers).get('authorization'), `Bearer ${secret}`); return Response.json({ data: [] }); }
     assert.equal(url.origin, 'https://ai.pukitcore.com');
     if (url.pathname.endsWith('/model-plaza') || url.pathname.endsWith('/groups/available')) value = [group];
     if (url.pathname.endsWith('/keys')) value = { items: [exampleKey, { ...exampleKey, id: 19, status: 'inactive' }], total: 2 };
@@ -28,9 +29,9 @@ async function host() {
   } });
   runtime.db.createProvider({ name: '测试供应商', appType: 'codex', protocol: 'openai-responses', baseUrl: 'https://catalog.invalid/v1', apiKey: 'fixture-provider-credential', model: 'provider-model', availableModels: ['provider-other'] });
   const server = http.createServer(createManagementApp(undefined, runtime));
-  const requests = {};
-  server.prependListener('request', (req) => { const route = req.url; if (!['/api/subagent/apply','/api/subagent/preview-diff'].includes(route)) return;
-    let body = ''; req.on('data', b => body += b); req.on('end', () => { requests[route] = JSON.parse(body); }); });
+  const requests = {}, tests = [];
+  server.prependListener('request', req => { const route = req.url; if (!['/api/subagent/apply','/api/subagent/preview-diff','/api/subagent/test'].includes(route)) return;
+    let body = ''; req.on('data', b => body += b); req.on('end', () => { const data = JSON.parse(body); if (route === '/api/subagent/test') tests.push(data); else requests[route] = data; }); });
   let child;
   try {
     server.listen(0, '127.0.0.1'); await once(server, 'listening');
@@ -40,7 +41,12 @@ async function host() {
     assert.deepEqual(requests['/api/subagent/apply'], requests['/api/subagent/preview-diff']);
     assert.equal(requests['/api/subagent/apply'].enableChunkCompaction, false);
     assert.equal(requests['/api/subagent/apply'].compactTriggerPct, 75); assert.equal(requests['/api/subagent/apply'].compactKeepRecentGroups, 0);
-    assert.equal(requests['/api/subagent/apply'].apiKey, secret); assert.equal(requests['/api/subagent/apply'].model, 'my-custom:8b');
+    const applied = requests['/api/subagent/apply'], customTests = tests.filter(t => t.baseUrl === customBase);
+    assert.equal(applied.apiKey, secret); assert.equal(applied.model, 'my-custom:8b'); assert.equal(applied.baseUrl, customBase);
+    assert.deepEqual(customTests.map(t => t.testUpstream), [false, true, true]);
+    assert.ok(!Object.hasOwn(customTests[0], 'apiKey')); assert.ok(customTests.slice(1).every(t => t.apiKey === secret));
+    for (const r of [applied, ...customTests]) for (const field of ['providerId','groupId','phuketKeyId','autoCreatePhuketKey','keepExistingKey']) assert.ok(!Object.hasOwn(r, field));
+    assert.equal(runtime.db.state('subagent').keySource, 'manual');
   } finally {
     if (child && child.exitCode === null && !child.killed) child.kill();
     server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); await runtime.close();
@@ -60,20 +66,39 @@ async function renderer({ app, BrowserWindow, session }) {
       Object.defineProperty(navigator,'clipboard',{configurable:true,value:{writeText:async s=>{window.copied=s}}});void 0`);
   }
   const click = name => js(`btn(${JSON.stringify(name)}).click()`), set = (name,v) => js(`setField(${JSON.stringify(name)},${JSON.stringify(v)})`);
-  const leaks = async () => { assert.ok(!await js(`document.documentElement.outerHTML.includes(${JSON.stringify(secret)})`)); };
+  const leaks = async () => { assert.ok(!await js(`[document.documentElement.outerHTML, JSON.stringify(localStorage), JSON.stringify(sessionStorage)].some(s => s.includes(${JSON.stringify(secret)}))`)); };
+  const probe = async () => {
+    await js("document.querySelector('.subagent-test-actions input').click()"); await click('验证子代理');
+    await wait("document.querySelector('.subagent-result')?.textContent.includes('模型列表可访问')", 'model discovery');
+  };
   try {
     await page(); assert.deepEqual(await js(`[...document.querySelectorAll('.sidebar nav a')].slice(-3).map(x=>x.pathname)`), ['/lab','/subagent','/extensions']);
     await click('验证子代理'); await wait("document.querySelector('.subagent-result')?.textContent.includes('astra_wait_worker')", 'handshake');
     assert.ok(await js("document.querySelector('.subagent-result').textContent.includes('1.4.0')"));
     assert.ok(await js("document.querySelector('.subagent-metrics').textContent.includes('已开启 · 88% 兜底') && document.querySelector('.subagent-compaction').textContent.includes('239,360')"));
     await click('已有供应商'); await wait("field('默认子代理模型').value==='provider-model'", 'provider defaults'); await click('provider-other');
-    await js("document.querySelector('.subagent-test-actions input').click()"); await click('验证子代理'); await wait("document.querySelector('.subagent-result')?.textContent.includes('模型列表可访问')", 'model discovery');
+    await probe();
+    await set('接口 Base URL','https://catalog.invalid:443/relay/v3'); assert.ok(!await js("field('新地址 API 密钥')"));
+    await set('接口 Base URL','https://ark.cn-beijing.volces.com/api/v3/chat/completions/');
+    assert.ok(await js("field('新地址 API 密钥')?.type==='password' && field('新地址 API 密钥').closest('.subagent-endpoint').textContent.includes('实际请求：https://ark.cn-beijing.volces.com/api/v3/responses')"));
+    await set('新地址 API 密钥','first-origin-only'); await click('DeepSeek');
+    assert.ok(await js("field('新地址 API 密钥').value==='' && field('默认子代理模型').value==='provider-other' && field('接口协议').value==='openai-chat'"));
+    await set('新地址 API 密钥','invalid key'); assert.ok(await js("btn('预览变更 Diff').disabled && document.querySelector('.subagent-test-actions input').disabled"));
+    await set('新地址 API 密钥', secret); await click('验证子代理'); await wait("document.querySelector('.subagent-result')?.textContent.includes('未探测')", 'local-only test'); await probe();
     await click('PhuketAI 分组'); await wait("!!btn('登录 PhuketAI')", 'guest login action'); await click('登录 PhuketAI'); await wait("!!document.querySelector('dialog[open]')", 'login dialog'); await js("document.querySelector('dialog[open] button[aria-label=关闭]').click()");
     await js(`fetch('/api/phuket/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:'offline-guest-access'})}).then(r=>{if(!r.ok)throw Error('test login')})`);
-    await page(); await click('PhuketAI 分组'); await wait("!!field('分组密钥')?.querySelector('option[value=\"key:18\"]')", 'group keys');
+    await page(); await set('凭据选择','env'); await set('接口 Base URL', customBase);
+    assert.ok(await js("field('新地址 API 密钥')?.type==='password' && btn('预览变更 Diff').disabled"));
+    await set('凭据选择','new'); await set('API 密钥', secret); await js("document.querySelector('[aria-label=\"显示API 密钥\"]').click()");
+    assert.ok(await js(`field('API 密钥').type==='text' && field('API 密钥').value===${JSON.stringify(secret)}`));
+    await js("document.querySelector('[aria-label=\"隐藏API 密钥\"]').click()"); await leaks();
+    await click('PhuketAI 分组'); await wait("!!field('分组密钥')?.querySelector('option[value=\"key:18\"]')", 'group keys');
     assert.equal(await js("field('默认子代理模型').value"),'gemini-2.5-pro'); assert.ok(!await js("field('分组密钥').querySelector('option[value=\"key:19\"]')!==null"));
-    await set('分组密钥','key:18'); await click('手动 / 环境变量'); await set('凭据选择','new'); await set('API 密钥', secret);
-    await set('接口协议','openai-chat'); await set('接口 Base URL','http://127.0.0.1:15722'); await set('默认子代理模型','my-custom:8b'); await click('128K');
+    await set('分组密钥','key:18'); await set('默认子代理模型','my-custom:8b'); await click('DeepSeek');
+    assert.ok(await js(`field('接口 Base URL').value===${JSON.stringify(customBase)} && field('接口协议').value==='openai-chat' && field('默认子代理模型').value==='my-custom:8b' && field('新地址 API 密钥').value===''`));
+    await set('新地址 API 密钥', secret); await js("document.querySelector('[aria-label=\"显示新地址 API 密钥\"]').click()");
+    assert.equal(await js("field('新地址 API 密钥').type"), 'text'); await js("document.querySelector('[aria-label=\"隐藏新地址 API 密钥\"]').click()");
+    await probe(); await click('128K');
     await click('75%'); await set('分块保留最近交互组','0');
     await js("document.querySelector('[role=switch][aria-label=允许模型自主分块压缩]').click()");
     assert.ok(await js("document.querySelector('.subagent-compaction').textContent.includes('96,000')"));
@@ -92,6 +117,12 @@ async function renderer({ app, BrowserWindow, session }) {
     await js("document.querySelector('[aria-label=\"Codex 配置片段\"]').click()"); await wait("!!document.querySelector('.subagent-snippet')", 'snippet dialog'); await leaks();
     await js("document.querySelector('[aria-label=\"复制MCP 配置\"]').click()"); assert.ok(await js(`window.copied.includes('[REDACTED]') && !window.copied.includes(${JSON.stringify(secret)})`));
     await js("document.querySelector('[aria-label=\"复制分工规则\"]').click()"); assert.ok(await js("window.copied.includes('astra_run_task')")); await js("document.querySelector('dialog button[aria-label=关闭]').click()");
+    assert.equal(await js("field('凭据选择').value"), 'saved');
+    await set('凭据选择','new'); assert.ok(await js("field('API 密钥').value==='' && field('API 密钥').type==='password'")); await set('凭据选择','saved');
+    await click('OpenRouter'); assert.equal(await js("field('新地址 API 密钥')?.value"), '');
+    await set('密钥存储方式','user-env'); await js("document.querySelector('input[aria-label=\"选择 Codex\"]').click()");
+    await set('新地址 API 密钥', 'new-origin-only'); await click('改用独立 MCP 密钥存储（mcp-env）');
+    assert.ok(await js("field('密钥存储方式').value==='mcp-env' && field('新地址 API 密钥').value==='new-origin-only'"));
     await set('默认子代理模型','new-model'); await wait("document.querySelector('.subagent-harness .badge.amber')?.textContent.includes('my-custom:8b')", 'drift badge');
     for (const [width,theme] of [[920,'light'],[440,'dark']]) {
       w.setContentSize(width,700); await js(`document.documentElement.dataset.theme=${JSON.stringify(theme)}`); await delay(100);
@@ -101,7 +132,7 @@ async function renderer({ app, BrowserWindow, session }) {
     await js("document.querySelector('[aria-label=\"移除 Cursor\"]').click()"); await click('确认移除'); await wait("document.querySelectorAll('.subagent-harness .badge.good').length===1", 'single removal');
     await click('移除全部已部署'); await click('确认移除'); await wait("document.querySelectorAll('.subagent-harness .badge.good').length===0", 'all removed');
     await w.loadURL(origin+'/extensions#backups'); await wait("document.querySelector('.backup-list')?.textContent.includes('部署子代理插件与配置') && document.querySelector('.backup-list')?.textContent.includes('移除子代理配置')", 'backups');
-    console.log('Renderer passed: navigation, guest/account and provider sources, custom model, 6-tool MCP 1.4.0 handshake, chunk policy controls, discovery, refresh, selection, diff/apply, safe copies, removal, backups, light/dark widths.');
+    console.log('Renderer passed: inline origin keys, presets, endpoint preview, read-only discovery, redacted diff/apply, independent MCP storage, navigation, provider/group/manual sources, custom model, MCP handshake, chunk policy, refresh, selection, safe copies, removal, backups, light/dark widths.');
   } finally { w.destroy(); }
 }
 if (process.versions.electron) { const electron = await import('electron'); renderer(electron).then(() => electron.app.exit(0), e => { console.error(e); electron.app.exit(1); }); }
