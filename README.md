@@ -70,4 +70,4 @@ node scripts/smoke-subagent-ui.mjs
 
 本地打包使用 `npm.cmd run dist:win`（`--publish never`，无需 `GH_TOKEN`）。`release/` 下应有两个 `.exe`、安装包的 `.blockmap` 和 `latest.yml`；`win-unpacked/resources/app-update.yml` 是内嵌更新源配置，不是需要单独上传的安装包。
 
-维护者发版时同步 `package.json`、锁文件、`shared/constants.ts` 中的版本与变更记录，验证后推送对应的稳定标签（如 `v1.0.0`）。[发布工作流](.github/workflows/release.yml) 检查标签、运行测试，并通过 `dist:win:publish` 将安装包和更新索引上传到本仓库；也可对已有标签手动运行。不要把发布令牌写入应用或配置文件。
+维护者发版时同步 `package.json`、锁文件、`shared/constants.ts` 中的版本与变更记录，验证后推送对应的稳定标签（如 `v1.0.0`）。[发布工作流](.github/workflows/release.yml) 检查标签、运行测试，并用 `npm run dist:win` 打包，再用 `gh release` 将四个文件发布到该标签的同一个 GitHub Release；也可对已有标签手动运行。不要把发布令牌写入应用或配置文件。

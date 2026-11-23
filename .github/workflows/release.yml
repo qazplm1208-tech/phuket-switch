@@ -24,6 +24,7 @@ jobs:
       run:
         shell: pwsh
     env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
       PYTHONUTF8: '1'
       npm_config_logs_max: '0'
       npm_config_update_notifier: 'false'
@@ -39,8 +40,6 @@ jobs:
         with:
           python-version: '3.13'
       - name: Validate release tag and isolate fixtures
-        env:
-          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           $version = (Get-Content -Raw package.json | ConvertFrom-Json).version
           if ($env:RELEASE_TAG -cne "v$version" -or $version -notmatch '^\d+\.\d+\.\d+$') { throw 'Tag must match the stable package version.' }
@@ -57,8 +56,48 @@ jobs:
       - run: python -m py_compile subagent/astra_mcp_server.py
       - run: python -m unittest discover -s subagent -p "test_*.py" -v
       - run: npm test
-      - name: Publish NSIS installer, portable executable and update metadata
-        run: npm run dist:win:publish
+      - name: Build Windows installers and update metadata
+        run: npm run dist:win
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      - name: Publish and verify a single GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $releaseTag = $env:RELEASE_TAG
+          $version = $releaseTag.Substring(1)
+          $assets = @(
+            "release/Phuket.Switch.Setup.$version.exe"
+            "release/Phuket.Switch.Setup.$version.exe.blockmap"
+            'release/latest.yml'
+            "release/Phuket.Switch.$version.exe"
+          )
+          foreach ($asset in $assets) {
+            if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) { throw "Missing release file: $asset" }
+          }
+
+          function Get-TagReleases {
+            $pages = gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" --paginate --slurp | ConvertFrom-Json -NoEnumerate
+            foreach ($page in $pages) { $page | Where-Object { $_.tag_name -ceq $releaseTag } }
+          }
+          $existing = @(Get-TagReleases | Sort-Object -Property created_at, id -Descending)
+          foreach ($duplicate in ($existing | Select-Object -Skip 1)) {
+            Write-Host "Deleting duplicate release $($duplicate.id) for $releaseTag; keeping $($existing[0].id)."
+            gh api -X DELETE "repos/$env:GITHUB_REPOSITORY/releases/$($duplicate.id)"
+          }
+          if ($existing.Count -gt 0) {
+            gh release edit $releaseTag --title "Phuket Switch $releaseTag" --notes-file CHANGELOG.md --draft=false --prerelease=false
+            gh release upload $releaseTag @assets --clobber
+          } else {
+            gh release create $releaseTag @assets --title "Phuket Switch $releaseTag" --notes-file CHANGELOG.md --verify-tag
+          }
+
+          if (@(Get-TagReleases).Count -ne 1) { throw "Expected exactly one release for $releaseTag after publishing." }
+          $published = gh release view $releaseTag --json assets | ConvertFrom-Json
+          foreach ($asset in $assets) {
+            $name = Split-Path -Leaf $asset
+            if ($published.assets.name -cnotcontains $name) { throw "Release $releaseTag is missing asset: $name" }
+          }
