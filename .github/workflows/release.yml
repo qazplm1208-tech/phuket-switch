@@ -44,7 +44,8 @@ jobs:
         run: |
           $version = (Get-Content -Raw package.json | ConvertFrom-Json).version
           if ($env:RELEASE_TAG -cne "v$version" -or $version -notmatch '^\d+\.\d+\.\d+$') { throw 'Tag must match the stable package version.' }
-          $root = Join-Path $env:RUNNER_TEMP "phuket-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          # Keep fixture paths in the runner's native TEMP spelling (which can be an 8.3 alias).
+          $root = Join-Path $env:TEMP "phuket-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           foreach ($entry in @{PHUKET_SWITCH_USER_HOME='home'; PHUKET_SWITCH_HOME='db'; PLUGIN_DATA='plugin-data'}.GetEnumerator()) {
             $dir = Join-Path $root $entry.Value
             New-Item -ItemType Directory -Force $dir | Out-Null

@@ -24,7 +24,7 @@ class AstraTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.home = Path(self.temp.name)
+        self.home = Path(self.temp.name).resolve()
         for p in [patch.dict(os.environ, {'PHUKET_SWITCH_USER_HOME': str(self.home), 'PLUGIN_DATA': str(self.home / 'data'), 'ASTRA_API_KEY': 'offline-only'}),
                   patch.object(astra, 'DEFAULT_BASE_URL', 'https://offline.invalid/relay/v1'), patch.object(astra, 'SESSIONS', {}), patch.object(astra, 'WORKERS', {})]:
             p.start()
@@ -252,6 +252,25 @@ class AstraTests(unittest.TestCase):
         self.assertEqual(saved['input_history'][0], old['input_history'][0])
         self.assertEqual(self.tool('astra_list_sessions')['sessions'][0]['api_format'], astra.DEFAULT_PROTOCOL)
 
+    def test_list_and_resume_snapshot_with_noncanonical_cwd(self):
+        alias = Path(self.temp.name)
+        if alias == self.home:  # Exercise an equivalent spelling even without NTFS short names.
+            alias = self.home / '..' / self.home.name
+        session = astra.AstraSession('legacy-alias', str(alias), 'readonly', 'none', False)
+        astra._save_session(session)
+
+        rows = self.tool('astra_list_sessions', {'cwd': str(self.home)})['sessions']
+        self.assertEqual([r['session_id'] for r in rows], [session.session_id])
+        other = self.home / 'other'
+        other.mkdir()
+        self.assertEqual(self.tool('astra_list_sessions', {'cwd': str(other)})['sessions'], [])
+        with patch.object(astra, 'call_subagent_api', return_value={'output_text': 'ok'}):
+            resumed = self.tool('astra_run_task', {'session_id': session.session_id, 'task': 'resume', 'mode': 'readonly'})
+            with self.assertRaisesRegex(ValueError, 'different workspace'):
+                astra.run_astra_agent_turn(task='resume', cwd=str(other), session_id=session.session_id)
+        self.assertEqual(resumed['prompt_cache_key'], session.prompt_cache_key)
+        self.assertEqual(astra._load_session(session.session_id).cwd, str(alias))
+
     def test_override_sticks_across_workers_and_new_sessions_get_the_default(self):
         with patch.object(astra, 'ALLOW_MODEL_OVERRIDE', True), patch.object(astra, 'DEFAULT_PROTOCOL', 'openai-chat'), patch.object(astra, 'call_subagent_api', return_value={'output': [astra.message('ok')]}) as call:
             first = self.tool('astra_run_task', {'task': 'test', 'model': 'custom-model'})
@@ -414,7 +433,7 @@ class SessionCacheTests(unittest.TestCase):
         temp = tempfile.TemporaryDirectory(dir=Path.cwd())
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name)
-        self.cwd = self.root / "Workspace"
+        self.cwd = (self.root / "Workspace").resolve()
         self.cwd.mkdir()
         self.data = self.root / "plugin-data"
         for p in (patch.dict(os.environ, PHUKET_SWITCH_USER_HOME=str(self.root), PLUGIN_DATA=str(self.data), ASTRA_API_KEY="offline-test"),

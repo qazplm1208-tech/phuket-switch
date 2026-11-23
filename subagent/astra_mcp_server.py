@@ -1843,7 +1843,7 @@ def run_astra_agent_turn(
 
     sid = _validate_session_id(session_id) if session_id is not None else f"astra-{uuid.uuid4().hex[:10]}"
     with _turn_session(sid, cwd, mode, effort, allow_outside_cwd) as session:
-        if Path(cwd).resolve() != Path(session.cwd):
+        if Path(cwd).resolve() != Path(session.cwd).resolve():
             raise ValueError("Use a new session for a different workspace.")
         if model is not None:
             session.model = model
@@ -2152,8 +2152,8 @@ def astra_list_sessions(cwd: str | None = None) -> dict[str, Any]:
     items: list[dict[str, Any]] = []
 
     def collect(s: AstraSession) -> None:
-        # Stored cwd is already resolved. Path equality ignores case on Windows.
-        if workspace is not None and Path(s.cwd) != workspace:
+        # Older snapshots can contain a Windows short name instead of the long path.
+        if workspace is not None and Path(s.cwd).resolve() != workspace:
             return
         status = _chunk_status(s)
         items.append({
