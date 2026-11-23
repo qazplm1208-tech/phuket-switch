@@ -1,0 +1,126 @@
+{
+  "name": "phuket-switch",
+  "version": "1.0.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/qazplm1208-tech/phuket-switch.git"
+  },
+  "homepage": "https://github.com/qazplm1208-tech/phuket-switch",
+  "private": true,
+  "description": "Loopback desktop workbench for PhuketAI providers and coding clients",
+  "type": "module",
+  "productName": "Phuket Switch",
+  "author": "Phuket Switch",
+  "main": "electron/main.mjs",
+  "build": {
+    "appId": "com.phuketcore.switch",
+    "productName": "Phuket Switch",
+    "asar": false,
+    "releaseInfo": { "releaseNotesFile": "CHANGELOG.md" },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "qazplm1208-tech",
+        "repo": "phuket-switch",
+        "releaseType": "release"
+      }
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "subagent/astra_mcp_server.py",
+      "!subagent/test_*.py",
+      "package.json",
+      "!dist/**/*.map",
+      "!**/*.test.*",
+      "!.npm-cache/**",
+      "!.desktop/**",
+      "!web/**",
+      "!server/**",
+      "!shared/**",
+      "!scripts/**"
+    ],
+    "win": {
+      "icon": "electron/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "portable": {
+      "artifactName": "Phuket.Switch.${version}.${ext}"
+    },
+    "nsis": {
+      "artifactName": "Phuket.Switch.Setup.${version}.${ext}",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Phuket Switch",
+      "installerIcon": "electron/icon.ico",
+      "uninstallerIcon": "electron/icon.ico",
+      "language": "2052",
+      "installerLanguages": [
+        "zh_CN"
+      ],
+      "deleteAppDataOnUninstall": false
+    }
+  },
+  "engines": {
+    "node": ">=24.0.0 <25"
+  },
+  "scripts": {
+    "dev": "concurrently --kill-others --names server,web \"tsx watch server/index.ts\" \"vite\"",
+    "build": "tsc -p tsconfig.server.json && vite build",
+    "dist:win": "npm run build && electron-builder --win --publish never",
+    "dist:win:publish": "npm run build && electron-builder --win --publish always",
+    "start": "node dist/server/index.js",
+    "desktop": "npm run build && electron .",
+    "desktop:start": "electron .",
+    "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.web.json --noEmit",
+    "test": "node --import tsx --test \"server/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@iarna/toml": "^2.2.5",
+    "cors": "^2.8.5",
+    "electron-updater": "^6.8.11",
+    "express": "^5.1.0",
+    "lucide-react": "^0.577.0",
+    "qrcode": "^1.5.4",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "recharts": "^3.3.0",
+    "semver": "^7.8.6",
+    "zod": "^4.1.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.0",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.0.0",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.1.0",
+    "concurrently": "^9.2.0",
+    "electron": "^45.4.1",
+    "electron-builder": "^26.18.0",
+    "tailwindcss": "^4.1.0",
+    "tsx": "^4.20.0",
+    "typescript": "~5.9.3",
+    "vite": "^7.3.0"
+  }
+}

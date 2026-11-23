@@ -1,0 +1,63 @@
+name: Windows Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag, for example v1.0.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PYTHONUTF8: '1'
+      npm_config_logs_max: '0'
+      npm_config_update_notifier: 'false'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Validate release tag and isolate fixtures
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          $version = (Get-Content -Raw package.json | ConvertFrom-Json).version
+          if ($env:RELEASE_TAG -cne "v$version" -or $version -notmatch '^\d+\.\d+\.\d+$') { throw 'Tag must match the stable package version.' }
+          $root = Join-Path $env:RUNNER_TEMP "phuket-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          foreach ($entry in @{PHUKET_SWITCH_USER_HOME='home'; PHUKET_SWITCH_HOME='db'; PLUGIN_DATA='plugin-data'}.GetEnumerator()) {
+            $dir = Join-Path $root $entry.Value
+            New-Item -ItemType Directory -Force $dir | Out-Null
+            "$($entry.Key)=$dir" >> $env:GITHUB_ENV
+          }
+      - run: npm ci
+      - run: node scripts/api-contract.mjs --check
+      - run: npm run typecheck
+      - run: python -m py_compile subagent/astra_mcp_server.py
+      - run: python -m unittest discover -s subagent -p "test_*.py" -v
+      - run: npm test
+      - name: Publish NSIS installer, portable executable and update metadata
+        run: npm run dist:win:publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'

@@ -1,0 +1,225 @@
+@media (max-width: 1040px) {
+  .subagent-footer { flex-wrap: wrap; }
+  .subagent-footer .actions { margin-left: auto; }
+}
+@media (max-width: 760px) {
+  .subagent-panel { padding: 12px; }
+  .subagent-panel .section-head { flex-wrap: wrap; }
+  .subagent-metrics { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .subagent-harness { grid-template-columns: minmax(0,1fr) auto; gap: 5px; }
+  .subagent-row-actions { grid-column: 2; grid-row: 1 / 3; flex-wrap: wrap; }
+  .subagent-harness-badges { grid-column: 1; grid-row: 2; padding-left: 22px; }
+  .subagent-footer { position: static; }
+}
+@media (max-width: 600px) {
+  .subagent-row-actions { grid-column: 1 / -1; grid-row: auto; }
+  .subagent-paths { padding-inline-start: 0; }
+  .subagent-result dl { grid-template-columns: max-content minmax(0,1fr); }
+  .subagent-footer .actions { justify-content: flex-start; margin-left: 0; }
+  .subagent-footer .btn { white-space: normal; height: auto; min-height: 30px; }
+}
+@media (min-width: 1450px) {
+  .group-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .hub {
+    max-width: 1160px;
+    margin-inline: auto;
+  }
+}
+@media (max-width: 1040px) {
+  .titlebar { grid-template-columns: max-content minmax(0, 1fr) max-content; }
+  .client-switch { justify-self: center; }
+  .client-switch button { padding-inline: 6px; }
+  .title-actions:has(.window-buttons) .account-pill .pill-text { display: none; }
+  .title-actions {
+    gap: 4px;
+  }
+  .page {
+    padding-inline: 15px;
+  }
+  .fast-row {
+    gap: 6px;
+    padding-inline: 10px;
+  }
+  .fast-name {
+    gap: 4px;
+  }
+  .fast-row .btn {
+    padding-inline: 7px;
+  }
+  .group-card,
+  .provider,
+  .channel {
+    padding-inline: 13px;
+  }
+}
+@media (max-width: 900px) {
+  .shell {
+    grid-template-columns: 58px minmax(0, 1fr);
+  }
+  .sidebar nav {
+    padding-inline: 8px;
+  }
+  .sidebar nav a {
+    justify-content: center;
+    padding: 0;
+  }
+  .sidebar nav a span,
+  .sidebar-fast > span,
+  .sidebar-fast .toggle {
+    display: none;
+  }
+  .sidebar-bottom {
+    padding-inline: 8px;
+  }
+  .sidebar-fast {
+    justify-content: center;
+  }
+  .titlebar {
+    grid-template-columns: auto 1fr auto;
+  }
+  .client-switch {
+    justify-self: center;
+  }
+  .title-actions:has(.window-buttons) .account-pill .pill-text {
+    display: none;
+  }
+  .brand {
+    padding-left: 12px;
+    gap: 6px;
+  }
+}
+@media (max-width: 760px) {
+  .provider-top {
+    flex-wrap: wrap;
+  }
+  .provider-actions {
+    flex-wrap: wrap;
+    flex-shrink: 1;
+  }
+  .chart-duo,
+  .lab-grid {
+    grid-template-columns: 1fr;
+  }
+  .brand span {
+    display: none;
+  }
+  .title-actions .account-pill .pill-text {
+    display: none;
+  }
+  .hub-bar {
+    flex-wrap: wrap;
+  }
+  .monitor-bar {
+    flex-wrap: wrap;
+  }
+  .group-grid,
+  .channel-grid {
+    grid-template-columns: 1fr;
+  }
+}
+@media (max-width: 600px) {
+  .shell {
+    grid-template: 79px minmax(0, 1fr) / 44px minmax(0, 1fr);
+  }
+  .titlebar {
+    height: 79px;
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-rows: 39px 38px;
+  }
+  .brand span {
+    display: inline;
+  }
+  .title-actions {
+    grid-column: 2;
+    grid-row: 1;
+  }
+  .window-buttons {
+    height: 39px;
+  }
+  .window-buttons .icon-btn {
+    width: 28px;
+  }
+  .client-switch {
+    grid-row: 2;
+    grid-column: 1 / -1;
+  }
+  .sidebar nav {
+    padding: 9px 4px;
+  }
+  .sidebar-bottom {
+    padding-inline: 4px;
+  }
+  .page {
+    padding: 10px 10px 20px;
+  }
+  .page-title {
+    margin-bottom: 8px;
+  }
+  .hub-bar > .inline {
+    flex-wrap: wrap;
+    gap: 5px;
+  }
+  .hub-bar > .actions {
+    margin-left: auto;
+  }
+  .hub-bar .actions .btn {
+    font-size: 12px;
+  }
+  .hub-bar .live-state {
+    font-size: 11px;
+  }
+  .fast-row {
+    column-gap: 4px;
+    row-gap: 6px;
+  }
+  .hub > .empty .actions,
+  .group-card .actions,
+  .proxy-card .spread,
+  .tab-bar,
+  .monitor-bar .actions,
+  .section-head {
+    flex-wrap: wrap;
+  }
+  .tabs {
+    gap: 11px;
+  }
+  .tab-bar > .actions {
+    margin-left: auto;
+  }
+  .toolbar .segments {
+    flex-wrap: wrap;
+  }
+  .segments button {
+    padding-inline: 6px;
+  }
+  .form-grid,
+  .prompt-layout {
+    grid-template-columns: 1fr;
+  }
+  .strip {
+    grid-auto-flow: row;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 9px;
+  }
+  .strip .metric + .metric {
+    border: none;
+  }
+  .diff-grid {
+    grid-template-columns: 1fr;
+  }
+  .diff-pane + .diff-pane {
+    border-left: 0;
+    border-top: 1px solid var(--border);
+  }
+  .setting-row {
+    flex-wrap: wrap;
+  }
+  .modal {
+    max-height: 90dvh;
+  }
+  .modal.wide {
+    width: calc(100% - 18px);
+  }
+}
