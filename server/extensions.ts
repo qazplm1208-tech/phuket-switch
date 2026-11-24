@@ -6,6 +6,7 @@ import { bad, conflict, getUserHome, isRecord, missing, own, secretField } from 
 import { cliPaths, commitFiles, jsonText, parseJson, textFile } from './configFiles.js';
 import { parseToml, replaceTomlSubtree } from './surgicalToml.js';
 import { editSubagentBlock, subagentBlock } from './subagentRules.js';
+import { directDownloadBlock, editDirectDownloadBlock } from './directDownloadRules.js';
 import { managedText } from './configFiles.js';
 import { hasImagePromptBlock, mergeImagePromptBlock, renderImagePromptBlock } from './imagePrompt.js';
 
@@ -56,8 +57,9 @@ export function applyPrompt(db: SwitchDb, id: string) {
     ? mergeImagePromptBlock(p.content, renderImagePromptBlock(img))
     : p.content;
   const file = p.appType === 'claude' ? f.claudePrompt : f.codexPrompt;
-  const live = subagentBlock(managedText(file) ?? '');
-  const result = commitFiles(db, p.appType, 'Apply prompt preset', new Map([[file, live ? editSubagentBlock(content, live) : content]])); db.enablePrompt(p); return result;
+  const src = managedText(file) ?? '', sub = subagentBlock(src), download = directDownloadBlock(src);
+  const withSubagent = sub ? editSubagentBlock(content, sub) : content;
+  const result = commitFiles(db, p.appType, 'Apply prompt preset', new Map([[file, download ? editDirectDownloadBlock(withSubagent, download) : withSubagent]])); db.enablePrompt(p); return result;
 }
 function frontmatter(content: string) {
   const block = /^\uFEFF?---\s*\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(content)?.[1] ?? '';

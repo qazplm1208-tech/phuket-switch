@@ -1,11 +1,12 @@
 import { useState } from 'react';
-import { Activity, RefreshCw, Save } from 'lucide-react';
+import { Activity, ArrowRight, RefreshCw, Save } from 'lucide-react';
 import { PHUKET_BASE_URL } from '@shared/constants';
 import type { DirectBypassProbeResult, DirectBypassStatus, UpdateDirectBypassRequest } from '@shared/types';
 import { api } from '../api/client';
 import { ms } from '../lib/display';
 import { useAction } from '../lib/feedback';
 import { useResource } from '../lib/resource';
+import { useStudio } from '../lib/studio';
 import { Badge, Btn, Choices, Field, Notice, Section, Skeleton, Toggle } from './ui';
 
 const modes = [
@@ -20,6 +21,7 @@ export function DirectBypassBadge({ status }: { status: DirectBypassStatus }) {
 }
 
 export default function DirectBypassPanel() {
+  const s = useStudio();
   const r = useResource('direct-bypass', api.directBypass), status = r.data, config = status?.config;
   const { pending, run } = useAction(), busy = r.loading || !!pending;
   // A null draft follows the saved value. Refreshes and unrelated PUTs leave an edit in progress alone.
@@ -93,6 +95,10 @@ export default function DirectBypassPanel() {
         <div className="setting-row">
           <div className="grow"><b>同步用于子代理（Astra MCP）</b><small>开启后，前往「子代理」页重新应用即可为子代理同步直连参数。</small></div>
           <Toggle label="同步用于子代理（Astra MCP）" on={config.applyToSubagent} disabled={busy} change={() => save({ applyToSubagent: !config.applyToSubagent })} />
+        </div>
+        <div className="setting-row">
+          <div className="grow"><b>AI 文件直连下载（断点续传 / 并行 / 种子）</b><small>可部署内置直连脚本并写入 AI 客户端规则，让 AI 下载文件不走代理。</small></div>
+          <Btn icon={ArrowRight} onClick={() => s.navigate('/extensions', 'direct-download')}>前往配置</Btn>
         </div>
         <form className="setting-row direct-fields" onSubmit={e => { e.preventDefault(); probe(); }}>
           <Field label="测试地址（可选）"><input value={url} disabled={busy} placeholder={PHUKET_BASE_URL} onChange={e => { setUrl(e.target.value); setResult(null); }} /></Field>

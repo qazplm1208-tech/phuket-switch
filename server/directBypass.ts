@@ -8,22 +8,16 @@ import { PHUKET_BASE_URL } from '../shared/constants.js';
 import type { DirectBypassConfig, DirectBypassProbeRequest, DirectBypassProbeResult, DirectBypassRouteInfo, DirectBypassStatus, UpdateDirectBypassRequest } from '../shared/types.js';
 import { ApiError, elapsed, now } from './common.js';
 import type { SwitchDb } from './db.js';
-import { bundledDirectFile } from './directFiles.js';
+import { bundledDirectFile, childEnv, routeInfo } from './directFiles.js';
 import { detectPython } from './subagentPython.js';
 import { adaptiveFetch, connectAuthority, isLoopbackUrl, setDirectBypassResolver, type DirectPolicy } from './upstreamTransport.js';
 
 export interface DirectBypassOptions { /** Exercise the real bridge without requiring Windows hardware in tests. */ systemRoute?: boolean }
 const timeout = 8000, outputLimit = 256 * 1024, run = promisify(execFile);
-const routeInfo = z.object({ name: z.string(), description: z.string(), index: z.int().nullable(), ipv4: z.string().nullable(), ipv6: z.string().nullable(),
-  gateway: z.string().nullable(), dnsServers: z.array(z.string()), metric: z.int().nullable(), systemRoute: z.boolean() });
 const startup = z.object({ ok: z.literal(true), port: z.int().min(1).max(65535), route: routeInfo });
 const inventory = z.object({ ok: z.literal(true), selected: routeInfo.nullable(), adapters: z.array(routeInfo) });
 const unavailable = (message = 'Physical network route unavailable. Check the adapter and DNS settings.') => new ApiError(502, 'DIRECT_BYPASS_UNAVAILABLE', message);
 const safeError = (err: unknown) => err instanceof ApiError && err.code === 'DIRECT_BYPASS_UNAVAILABLE' ? err : unavailable();
-function childEnv(): NodeJS.ProcessEnv {
-  const keys = ['SystemRoot', 'WINDIR', 'PATH', 'ComSpec', 'TEMP', 'TMP', 'SystemDrive', 'PSModulePath'];
-  return Object.fromEntries(keys.filter(k => process.env[k] !== undefined).map(k => [k, process.env[k]]));
-}
 function argsFor(config: DirectBypassConfig) {
   return [...(config.interfaceName ? [`--interface=${config.interfaceName}`] : []), ...(config.dnsServers.length ? ['--dns', ...config.dnsServers] : [])];
 }

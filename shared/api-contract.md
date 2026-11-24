@@ -34,6 +34,11 @@ Subagent preview and apply accept `enableChunkCompaction` (default `true`), `com
 | `GET /api/network/direct-bypass` | `NoBody` | 200 | `DirectBypassStatus` |
 | `PUT /api/network/direct-bypass` | `UpdateDirectBypassRequest` | 200 | `DirectBypassStatus` |
 | `POST /api/network/direct-bypass/probe` | `DirectBypassProbeRequest` | 200 | `DirectBypassProbeResult` |
+| `GET /api/direct-download` | `NoBody` | 200 | `DirectDownloadStatus` |
+| `POST /api/direct-download/preview-diff` | `ApplyDirectDownloadRequest` | 200 | `DirectDownloadDiffPreview` |
+| `POST /api/direct-download/apply` | `ApplyDirectDownloadRequest` | 200 | `ApplyDirectDownloadResult` |
+| `POST /api/direct-download/remove` | `RemoveDirectDownloadRequest` | 200 | `ApplyDirectDownloadResult` |
+| `POST /api/direct-download/test` | `DirectDownloadTestRequest` | 200 | `DirectDownloadTestResult` |
 | `GET /api/subagent` | `NoBody` | 200 | `SubagentStatus` |
 | `POST /api/subagent/preview-diff` | `ApplySubagentRequest` | 200 | `SubagentDiffPreview` |
 | `POST /api/subagent/apply` | `ApplySubagentRequest` | 200 | `ApplySubagentResult` |

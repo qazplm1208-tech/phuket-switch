@@ -74,6 +74,39 @@ async function renderer({ app, BrowserWindow, session }) {
     await js("document.querySelector('.subagent-test-actions input').click()"); await click('验证子代理');
     await wait("document.querySelector('.subagent-result')?.textContent.includes('模型列表可访问')", 'model discovery');
   };
+  async function downloadPage() {
+    assert.equal(await js("fetch('/api/direct-download').then(r=>r.status)"), 200);
+    await click('详细设置'); await wait("!!btn('前往配置')", 'download settings shortcut');
+    await js("window.downloadErrors=[]; addEventListener('error',e=>downloadErrors.push(e.message)); addEventListener('unhandledrejection',e=>downloadErrors.push(String(e.reason))); void 0");
+    await click('前往配置');
+    await wait("location.pathname==='/extensions' && location.hash==='#direct-download' && btn('AI 直连下载')?.getAttribute('aria-selected')==='true' && document.querySelectorAll('.direct-download input[type=checkbox]').length===7", 'direct download tab');
+    assert.ok(await js("btn('写入脚本与规则').disabled && field('并行连接数（1–16）').value==='4' && field('重试次数（0–20）').value==='5'"));
+    assert.equal(await js("btn('物理网卡直连（绕过代理 + TUN）').getAttribute('aria-pressed')"), 'true');
+    await wait("!!field('物理网卡')?.querySelector('option[value=\"Fixture Ethernet\"]')", 'saved offline download adapter');
+    await click('仅跳过系统代理'); await click('选择已检测客户端');
+    await wait("!btn('写入脚本与规则').disabled", 'detected download targets');
+    await set('并行连接数（1–16）','17'); assert.ok(await js("btn('预览变更').disabled"));
+    await set('并行连接数（1–16）','6'); await click('预览变更');
+    await wait("document.querySelector('dialog[open] .diff-grid') && document.querySelector('.download-diff').textContent.includes('direct_download.py')", 'download file diffs');
+    assert.equal(await js("fetch('/api/direct-download').then(r=>r.json()).then(s=>s.scriptInstalled)"), false);
+    await click('确认并写入'); await wait("!document.querySelector('dialog[open]') && document.querySelector('.direct-download').textContent.includes('已部署脚本') && !btn('移除规则与脚本').disabled", 'deployed downloader');
+    const paths = await js("fetch('/api/direct-download').then(r=>r.json()).then(s=>[s.scriptPath,s.cmdPath])");
+    for (const [i,label] of ['复制Python 脚本路径','复制Windows 启动器路径'].entries()) {
+      await js(`document.querySelector('[aria-label="${label}"]').click()`); assert.equal(await js('window.copied'), paths[i]);
+    }
+    await js("[...document.querySelectorAll('.direct-download summary')].find(s=>s.textContent.startsWith('AI 规则预览')).click()");
+    await click('复制 AI 规则'); assert.ok(await js("window.copied.includes('--system-route -c 6')"));
+    await set('探测地址（可选）',' '+origin+'/api/health '); await click('自检并探测');
+    await wait("document.querySelector('.direct-download .subagent-result')?.textContent.includes('探测成功')", 'loopback download metadata probe');
+    assert.ok(await js("['System','/api/health','并行分片','DHT'].every(s=>document.querySelector('.direct-download .subagent-result').textContent.includes(s))"));
+    for (const [width,theme] of [[920,'light'],[440,'dark']]) {
+      w.setContentSize(width,700); await js(`document.documentElement.dataset.theme=${JSON.stringify(theme)}`); await delay(100);
+      assert.ok(await js("[...document.querySelectorAll('.direct-download, .direct-download .setting-row')].every(el=>el.scrollWidth<=el.clientWidth+1)"), 'download panel overflow at '+width);
+    }
+    await click('移除规则与脚本'); await wait("!!btn('确认移除')", 'download removal confirmation'); await click('确认移除');
+    await wait("!document.querySelector('dialog[open]') && document.querySelector('.direct-download .badge')?.textContent==='未部署' && btn('移除规则与脚本').disabled", 'download rules and scripts removed');
+    assert.deepEqual(await js('window.downloadErrors'), []);
+  }
   try {
     await page(); assert.deepEqual(await js(`[...document.querySelectorAll('.sidebar nav a')].slice(-3).map(x=>x.pathname)`), ['/lab','/subagent','/extensions']);
     await click('验证子代理'); await wait("document.querySelector('.subagent-result')?.textContent.includes('astra_wait_worker')", 'handshake');
@@ -161,8 +194,10 @@ async function renderer({ app, BrowserWindow, session }) {
     await wait("document.querySelector('.direct-shortcut .badge')?.textContent==='绕过系统代理'", 'shortcut reflects enabled mode');
     await js("document.querySelector('.direct-shortcut [role=switch]').click()");
     await wait("document.querySelector('.direct-shortcut .badge')?.textContent==='未启用'", 'quick disable');
+    await downloadPage();
     await w.loadURL(origin+'/extensions#backups'); await wait("document.querySelector('.backup-list')?.textContent.includes('部署子代理插件与配置') && document.querySelector('.backup-list')?.textContent.includes('移除子代理配置')", 'backups');
-    console.log('Renderer passed: inline origin keys, presets, endpoint preview, read-only discovery, redacted diff/apply, independent MCP storage, navigation, provider/group/manual sources, custom model, MCP handshake, chunk policy, refresh, selection, safe copies, removal, backups, light/dark widths.');
+    assert.ok(await js("['部署 AI 直连下载脚本与规则','移除 AI 直连下载规则'].every(s=>document.querySelector('.backup-list').textContent.includes(s)) && [...document.querySelectorAll('.backup-list .badge')].filter(b=>b.textContent==='AI 直连下载').length===2"));
+    console.log('Renderer passed: inline origin keys, presets, endpoint preview, read-only discovery, redacted diff/apply, independent MCP storage, navigation, provider/group/manual sources, custom model, MCP handshake, chunk policy, refresh, selection, safe copies, removal, backups, direct download API/tab/diff/apply/loopback probe/removal, light/dark widths.');
   } finally { w.destroy(); }
 }
 if (process.versions.electron) { const electron = await import('electron'); renderer(electron).then(() => electron.app.exit(0), e => { console.error(e); electron.app.exit(1); }); }

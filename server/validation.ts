@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { isIP } from 'node:net';
-import { directBypassModes, paymentStatuses, subagentHarnessIds, subagentProtocols } from '../shared/types.js';
+import { directBypassModes, directDownloadModes, directDownloadTargets, paymentStatuses, subagentHarnessIds, subagentProtocols } from '../shared/types.js';
 import { apps } from './db.js';
 import { MODEL_SLUG } from '../shared/constants.js';
 import { httpBase, normalizeLoginEmail, normalizeLoginPassword, normalizeLoginToken } from './common.js';
@@ -46,6 +46,19 @@ export const directBypassProbe = z.strictObject({ url: z.string().max(4096).refi
   const url = URL.parse(s);
   return !!url && /^https?:\/\/[^/@?#]+(?:[/?#]|$)/i.test(s) && !/[\s\\\x00-\x1f\x7f]/.test(s) && !url.username && !url.password;
 }, '测试地址必须是无用户名和密码的 HTTP 或 HTTPS 网址。').optional() });
+
+const downloadTargets = z.array(z.enum(directDownloadTargets)).min(1).max(directDownloadTargets.length)
+  .refine(ids => new Set(ids).size === ids.length, 'Duplicate direct-download target.');
+const downloadOptions = z.strictObject({
+  mode: z.enum(directDownloadModes), interfaceName: updateDirectBypass.shape.interfaceName.unwrap(), dnsServers: updateDirectBypass.shape.dnsServers.unwrap(),
+  connections: z.int().min(1).max(16), retries: z.int().min(0).max(20), resume: z.boolean(), enableTorrent: z.boolean(),
+  maxRate: z.string().trim().max(32).refine(s => !s || (/^\d+(?:\.\d+)?[KMG]?(?:i?B)?$/i.test(s) && parseFloat(s) * 1024 ** (' KMG'.indexOf(s.match(/[KMG]/i)?.[0].toUpperCase() ?? ' ')) >= 1)),
+  customInstructions: z.string().max(2000).refine(s => !/PHUKET_SWITCH_|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/i.test(s)).optional(),
+});
+export const applyDirectDownload = downloadOptions.partial().extend({ targets: downloadTargets });
+export const removeDirectDownload = z.strictObject({ targets: downloadTargets, removeScripts: z.boolean().optional() });
+export const testDirectDownload = directBypassProbe;
+export const directDownloadConfig = downloadOptions.extend({ enabled: z.boolean(), targets: z.record(z.enum(directDownloadTargets), z.boolean()), updatedAt: z.iso.datetime().optional() });
 
 const subagentTargets = z.array(z.enum(subagentHarnessIds)).min(1).max(9).transform(a => [...new Set(a)]);
 const subagentFields = {

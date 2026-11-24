@@ -228,12 +228,15 @@ def build_developer_context(cwd: str, mode: str, allow_outside_cwd: bool) -> str
         'a factual summary and label; there is no need to wait for the context cap.\n'
         if ALLOW_MODEL_COMPACTION else ""
     )
+    download_script = os.environ.get('ASTRA_DIRECT_DOWNLOAD_SCRIPT', '').strip()
+    download_guide = (f'- For authorized file downloads, use the direct downloader at "{download_script}" without an app proxy, within the active workspace and mode limits.\n'
+                      if download_script and download_script.isprintable() else '')
     return (
         "Subagent session context (orchestrated by Gemini planner):\n"
         f"- {mode_desc}\n"
         f"- {boundary_desc}\n"
         "- Use the registered function tools (`list_dir`, `read_file`, `search_files`, `write_file`, `edit_file`, `run_command`) directly rather than probing for external `apply_patch` binaries.\n"
-        f"{compaction_guide}"
+        f"{compaction_guide}{download_guide}"
         "- End your final response with a concise factual summary of changes, commands run, and verification results."
     )
 

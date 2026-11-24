@@ -4,7 +4,7 @@ import path from 'node:path';
 import { DatabaseSync, type SQLInputValue, type SQLOutputValue } from 'node:sqlite';
 import { DEFAULT_GPT_FAST_CONFIG, DEFAULT_PROXY_SETTINGS, PHUKET_BASE_URL, PHUKET_GPT_BASE_URL } from '../shared/constants.js';
 import type { DirectBypassConfig, AppSettings, AppType, ConfigBackupItem, CreatePromptRequest, CreateProviderRequest, GptFastConfig, ImagePromptConfig, ModelRouteRule, PhuketAccount, PromptPreset, Provider, ProviderView, ProxyRequestLog, ProxySettings, ProxyTakeoverState, UpdatePromptRequest, UpdateProviderRequest } from '../shared/types.js';
-import { subagentHarnessIds, type SubagentConfig } from '../shared/types.js';
+import { directDownloadTargets, subagentHarnessIds, type DirectDownloadConfig, type SubagentConfig } from '../shared/types.js';
 import { assertNotCcSwitch, conflict, getDataDir, missing, now } from './common.js';
 export { getDataDir } from './common.js';
 
@@ -23,6 +23,7 @@ interface State {
   fastMode: GptFastConfig;
   settings: AppSettings;
   directBypass: DirectBypassConfig;
+  directDownload: DirectDownloadConfig;
   proxySettings: ProxySettings;
   proxyTakeover: ProxyTakeoverState;
   phuketSession: PhuketSession | null;
@@ -38,6 +39,8 @@ const defaults: State = {
   fastMode: DEFAULT_GPT_FAST_CONFIG,
   settings: { theme: 'system', language: 'zh-CN', backupBeforeSwitch: true, autoCheckUpdates: true, defaultGptFastConfig: DEFAULT_GPT_FAST_CONFIG },
   directBypass: { enabled: false, mode: 'physical-nic', interfaceName: '', dnsServers: [], applyToSubagent: true },
+  directDownload: { enabled: false, mode: 'physical-nic', interfaceName: '', dnsServers: [], connections: 4, retries: 5, maxRate: '', resume: true, enableTorrent: true,
+    targets: Object.fromEntries(directDownloadTargets.map(id => [id, false])) as DirectDownloadConfig['targets'] },
   proxySettings: DEFAULT_PROXY_SETTINGS,
   proxyTakeover: { claude: false, codex: false, 'gpt-native': false, 'claude-desktop': false, gemini: false, antigravity: false },
   phuketSession: null, proxyOriginalConfigs: {}, antigravityModelBindings: {}, codexIncludeRoutedModels: false, codexCatalogRouteSlugs: [],

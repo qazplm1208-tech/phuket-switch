@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import type { AppType, SubagentConfig, SystemApplyResult } from '../shared/types.js';
+import type { AppType, DirectDownloadConfig, SubagentConfig, SystemApplyResult } from '../shared/types.js';
+import { directDownloadConfig } from './validation.js';
 import { readAstraUserEnvKey, writeAstraUserEnvKey } from './subagentEnvironment.js';
 import { agyEnvNote, readAgyEnv, validAgyEnv, writeAgyEnv, type AgyEnv } from './agyEnvironment.js';
 import type { SwitchDb } from './db.js';
@@ -42,6 +43,11 @@ export function subagentPaths() {
     clineMcp: at('.cline', 'data', 'settings', 'cline_mcp_settings.json'), clineRules: at('.cline', 'rules', 'phuket-subagent.md'),
   };
 }
+export function directDownloadPaths() {
+  const dir = path.join(getUserHome(), '.phuket-switch', 'direct-download'), at = (name: string) => path.join(dir, name);
+  return { dir, script: at('direct_download.py'), torrent: at('direct_torrent.py'), net: at('direct_net.py'), dns: at('direct_dns.py'),
+    cmd: at('phuket-dl.cmd'), clineRules: path.join(getUserHome(), '.cline', 'rules', 'phuket-direct-download.md') };
+}
 function checkUnlinkedPath(file: string) {
   assertNotCcSwitch(file);
   const home = getUserHome();
@@ -52,10 +58,13 @@ function checkUnlinkedPath(file: string) {
   }
 }
 function checkTarget(file: string) {
-  if (!Object.values(cliPaths()).includes(file) && !Object.values(subagentPaths()).includes(file)) throw conflict('Path is not a managed CLI configuration.');
+  const { script, torrent, net, dns, cmd, clineRules } = directDownloadPaths();
+  if (!Object.values(cliPaths()).includes(file) && !Object.values(subagentPaths()).includes(file) &&
+      ![script, torrent, net, dns, cmd, clineRules].includes(file)) throw conflict('Path is not a managed CLI configuration.');
   checkUnlinkedPath(file);
 }
-export function managedText(file: string) { checkTarget(file); return textFile(file); }
+export function managedBytes(file: string) { checkTarget(file); return bytes(file); }
+export function managedText(file: string) { return managedBytes(file)?.toString('utf8') ?? null; }
 export function desktopConfigText(file: string) {
   if (path.dirname(file) !== claudeDesktopConfigDir()) throw conflict('Invalid Claude Desktop profile path.');
   checkUnlinkedPath(file);
@@ -81,9 +90,10 @@ function atomicWrite(file: string, content: Buffer | null) {
 }
 type AgySnapshot = { bindings: Record<string, string>; env?: AgyEnv };
 type SubagentSnapshot = { config: SubagentConfig & { apiKey: string }; userKey?: string | null };
-export type Plan = Map<string, string | Buffer | null> & { antigravity?: AgySnapshot; subagent?: SubagentSnapshot };
+type DownloadSnapshot = { config: DirectDownloadConfig };
+export type Plan = Map<string, string | Buffer | null> & { antigravity?: AgySnapshot; subagent?: SubagentSnapshot; directDownload?: DownloadSnapshot };
 type Original = { file: string; content: Buffer | null };
-function snapshot(db: SwitchDb, appType: AppType, reason: string, originals: Original[], agy?: AgySnapshot, subagent?: SubagentSnapshot) {
+function snapshot(db: SwitchDb, appType: AppType, reason: string, originals: Original[], agy?: AgySnapshot, subagent?: SubagentSnapshot, download?: DownloadSnapshot) {
   const createdAt = now(), id = createdAt.replace(/[:.]/g, '-') + '-' + randomUUID();
   const dir = path.join(getDataDir(), 'backups', id); assertNotCcSwitch(dir);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -92,6 +102,7 @@ function snapshot(db: SwitchDb, appType: AppType, reason: string, originals: Ori
       if (content !== null) fs.writeFileSync(path.join(dir, `${i}.original`), content, { mode: 0o600, flag: 'wx', flush: true });
       return { path: file, existed: content !== null };
     });
+    if (download) fs.writeFileSync(path.join(dir, 'direct-download.json'), jsonText(download), { mode: 0o600, flag: 'wx', flush: true });
     if (subagent) fs.writeFileSync(path.join(dir, 'subagent.json'), jsonText(subagent), { mode: 0o600, flag: 'wx', flush: true });
     if (agy) fs.writeFileSync(path.join(dir, 'antigravity.json'), jsonText(agy), { mode: 0o600, flag: 'wx', flush: true });
     fs.writeFileSync(path.join(dir, 'manifest.json'), jsonText(manifest), { mode: 0o600, flag: 'wx', flush: true });
@@ -116,13 +127,16 @@ export function commitFiles(db: SwitchDb, app: AppType, reason: string, plan: Pl
   const previousSub = sub ? { config: db.state('subagent'), ...(sub.userKey !== undefined ? { userKey: readAstraUserEnvKey() } : {}) } : undefined;
   const keyChanged = sub?.userKey !== undefined && previousSub?.userKey !== sub.userKey;
   const stateChanged = sub && JSON.stringify(previousSub?.config) !== JSON.stringify(sub.config);
-  if (!originals.length && !keyChanged && !stateChanged) return { ...notApplied(), ...note };
-  const backupId = snapshot(db, app, reason, originals, previous, previousSub), written = new Set<string>();
+  const previousDownload = plan.directDownload ? { config: db.state('directDownload') } : undefined;
+  const downloadChanged = plan.directDownload && JSON.stringify(previousDownload?.config) !== JSON.stringify(plan.directDownload.config);
+  if (!originals.length && !keyChanged && !stateChanged && !downloadChanged) return { ...notApplied(), ...note };
+  const backupId = snapshot(db, app, reason, originals, previous, previousSub, previousDownload), written = new Set<string>();
   let writingEnv = false;
   try {
     for (const f of changes) { atomicWrite(f.file, f.content); written.add(f.file); }
     if (envChanged && agy?.env) { writingEnv = true; writeAgyEnv(agy.env); }
     if (keyChanged) { writingEnv = true; writeAstraUserEnvKey(sub!.userKey!); }
+    if (plan.directDownload) db.setState('directDownload', plan.directDownload.config);
     if (sub) db.setState('subagent', sub.config);
     if (agy) db.setState('antigravityModelBindings', agy.bindings);
   } catch (e) {
@@ -154,6 +168,12 @@ export function restoreBackup(db: SwitchDb, id: string) {
     const sub = parseJson(textFile(subFile));
     if (!isRecord(sub.config) || typeof sub.config.apiKey !== 'string' || !isRecord(sub.config.targets) || !(sub.userKey == null || typeof sub.userKey === 'string')) throw conflict('Incomplete subagent backup.');
     plan.subagent = sub as SubagentSnapshot;
+  }
+  const downloadFile = path.join(dir, 'direct-download.json');
+  if (fs.existsSync(downloadFile)) {
+    const parsed = directDownloadConfig.safeParse(parseJson(textFile(downloadFile)).config);
+    if (!parsed.success) throw conflict('Incomplete direct downloader backup.');
+    plan.directDownload = { config: parsed.data };
   }
   return commitFiles(db, entry.appType, `Restore ${id}`, plan, true);
 }

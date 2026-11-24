@@ -69,6 +69,15 @@ class AstraTests(unittest.TestCase):
             self.assertTrue({'task', 'cwd', 'reasoning_effort', 'mode', 'session_id', 'max_steps', 'allow_outside_cwd', 'model'} <= t['inputSchema']['properties'].keys())
         self.assertIn('worker_name', tools[1]['inputSchema']['properties'])
 
+    def test_direct_download_script_appears_only_when_configured(self):
+        script = str(self.home / 'direct-download' / 'direct_download.py')
+        with patch.dict(os.environ, {'ASTRA_DIRECT_DOWNLOAD_SCRIPT': script}):
+            prompt = astra.build_developer_context(str(self.home), 'edit', False)
+            self.assertIn(script, prompt)
+            self.assertIn('without an app proxy', prompt)
+        with patch.dict(os.environ, {'ASTRA_DIRECT_DOWNLOAD_SCRIPT': ''}):
+            self.assertNotIn('direct downloader', astra.build_developer_context(str(self.home), 'edit', False))
+
     def test_user_env_key_does_not_access_the_registry_under_isolated_home(self):
         with patch.dict(os.environ, {'ASTRA_KEY_STORAGE': 'user-env', 'ASTRA_API_KEY': ''}), patch.dict(sys.modules, {'winreg': None}):
             with self.assertRaisesRegex(RuntimeError, 'ASTRA_API_KEY'):

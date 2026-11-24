@@ -42,7 +42,7 @@ function safeFile(file: string, text: string | null, keys: string[]) {
 export function getSubagentStatus(db: SwitchDb): SubagentStatus {
   const c = db.state('subagent'), { apiKey, ...config } = c, python = detectPython(config.pythonPath);
   const userKey = readAstraUserEnvKey(), keys = secrets(db, userKey ?? '');
-  const status = publicStrings({ config, python, userEnvHasKey: !!userKey, runtimeScriptPath: subagentPaths().runtime, harnesses: harnessStates(c, python.executable ?? 'python', db.state('directBypass')), updatedAt: now() }, keys);
+  const status = publicStrings({ config, python, userEnvHasKey: !!userKey, runtimeScriptPath: subagentPaths().runtime, harnesses: harnessStates(c, python.executable ?? 'python', db.state('directBypass'), db.state('directDownload')), updatedAt: now() }, keys);
   status.config.maskedKey = maskApiKey(apiKey);
   return status;
 }
@@ -109,7 +109,7 @@ async function resolveConfig(db: SwitchDb, phuket: PhuketClient, req: ApplySubag
 function planFor(db: SwitchDb, req: ApplySubagentRequest, c: StoredConfig, preview: boolean) {
   const python = detectPython(c.pythonPath);
   if (!preview && !python.meetsMinimum) throw bad(python.error!);
-  const plan = installPlan(req.targets, c, python.executable ?? 'python', fs.readFileSync(bundledScript(), 'utf8'), db.state('directBypass'));
+  const plan = installPlan(req.targets, c, python.executable ?? 'python', fs.readFileSync(bundledScript(), 'utf8'), db.state('directBypass'), db.state('directDownload'));
   checkUserKeyDestinations(c, plan);
   return plan;
 }

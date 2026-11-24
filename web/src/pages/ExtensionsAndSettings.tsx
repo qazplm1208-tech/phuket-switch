@@ -19,6 +19,7 @@ import { SearchInput } from '../components/LoginGate';
 import McpView from '../components/McpView';
 import PromptView from '../components/PromptView';
 import DirectBypassPanel from '../components/DirectBypassPanel';
+import DirectDownloadPanel from '../components/DirectDownloadPanel';
 import SoftwareUpdates from '../components/SoftwareUpdates';
 import ImagePromptPanel from '../components/ImagePromptPanel';
 import { Badge, Btn, Choices, Empty, IconBtn, Notice, Section, Skeleton, Toggle } from '../components/ui';
@@ -27,6 +28,7 @@ const tabs = [
   ['mcp', 'MCP 服务器'],
   ['prompts', '系统提示词'],
   ['image-prompt', '生图适配'],
+  ['direct-download', 'AI 直连下载'],
   ['skills', 'Skills'],
   ['backups', '配置备份'],
   ['import', 'CC-Switch 导入'],
@@ -181,6 +183,8 @@ const reasons: Record<string, string> = {
   'Apply prompt preset': '应用系统提示词',
   'Apply image generation prompt': '写入生图系统提示词',
   'Remove image generation prompt': '移除生图系统提示词',
+  'Apply direct downloader': '部署 AI 直连下载脚本与规则',
+  'Remove direct downloader': '移除 AI 直连下载规则',
   'Save MCP server': '保存 MCP 服务器',
   'Remove MCP server': '移除 MCP 服务器',
 };
@@ -209,7 +213,8 @@ function Backups() {
                 <time>{time(b.createdAt, true)}</time>
                 <div className="inline">
                   <b>{reasons[b.reason] || b.reason || '配置备份'}</b>
-                  <Badge>{['Apply subagent', 'Remove subagent'].includes(b.reason) ? '子代理' : appName[b.appType]}</Badge>
+                  <Badge>{['Apply direct downloader', 'Remove direct downloader'].includes(b.reason) ? 'AI 直连下载'
+                      : ['Apply subagent', 'Remove subagent'].includes(b.reason) ? '子代理' : appName[b.appType]}</Badge>
                 </div>
                 <details>
                   <summary>{b.files.length} 个文件</summary>
@@ -336,6 +341,8 @@ export default function ExtensionsAndSettings() {
         <PromptView />
       ) : tab === 'image-prompt' ? (
         <ImagePromptPanel />
+      ) : tab === 'direct-download' ? (
+        <DirectDownloadPanel />
       ) : tab === 'skills' ? (
         <Skills />
       ) : tab === 'backups' ? (

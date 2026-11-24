@@ -590,6 +590,32 @@ export interface DirectBypassRouteInfo {
 export interface DirectBypassStatus {
   config: DirectBypassConfig; bridgeRunning: boolean; selected: DirectBypassRouteInfo | null; adapters: DirectBypassRouteInfo[]; error: string | null;
 }
+export const directDownloadTargets = ['codex', 'claude-code', 'gemini-cli', 'antigravity', 'windsurf', 'opencode', 'cline'] as const;
+export type DirectDownloadTarget = typeof directDownloadTargets[number];
+export const directDownloadModes = ['follow-bypass', 'physical-nic', 'skip-proxy'] as const;
+export type DirectDownloadMode = typeof directDownloadModes[number];
+export interface DirectDownloadConfig {
+  enabled: boolean; mode: DirectDownloadMode; interfaceName: string; dnsServers: string[];
+  connections: number; retries: number; maxRate: string; resume: boolean; enableTorrent: boolean;
+  targets: Record<DirectDownloadTarget, boolean>; customInstructions?: string; updatedAt?: string;
+}
+export interface DirectDownloadTargetState { id: DirectDownloadTarget; name: string; path: string; detected: boolean; exists: boolean; injected: boolean }
+export interface DirectDownloadStatus {
+  config: DirectDownloadConfig; python: SubagentPythonInfo; runtimeDir: string; scriptPath: string; cmdPath: string;
+  scriptInstalled: boolean; liveTargets: Record<DirectDownloadTarget, DirectDownloadTargetState>; previewMarkdown: string; updatedAt: string;
+}
+export interface ApplyDirectDownloadRequest extends Partial<Omit<DirectDownloadConfig, 'enabled' | 'targets' | 'updatedAt'>> { targets: DirectDownloadTarget[] }
+export interface ConfigDiffFile { path: string; before: string | null; after: string | null }
+export interface DirectDownloadDiffPreview { files: ConfigDiffFile[]; warnings: string[]; previewMarkdown: string }
+export interface ApplyDirectDownloadResult { system: SystemApplyResult; status: DirectDownloadStatus }
+export interface RemoveDirectDownloadRequest { targets: DirectDownloadTarget[]; removeScripts?: boolean }
+export interface DirectDownloadTestRequest { url?: string }
+export interface DirectDownloadTestResult {
+  ok: boolean; latencyMs: number; pythonExecutable: string | null; pythonVersion: string | null; scriptVersion: string | null; capabilities: string[];
+  probe?: { url: string; finalUrl?: string; filename?: string; totalSize?: number | null; acceptRanges?: boolean; contentType?: string; route?: DirectBypassRouteInfo | null };
+  error?: string; testedAt: string;
+}
+
 export type UpdateDirectBypassRequest = Partial<DirectBypassConfig>;
 export interface DirectBypassProbeRequest { url?: string }
 export interface DirectBypassProbeResult {
@@ -765,7 +791,7 @@ export interface ApplySubagentRequest extends Partial<Pick<SubagentConfig, 'prot
 }
 export interface ApplySubagentResult { status: SubagentStatus; system: SystemApplyResult }
 export interface RemoveSubagentRequest { targets: SubagentHarnessId[]; removeRules?: boolean }
-export interface SubagentDiffPreview { files: { path: string; before: string | null; after: string | null }[]; warnings: string[] }
+export interface SubagentDiffPreview { files: ConfigDiffFile[]; warnings: string[] }
 export interface SubagentTestRequest { pythonPath?: string; model?: string; protocol?: SubagentProtocol; baseUrl?: string; providerId?: string; apiKey?: string; testUpstream?: boolean }
 export interface SubagentTestResult {
   ok: boolean; latencyMs: number; handshakeLatencyMs?: number; pythonExecutable: string | null; pythonVersion: string | null; serverVersion: string | null;
@@ -803,7 +829,7 @@ export interface ConfigBackupItem {
 export interface ConfigDiffPreview {
   appType: AppType;
   providerId: string;
-  files: { path: string; before: string | null; after: string | null }[];
+  files: ConfigDiffFile[];
   warnings: string[];
 }
 
@@ -884,6 +910,11 @@ export interface ApiContract {
   'GET /api/network/direct-bypass': Route<NoBody, DirectBypassStatus>;
   'PUT /api/network/direct-bypass': Route<UpdateDirectBypassRequest, DirectBypassStatus>;
   'POST /api/network/direct-bypass/probe': Route<DirectBypassProbeRequest, DirectBypassProbeResult>;
+  'GET /api/direct-download': Route<NoBody, DirectDownloadStatus>;
+  'POST /api/direct-download/preview-diff': Route<ApplyDirectDownloadRequest, DirectDownloadDiffPreview>;
+  'POST /api/direct-download/apply': Route<ApplyDirectDownloadRequest, ApplyDirectDownloadResult>;
+  'POST /api/direct-download/remove': Route<RemoveDirectDownloadRequest, ApplyDirectDownloadResult>;
+  'POST /api/direct-download/test': Route<DirectDownloadTestRequest, DirectDownloadTestResult>;
   'GET /api/subagent': Route<NoBody, SubagentStatus>;
   'POST /api/subagent/preview-diff': Route<ApplySubagentRequest, SubagentDiffPreview>;
   'POST /api/subagent/apply': Route<ApplySubagentRequest, ApplySubagentResult>;

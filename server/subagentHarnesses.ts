@@ -1,10 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import type { DirectBypassConfig } from '../shared/types.js';
+import type { DirectBypassConfig, DirectDownloadConfig } from '../shared/types.js';
 import { bundledDirectFile } from './directFiles.js';
 import { subagentHarnessIds, subagentProtocols, type SubagentConfig, type SubagentHarnessId as Id, type SubagentHarnessState } from '../shared/types.js';
 import { conflict, getUserHome, isRecord, own } from './common.js';
-import { jsonText, managedText, parseJson, subagentPaths, type Plan } from './configFiles.js';
+import { directDownloadPaths, jsonText, managedText, parseJson, subagentPaths, type Plan } from './configFiles.js';
 import { parseToml, replaceTomlSubtree } from './surgicalToml.js';
 import { editSubagentBlock, subagentBlock } from './subagentRules.js';
 import { renderSubagentRules as ruleText, renderSubagentSkill, withoutLegacyNativeRules } from './subagentTemplates.js';
@@ -32,7 +32,7 @@ function paths(id: Id) {
   if (id === 'cline' && dirExists(path.dirname(f.clineVsMcp))) mcp.splice(0, 1, f.clineVsMcp);
   return { mcp, rules, root };
 }
-function entry(id: Id, c: StoredConfig, command: string, direct: DirectBypassConfig, masked = false) {
+function entry(id: Id, c: StoredConfig, command: string, direct: DirectBypassConfig, download: DirectDownloadConfig, masked = false) {
   const f = subagentPaths(), args = ['-u', id === 'antigravity' ? f.pluginServer : f.runtime];
   const env = { PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8', PYTHONUNBUFFERED: '1',
     ASTRA_BASE_URL: c.baseUrl, ASTRA_MODEL: c.model, ASTRA_PROTOCOL: c.protocol, ASTRA_DEFAULT_REASONING_EFFORT: c.reasoningEffort, ASTRA_REASONING_EFFORT: c.reasoningEffort,
@@ -40,6 +40,7 @@ function entry(id: Id, c: StoredConfig, command: string, direct: DirectBypassCon
     ASTRA_ALLOW_MODEL_COMPACTION: c.enableChunkCompaction ? '1' : '0',
     ASTRA_COMPACT_TRIGGER_TOKENS: String(Math.max(5584, Math.min(c.maxContextTokens, Math.round(c.maxContextTokens * c.compactTriggerPct / 100)))),
     ASTRA_COMPACT_KEEP_RECENT_GROUPS: String(c.compactKeepRecentGroups),
+    ...(download.enabled ? { ASTRA_DIRECT_DOWNLOAD_SCRIPT: directDownloadPaths().script } : {}),
     ...(direct.enabled && direct.applyToSubagent ? { ASTRA_DIRECT_BYPASS: direct.mode,
       ...(direct.interfaceName ? { ASTRA_DIRECT_INTERFACE: direct.interfaceName } : {}),
       ...(direct.dnsServers.length ? { ASTRA_DIRECT_DNS: direct.dnsServers.join(',') } : {}) } : {}),
@@ -64,9 +65,9 @@ function renderMcp(id: Id, src: string | null, value: ReturnType<typeof entry> |
   if (id === 'antigravity' && !value && !Object.keys(next).length && Object.keys(doc).length === 1) return null;
   return jsonText({ ...doc, [key]: next });
 }
-export function harnessStates(c: StoredConfig, exe: string, direct: DirectBypassConfig): SubagentHarnessState[] {
+export function harnessStates(c: StoredConfig, exe: string, direct: DirectBypassConfig, download: DirectDownloadConfig): SubagentHarnessState[] {
   return subagentHarnessIds.map(id => {
-    const p = paths(id), value = entry(id, c, exe, direct, true), notes: string[] = [];
+    const p = paths(id), value = entry(id, c, exe, direct, download, true), notes: string[] = [];
     const rulesSnippet = (id === 'cursor' ? '---\ndescription: Phuket subagent\nalwaysApply: true\n---\n' : '') + ruleText(c, id);
     const state: SubagentHarnessState = { id, name: names[id], detected: dirExists(p.root), installed: false, rulesInstalled: false, supportsRules: !!p.rules,
       installedModel: null, installedProtocol: null, mcpPath: p.mcp[0], rulesPath: p.rules, snippet: renderMcp(id, null, value)!, rulesSnippet, notes };
@@ -102,7 +103,7 @@ export function checkUserKeyDestinations(c: StoredConfig, plan: Plan) {
     }
   }
 }
-export function installPlan(ids: Id[], c: StoredConfig, exe: string, script: string, direct: DirectBypassConfig): Plan {
+export function installPlan(ids: Id[], c: StoredConfig, exe: string, script: string, direct: DirectBypassConfig, download: DirectDownloadConfig): Plan {
   const f = subagentPaths(), plan: Plan = new Map();
   const helpers = (dns: string, net: string) => {
     if (direct.enabled && direct.applyToSubagent) {
@@ -113,7 +114,7 @@ export function installPlan(ids: Id[], c: StoredConfig, exe: string, script: str
   if (ids.some(id => id !== 'antigravity')) { plan.set(f.runtime, script); helpers(f.runtimeDirectDns, f.runtimeDirectNet); }
   for (const id of ids) {
     const p = paths(id), block = ruleText(c, id);
-    for (const file of p.mcp) plan.set(file, renderMcp(id, managedText(file), entry(id, c, exe, direct)));
+    for (const file of p.mcp) plan.set(file, renderMcp(id, managedText(file), entry(id, c, exe, direct, download)));
     if (p.rules) {
       const before = managedText(p.rules);
       const src = id === 'antigravity' ? withoutLegacyNativeRules(before ?? '') : before ?? '';

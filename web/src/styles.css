@@ -51,7 +51,7 @@
 .subagent-footer .actions { justify-content: flex-end; }
 .subagent-view :is(input, button, select, textarea) { scroll-margin-bottom: 70px; }
 .subagent-snippet pre { max-height: 36dvh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--soft); border: 1px solid var(--divider); border-radius: 6px; padding: 10px; font: 12px/1.6 var(--mono); }
-.subagent-modal-foot {
+.subagent-modal-foot, .download-diff .modal-foot {
   position: sticky;
   bottom: calc(-1 * var(--modal-body-pad-y));
   z-index: 3;
@@ -167,6 +167,8 @@
 .direct-fields .btn { margin-inline-start: auto; }
 .direct-bypass .grow, .direct-shortcut .grow { overflow-wrap: anywhere; }
 .direct-shortcut .grow { flex-basis: 12rem; }
+.direct-download :is(.section-head, .actions, .segments, .spread) { flex-wrap: wrap; }
+.direct-download :is(.grow, code), .download-diff h3 { overflow-wrap: anywhere; }
 .software-updates, .update-result { display: grid; gap: 10px; min-width: 0; }
 .software-updates .update-version, .update-version .inline, .update-result .spread { flex-wrap: wrap; }
 .update-result { border-left: 3px solid var(--accent); padding: 8px 12px; }
