@@ -27,8 +27,10 @@ export function subagentPaths() {
   const roaming = process.platform === 'win32' ? (!isolated && process.env.APPDATA || at('AppData', 'Roaming'))
     : process.platform === 'darwin' ? at('Library', 'Application Support') : at('.config');
   const plugin = (...p: string[]) => at('.gemini', 'config', 'plugins', 'gpt-astra-subagent', ...p);
+  const runtime = (name: string) => at('.phuket-switch', 'subagent', 'server', name);
   return {
-    runtime: at('.phuket-switch', 'subagent', 'server', 'astra_mcp_server.py'),
+    runtime: runtime('astra_mcp_server.py'), runtimeDirectDns: runtime('direct_dns.py'), runtimeDirectNet: runtime('direct_net.py'),
+    pluginDirectDns: plugin('server', 'direct_dns.py'), pluginDirectNet: plugin('server', 'direct_net.py'),
     pluginManifest: plugin('plugin.json'), pluginMcp: plugin('mcp_config.json'), pluginRules: plugin('rules', 'AGENTS.md'),
     pluginSkill: plugin('skills', 'gpt-astra-orchestrator', 'SKILL.md'), pluginServer: plugin('server', 'astra_mcp_server.py'),
     claudeMcp: cli.claudeMcp, claudeRules: cli.claudePrompt, codexMcp: cli.codex, codexRules: cli.codexPrompt,

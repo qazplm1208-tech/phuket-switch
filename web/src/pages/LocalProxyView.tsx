@@ -6,6 +6,7 @@ import { appName, ms, systemNote, time } from '../lib/display';
 import { copyText, useAction, useFeedback } from '../lib/feedback';
 import { usePoll, useResource } from '../lib/resource';
 import { useStudio } from '../lib/studio';
+import { DirectBypassBadge } from '../components/DirectBypassPanel';
 import RouteManager from '../components/RouteManager';
 import { Badge, Btn, Choices, Empty, IconBtn, Notice, Section, Skeleton, Table, Toggle } from '../components/ui';
 
@@ -160,6 +161,8 @@ function ProxyControls() {
   const s = useStudio(),
     { notify, confirm } = useFeedback(),
     { pending, run } = useAction(),
+    direct = useResource('direct-bypass', api.directBypass),
+    status = direct.data,
     p = s.proxy;
   const endpoint = p ? (p.baseUrl ?? `http://${p.settings.host}:${p.settings.port}`) : '';
   return (
@@ -210,6 +213,23 @@ function ProxyControls() {
       ) : (
         s.proxyResource.loading && <Skeleton />
       )}
+      <section className="grouped-list direct-shortcut" aria-label="网络直连（绕过代理）">
+        <div className="setting-row">
+          <div className="grow">
+            <b>网络直连（绕过代理）</b>
+            <small>{!status ? (direct.loading ? '正在读取…' : '状态未知') : status.config.mode === 'skip-proxy' ? '仅跳过系统代理 · 使用系统路由' : status.bridgeRunning && status.selected
+              ? `当前网卡：${status.selected.name}` : `物理网卡 · ${status.config.interfaceName || '自动选择'}`}</small>
+          </div>
+          {status && <span role="status"><DirectBypassBadge status={status} /></span>}
+          <Toggle label="启用绕过代理直连" on={!!status?.config.enabled} disabled={!status || direct.loading || !!pending}
+            change={() => status && void run('direct', async () => {
+              direct.replace(await api.updateDirectBypass({ enabled: !status.config.enabled }));
+            })} />
+          <Btn kind="ghost" icon={ArrowRight} onClick={() => s.navigate('/extensions', 'preferences')}>详细设置</Btn>
+        </div>
+        {direct.error && <Notice tone="bad" retry={direct.reload}>{direct.error}</Notice>}
+        {status?.config.enabled && status.config.mode === 'physical-nic' && status.error && <Notice tone="bad">{status.error}</Notice>}
+      </section>
       <section className="stack">
         <Section title="客户端一键代理接管" />
         <div className="grouped-list">

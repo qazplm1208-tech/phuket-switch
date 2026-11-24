@@ -160,6 +160,13 @@
 @media (max-width: 1040px) {
   .update-pill span { display: none; }
 }
+.direct-bypass .segments, .direct-bypass .section-head, .direct-bypass .actions, .direct-shortcut .setting-row { flex-wrap: wrap; }
+.direct-bypass .direct-fields { align-items: end; flex-wrap: wrap; }
+.direct-fields .field { flex: 1 1 14rem; }
+.direct-fields .field + .field { flex: 2 1 20rem; }
+.direct-fields .btn { margin-inline-start: auto; }
+.direct-bypass .grow, .direct-shortcut .grow { overflow-wrap: anywhere; }
+.direct-shortcut .grow { flex-basis: 12rem; }
 .software-updates, .update-result { display: grid; gap: 10px; min-width: 0; }
 .software-updates .update-version, .update-version .inline, .update-result .spread { flex-wrap: wrap; }
 .update-result { border-left: 3px solid var(--accent); padding: 8px 12px; }

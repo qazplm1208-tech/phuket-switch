@@ -17,7 +17,7 @@ async function host() {
   const { createRuntime, createManagementApp } = await import('../dist/server/app.js');
   const group = { id: 124, name: '测试 Gemini 分组', platform: 'gemini', status: 'active', models: [{ name: 'gemini-2.5-pro' }, { name: 'gemini-other' }] };
   const exampleKey = { id: 18, name: '测试密钥', key: 'fixture-group-credential', status: 'active', group_id: 124 };
-  const runtime = createRuntime({ fetch: async (u, init) => {
+  const runtime = createRuntime({ directBypass: { systemRoute: true }, fetch: async (u, init) => {
     const url = new URL(String(u)); let value = {};
     if (url.hostname === 'catalog.invalid') { assert.equal(new Headers(init.headers).get('authorization'), 'Bearer fixture-provider-credential'); return Response.json({ data: [] }); }
     if (url.href === customBase + '/models') { assert.equal(new Headers(init.headers).get('authorization'), `Bearer ${secret}`); return Response.json({ data: [] }); }
@@ -34,6 +34,7 @@ async function host() {
     let body = ''; req.on('data', b => body += b); req.on('end', () => { const data = JSON.parse(body); if (route === '/api/subagent/test') tests.push(data); else requests[route] = data; }); });
   let child;
   try {
+    await runtime.directBypass.updateConfig({ interfaceName: 'Fixture Ethernet' }); // Saved adapter is offline in this fixture.
     server.listen(0, '127.0.0.1'); await once(server, 'listening');
     const env = { ...process.env, PHUKET_UI_TEST_ORIGIN: `http://127.0.0.1:${server.address().port}` }; delete env.ELECTRON_RUN_AS_NODE;
     child = spawn(createRequire(import.meta.url)('electron'), [`--user-data-dir=${path.join(temp, 'chromium')}`, '--no-proxy-server', '--disable-background-networking', import.meta.filename], { env, stdio: 'inherit', windowsHide: true });
@@ -47,6 +48,8 @@ async function host() {
     assert.ok(!Object.hasOwn(customTests[0], 'apiKey')); assert.ok(customTests.slice(1).every(t => t.apiKey === secret));
     for (const r of [applied, ...customTests]) for (const field of ['providerId','groupId','phuketKeyId','autoCreatePhuketKey','keepExistingKey']) assert.ok(!Object.hasOwn(r, field));
     assert.equal(runtime.db.state('subagent').keySource, 'manual');
+    assert.deepEqual(runtime.db.state('directBypass'), { enabled: false, mode: 'skip-proxy', interfaceName: 'Fixture Ethernet',
+      dnsServers: ['192.0.2.53', '2001:db8::53'], applyToSubagent: false });
   } finally {
     if (child && child.exitCode === null && !child.killed) child.kill();
     server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); await runtime.close();
@@ -131,6 +134,33 @@ async function renderer({ app, BrowserWindow, session }) {
     await js("document.querySelector('[aria-label=\"移除 Cursor\"]').click()"); await wait("!!btn('确认移除')", 'confirm remove'); await click('取消'); assert.equal(await js("document.querySelectorAll('.subagent-harness .badge.good').length"), 2);
     await js("document.querySelector('[aria-label=\"移除 Cursor\"]').click()"); await click('确认移除'); await wait("document.querySelectorAll('.subagent-harness .badge.good').length===1", 'single removal');
     await click('移除全部已部署'); await click('确认移除'); await wait("document.querySelectorAll('.subagent-harness .badge.good').length===0", 'all removed');
+    await js("document.querySelector('.sidebar a[href=\"/proxy\"]').click()");
+    await wait("document.querySelector('.direct-shortcut .badge')?.textContent==='未启用'", 'direct shortcut');
+    await click('详细设置');
+    await wait("location.hash==='#preferences' && field('物理网卡')?.value==='Fixture Ethernet'", 'offline adapter');
+    assert.ok(await js("field('物理网卡').selectedOptions[0].textContent.includes('未检测到')"));
+    const dnsField = 'DNS 服务器（可选）';
+    await set(dnsField, 'invalid.invalid'); await click('保存网卡与 DNS');
+    await wait("document.querySelector('.toast-stack').textContent.includes('DNS 服务器必须是 IPv4 或 IPv6 地址')", 'DNS validation');
+    await set(dnsField, ' 192.0.2.53,  2001:db8::53 ');
+    await js("document.querySelector('[aria-label=\"同步用于子代理（Astra MCP）\"]').click()");
+    await wait("document.querySelector('[aria-label=\"同步用于子代理（Astra MCP）\"]').getAttribute('aria-checked')==='false'", 'subagent sync preference');
+    await click('刷新网卡'); await wait("!btn('刷新网卡').disabled", 'adapter refresh');
+    assert.equal(await js(`field(${JSON.stringify(dnsField)}).value`), ' 192.0.2.53,  2001:db8::53 ');
+    await click('保存网卡与 DNS'); await wait(`field(${JSON.stringify(dnsField)}).value==='192.0.2.53, 2001:db8::53'`, 'DNS save');
+    for (const [width,theme] of [[920,'light'],[440,'dark']]) {
+      w.setContentSize(width,700); await js(`document.documentElement.dataset.theme=${JSON.stringify(theme)}`); await delay(100);
+      assert.ok(await js("[...document.querySelectorAll('.direct-bypass, .direct-bypass .setting-row')].every(el=>el.scrollWidth<=el.clientWidth+1)"), 'direct panel overflow at '+width);
+    }
+    await click('仅跳过系统代理'); await wait("btn('仅跳过系统代理').getAttribute('aria-pressed')==='true'", 'skip-proxy mode');
+    await js("document.querySelector('[aria-label=启用绕过代理直连]').click()");
+    await wait("document.querySelector('.direct-bypass .badge')?.textContent==='绕过系统代理'", 'enabled direct badge');
+    await set('测试地址（可选）', ' '+origin+'/api/health '); await click('测试直连');
+    await wait("document.querySelector('.direct-bypass').textContent.includes('HTTP 200 · ') && document.querySelector('.direct-bypass').textContent.includes('未使用直连')", 'loopback probe result');
+    await js("document.querySelector('.sidebar a[href=\"/proxy\"]').click()");
+    await wait("document.querySelector('.direct-shortcut .badge')?.textContent==='绕过系统代理'", 'shortcut reflects enabled mode');
+    await js("document.querySelector('.direct-shortcut [role=switch]').click()");
+    await wait("document.querySelector('.direct-shortcut .badge')?.textContent==='未启用'", 'quick disable');
     await w.loadURL(origin+'/extensions#backups'); await wait("document.querySelector('.backup-list')?.textContent.includes('部署子代理插件与配置') && document.querySelector('.backup-list')?.textContent.includes('移除子代理配置')", 'backups');
     console.log('Renderer passed: inline origin keys, presets, endpoint preview, read-only discovery, redacted diff/apply, independent MCP storage, navigation, provider/group/manual sources, custom model, MCP handshake, chunk policy, refresh, selection, safe copies, removal, backups, light/dark widths.');
   } finally { w.destroy(); }

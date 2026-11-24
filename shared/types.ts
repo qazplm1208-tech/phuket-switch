@@ -578,6 +578,25 @@ export interface ProxyTakeoverRequest { appType: AppType; enable: boolean }
 export interface ProxyTakeoverResult { proxy: ProxyStatus; system: SystemApplyResult }
 export interface ProxyLogsPage { items: ProxyRequestLog[]; total: number }
 
+export const directBypassModes = ['physical-nic', 'skip-proxy'] as const;
+export type DirectBypassMode = typeof directBypassModes[number];
+export interface DirectBypassConfig {
+  enabled: boolean; mode: DirectBypassMode; interfaceName: string; dnsServers: string[]; applyToSubagent: boolean;
+}
+export interface DirectBypassRouteInfo {
+  name: string; description: string; index: number | null; ipv4: string | null; ipv6: string | null;
+  gateway: string | null; dnsServers: string[]; metric: number | null; systemRoute: boolean;
+}
+export interface DirectBypassStatus {
+  config: DirectBypassConfig; bridgeRunning: boolean; selected: DirectBypassRouteInfo | null; adapters: DirectBypassRouteInfo[]; error: string | null;
+}
+export type UpdateDirectBypassRequest = Partial<DirectBypassConfig>;
+export interface DirectBypassProbeRequest { url?: string }
+export interface DirectBypassProbeResult {
+  ok: boolean; statusCode: number | null; latencyMs: number; mode: DirectBypassMode; bypassUsed: boolean;
+  route: DirectBypassRouteInfo | null; error: string | null; testedAt: string;
+}
+
 export interface ProxyStatus {
   takeover: ProxyTakeoverState;
   running: boolean;
@@ -862,6 +881,9 @@ type Route<Input, Output, Status extends number = 200> = {
 
 export interface ApiContract {
   'GET /api/health': Route<NoBody, HealthResponse>;
+  'GET /api/network/direct-bypass': Route<NoBody, DirectBypassStatus>;
+  'PUT /api/network/direct-bypass': Route<UpdateDirectBypassRequest, DirectBypassStatus>;
+  'POST /api/network/direct-bypass/probe': Route<DirectBypassProbeRequest, DirectBypassProbeResult>;
   'GET /api/subagent': Route<NoBody, SubagentStatus>;
   'POST /api/subagent/preview-diff': Route<ApplySubagentRequest, SubagentDiffPreview>;
   'POST /api/subagent/apply': Route<ApplySubagentRequest, ApplySubagentResult>;

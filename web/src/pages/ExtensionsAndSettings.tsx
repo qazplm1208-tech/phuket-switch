@@ -18,6 +18,7 @@ import { useStudio } from '../lib/studio';
 import { SearchInput } from '../components/LoginGate';
 import McpView from '../components/McpView';
 import PromptView from '../components/PromptView';
+import DirectBypassPanel from '../components/DirectBypassPanel';
 import SoftwareUpdates from '../components/SoftwareUpdates';
 import ImagePromptPanel from '../components/ImagePromptPanel';
 import { Badge, Btn, Choices, Empty, IconBtn, Notice, Section, Skeleton, Toggle } from '../components/ui';
@@ -296,6 +297,7 @@ function Preferences() {
           <code>{PHUKET_BASE_URL}</code>
         </div>
       </div>
+      <DirectBypassPanel />
       <SoftwareUpdates />
       {window.phuketDesktop?.isElectron && (
         <div className="actions end">

@@ -42,7 +42,7 @@ function safeFile(file: string, text: string | null, keys: string[]) {
 export function getSubagentStatus(db: SwitchDb): SubagentStatus {
   const c = db.state('subagent'), { apiKey, ...config } = c, python = detectPython(config.pythonPath);
   const userKey = readAstraUserEnvKey(), keys = secrets(db, userKey ?? '');
-  const status = publicStrings({ config, python, userEnvHasKey: !!userKey, runtimeScriptPath: subagentPaths().runtime, harnesses: harnessStates(c, python.executable ?? 'python'), updatedAt: now() }, keys);
+  const status = publicStrings({ config, python, userEnvHasKey: !!userKey, runtimeScriptPath: subagentPaths().runtime, harnesses: harnessStates(c, python.executable ?? 'python', db.state('directBypass')), updatedAt: now() }, keys);
   status.config.maskedKey = maskApiKey(apiKey);
   return status;
 }
@@ -106,15 +106,15 @@ async function resolveConfig(db: SwitchDb, phuket: PhuketClient, req: ApplySubag
   c.maskedKey = maskApiKey(c.apiKey); for (const id of targets) c.targets[id] = true;
   return c;
 }
-function planFor(req: ApplySubagentRequest, c: StoredConfig, preview: boolean) {
+function planFor(db: SwitchDb, req: ApplySubagentRequest, c: StoredConfig, preview: boolean) {
   const python = detectPython(c.pythonPath);
   if (!preview && !python.meetsMinimum) throw bad(python.error!);
-  const plan = installPlan(req.targets, c, python.executable ?? 'python', fs.readFileSync(bundledScript(), 'utf8'));
+  const plan = installPlan(req.targets, c, python.executable ?? 'python', fs.readFileSync(bundledScript(), 'utf8'), db.state('directBypass'));
   checkUserKeyDestinations(c, plan);
   return plan;
 }
 export async function previewSubagent(db: SwitchDb, phuket: PhuketClient, req: ApplySubagentRequest): Promise<SubagentDiffPreview> {
-  const c = await resolveConfig(db, phuket, req, true), plan = planFor(req, c, true), keys = secrets(db, c.apiKey);
+  const c = await resolveConfig(db, phuket, req, true), plan = planFor(db, req, c, true), keys = secrets(db, c.apiKey);
   const warnings = useUserEnv(c) ? ['ASTRA_API_KEY is not written to MCP files. Restart the harness after changing Windows user environment variables.'] : ['Selected MCP configurations will contain an API key.'];
   if (!detectPython(c.pythonPath).meetsMinimum) warnings.push('Python 3.10 or later is required to apply.');
   return { files: [...plan].map(([file, after]) => ({ path: file, before: safeFile(file, managedText(file), keys), after: safeFile(file, after?.toString() ?? null, keys) })), warnings };
@@ -129,11 +129,11 @@ function commit(db: SwitchDb, c: StoredConfig, plan: Plan, reason: string, write
 export async function applySubagent(db: SwitchDb, phuket: PhuketClient, req: ApplySubagentRequest): Promise<ApplySubagentResult> {
   // Validate files and interpreter before a potentially irreversible remote key creation.
   if ((req.groupId || req.autoCreatePhuketKey) && !req.phuketKeyId && !req.apiKey && !req.providerId) {
-    const preflight = planFor(req, { ...db.state('subagent'), pythonPath: req.pythonPath ?? db.state('subagent').pythonPath }, false);
+    const preflight = planFor(db, req, { ...db.state('subagent'), pythonPath: req.pythonPath ?? db.state('subagent').pythonPath }, false);
     for (const file of preflight.keys()) managedText(file);
   }
   const c = await resolveConfig(db, phuket, req, false);
-  return commit(db, c, planFor(req, c, false), 'Apply subagent', true);
+  return commit(db, c, planFor(db, req, c, false), 'Apply subagent', true);
 }
 export function removeSubagent(db: SwitchDb, req: RemoveSubagentRequest): ApplySubagentResult {
   const c = db.state('subagent'), plan = uninstallPlan(req.targets, req.removeRules !== false, c);

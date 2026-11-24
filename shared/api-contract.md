@@ -22,6 +22,8 @@ Subagent preview and apply accept `enableChunkCompaction` (default `true`), `com
 
 `AppSettings.autoCheckUpdates` is an optional boolean, defaulting to `true` for new and existing databases. A settings PUT that omits it preserves the saved preference. Only the desktop main process checks GitHub on startup; downloading and restarting are separate user actions.
 
+`directBypass` is off by default. `physical-nic` binds connections and DNS to the selected Windows adapter and fails closed if that route is unavailable. `skip-proxy` skips HTTP proxies but uses normal OS routing (including VPN routes). Loopback URLs are exempt. A probe makes a single unauthenticated HTTP request; HTTP statuses below 500 indicate reachability, not successful API authentication. PUT persists the app setting only. Use Subagent Apply to update installed harnesses.
+
 <!-- Generated route tables -->
 
 ## Management
@@ -29,6 +31,9 @@ Subagent preview and apply accept `enableChunkCompaction` (default `true`), `com
 | Method and path | Input | Status | Response |
 | --- | --- | --- | --- |
 | `GET /api/health` | `NoBody` | 200 | `HealthResponse` |
+| `GET /api/network/direct-bypass` | `NoBody` | 200 | `DirectBypassStatus` |
+| `PUT /api/network/direct-bypass` | `UpdateDirectBypassRequest` | 200 | `DirectBypassStatus` |
+| `POST /api/network/direct-bypass/probe` | `DirectBypassProbeRequest` | 200 | `DirectBypassProbeResult` |
 | `GET /api/subagent` | `NoBody` | 200 | `SubagentStatus` |
 | `POST /api/subagent/preview-diff` | `ApplySubagentRequest` | 200 | `SubagentDiffPreview` |
 | `POST /api/subagent/apply` | `ApplySubagentRequest` | 200 | `ApplySubagentResult` |

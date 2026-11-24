@@ -1,5 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import type { DirectBypassConfig } from '../shared/types.js';
+import { bundledDirectFile } from './directFiles.js';
 import { subagentHarnessIds, subagentProtocols, type SubagentConfig, type SubagentHarnessId as Id, type SubagentHarnessState } from '../shared/types.js';
 import { conflict, getUserHome, isRecord, own } from './common.js';
 import { jsonText, managedText, parseJson, subagentPaths, type Plan } from './configFiles.js';
@@ -30,7 +32,7 @@ function paths(id: Id) {
   if (id === 'cline' && dirExists(path.dirname(f.clineVsMcp))) mcp.splice(0, 1, f.clineVsMcp);
   return { mcp, rules, root };
 }
-function entry(id: Id, c: StoredConfig, command: string, masked = false) {
+function entry(id: Id, c: StoredConfig, command: string, direct: DirectBypassConfig, masked = false) {
   const f = subagentPaths(), args = ['-u', id === 'antigravity' ? f.pluginServer : f.runtime];
   const env = { PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8', PYTHONUNBUFFERED: '1',
     ASTRA_BASE_URL: c.baseUrl, ASTRA_MODEL: c.model, ASTRA_PROTOCOL: c.protocol, ASTRA_DEFAULT_REASONING_EFFORT: c.reasoningEffort, ASTRA_REASONING_EFFORT: c.reasoningEffort,
@@ -38,6 +40,9 @@ function entry(id: Id, c: StoredConfig, command: string, masked = false) {
     ASTRA_ALLOW_MODEL_COMPACTION: c.enableChunkCompaction ? '1' : '0',
     ASTRA_COMPACT_TRIGGER_TOKENS: String(Math.max(5584, Math.min(c.maxContextTokens, Math.round(c.maxContextTokens * c.compactTriggerPct / 100)))),
     ASTRA_COMPACT_KEEP_RECENT_GROUPS: String(c.compactKeepRecentGroups),
+    ...(direct.enabled && direct.applyToSubagent ? { ASTRA_DIRECT_BYPASS: direct.mode,
+      ...(direct.interfaceName ? { ASTRA_DIRECT_INTERFACE: direct.interfaceName } : {}),
+      ...(direct.dnsServers.length ? { ASTRA_DIRECT_DNS: direct.dnsServers.join(',') } : {}) } : {}),
     ASTRA_KEY_STORAGE: useUserEnv(c) ? 'user-env' : 'mcp-env',
     ...(process.env.PHUKET_SWITCH_USER_HOME !== undefined ? { PHUKET_SWITCH_USER_HOME: getUserHome() } : {}),
     ...(!useUserEnv(c) && c.apiKey ? { ASTRA_API_KEY: masked ? '[REDACTED]' : c.apiKey } : {}) };
@@ -59,9 +64,9 @@ function renderMcp(id: Id, src: string | null, value: ReturnType<typeof entry> |
   if (id === 'antigravity' && !value && !Object.keys(next).length && Object.keys(doc).length === 1) return null;
   return jsonText({ ...doc, [key]: next });
 }
-export function harnessStates(c: StoredConfig, exe: string): SubagentHarnessState[] {
+export function harnessStates(c: StoredConfig, exe: string, direct: DirectBypassConfig): SubagentHarnessState[] {
   return subagentHarnessIds.map(id => {
-    const p = paths(id), value = entry(id, c, exe, true), notes: string[] = [];
+    const p = paths(id), value = entry(id, c, exe, direct, true), notes: string[] = [];
     const rulesSnippet = (id === 'cursor' ? '---\ndescription: Phuket subagent\nalwaysApply: true\n---\n' : '') + ruleText(c, id);
     const state: SubagentHarnessState = { id, name: names[id], detected: dirExists(p.root), installed: false, rulesInstalled: false, supportsRules: !!p.rules,
       installedModel: null, installedProtocol: null, mcpPath: p.mcp[0], rulesPath: p.rules, snippet: renderMcp(id, null, value)!, rulesSnippet, notes };
@@ -97,12 +102,18 @@ export function checkUserKeyDestinations(c: StoredConfig, plan: Plan) {
     }
   }
 }
-export function installPlan(ids: Id[], c: StoredConfig, exe: string, script: string): Plan {
+export function installPlan(ids: Id[], c: StoredConfig, exe: string, script: string, direct: DirectBypassConfig): Plan {
   const f = subagentPaths(), plan: Plan = new Map();
-  if (ids.some(id => id !== 'antigravity')) plan.set(f.runtime, script);
+  const helpers = (dns: string, net: string) => {
+    if (direct.enabled && direct.applyToSubagent) {
+      plan.set(dns, fs.readFileSync(bundledDirectFile('direct_dns.py'), 'utf8'));
+      plan.set(net, fs.readFileSync(bundledDirectFile('direct_net.py'), 'utf8'));
+    }
+  };
+  if (ids.some(id => id !== 'antigravity')) { plan.set(f.runtime, script); helpers(f.runtimeDirectDns, f.runtimeDirectNet); }
   for (const id of ids) {
     const p = paths(id), block = ruleText(c, id);
-    for (const file of p.mcp) plan.set(file, renderMcp(id, managedText(file), entry(id, c, exe)));
+    for (const file of p.mcp) plan.set(file, renderMcp(id, managedText(file), entry(id, c, exe, direct)));
     if (p.rules) {
       const before = managedText(p.rules);
       const src = id === 'antigravity' ? withoutLegacyNativeRules(before ?? '') : before ?? '';
@@ -117,7 +128,7 @@ export function installPlan(ids: Id[], c: StoredConfig, exe: string, script: str
         mcpConfig: './mcp_config.json', rules: c.writeRules ? ['./rules/AGENTS.md'] : [], skills: ['./skills'],
         suggestedPrompts: [`规划当前项目的改造方案，并交由 ${c.model} 子代理完成实现与测试`, `并行派出多个 ${c.model} 子代理分别修改不同模块并汇总验收`, `让 ${c.model} 在只读模式下审查当前代码变更并给出修复建议`],
       }));
-      plan.set(f.pluginServer, script);
+      plan.set(f.pluginServer, script); helpers(f.pluginDirectDns, f.pluginDirectNet);
       plan.set(f.pluginSkill, renderSubagentSkill(c));
     }
   }
@@ -140,7 +151,7 @@ export function uninstallPlan(ids: Id[], removeRules: boolean, c: StoredConfig):
       }
     }
     if (id === 'antigravity') {
-      for (const file of [f.pluginServer, f.pluginSkill, f.pluginManifest]) plan.set(file, null);
+      for (const file of [f.pluginServer, f.pluginDirectDns, f.pluginDirectNet, f.pluginSkill, f.pluginManifest]) plan.set(file, null);
     }
   }
   // Unselected harnesses (including a second Cline installation) may still use this script.
@@ -148,6 +159,8 @@ export function uninstallPlan(ids: Id[], removeRules: boolean, c: StoredConfig):
     (id === 'cline' ? [f.clineMcp, f.clineVsMcp] : paths(id).mcp).some(file => {
       try { return !!configNode(id, managedText(file)).servers[serverName]; } catch { return true; }
     }));
-  if (!stillUsed && ids.some(id => id !== 'antigravity') && Object.values(c.targets).some(Boolean)) plan.set(f.runtime, null);
+  if (!stillUsed && ids.some(id => id !== 'antigravity') && Object.values(c.targets).some(Boolean)) {
+    for (const file of [f.runtime, f.runtimeDirectDns, f.runtimeDirectNet]) plan.set(file, null);
+  }
   return plan;
 }

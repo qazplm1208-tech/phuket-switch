@@ -4,6 +4,7 @@ import { bad, elapsed, normalizeV1Base, now, stripV1Beta } from './common.js';
 import { readJson } from './httpClient.js';
 import { hybridBase, rewriteResponses } from './fastMode.js';
 import { providerHeaders } from './phuketClient.js';
+import { adaptiveFetch } from './upstreamTransport.js';
 import { StreamMetrics } from './streamMetrics.js';
 
 import { pickRecommendedModel, providerModelNames } from '../shared/constants.js';
@@ -15,7 +16,7 @@ async function measure(p: Provider, body: Record<string, any>, timeout: number, 
   const endpoint = geminiModel ? `${stripV1Beta(p.baseUrl)}/v1beta/models/${encodeURIComponent(geminiModel)}:generateContent` : `${normalizeV1Base(p.baseUrl)}/${anthropic ? 'messages' : 'responses'}`;
   let statusCode: number | null = null, error: string | undefined;
   try {
-    const send = () => fetch(endpoint, { method: 'POST', body: JSON.stringify(body), headers, redirect: 'error', signal });
+    const send = () => adaptiveFetch(endpoint, { method: 'POST', body: JSON.stringify(body), headers, redirect: 'error', signal });
     let res = await send();
     if (fallback && fallback !== body.model && [502,503].includes(res.status)) { await res.body?.cancel(); body.model = fallback; res = await send(); }
     statusCode = res.status;
@@ -67,7 +68,7 @@ export async function runLocalProbe(db: SwitchDb, req: LocalProbeRequest): Promi
   const p = db.provider(req.providerId), start = performance.now(), testedAt = now(), model = selectedModel(p, req.model);
   let statusCode: number | null = null;
   const endpoint = p.protocol === 'gemini-native' ? `${stripV1Beta(p.baseUrl)}/v1beta/models` : `${normalizeV1Base(p.baseUrl)}/models`;
-  try { const res = await fetch(endpoint, { headers: providerHeaders(p), signal: AbortSignal.timeout(Math.min(10000, db.state('proxySettings').requestTimeoutMs)), redirect: 'error' }); statusCode = res.status; await res.body?.cancel(); } catch { /* report as a measurement, not a management error */ }
+  try { const res = await adaptiveFetch(endpoint, { headers: providerHeaders(p), signal: AbortSignal.timeout(Math.min(10000, db.state('proxySettings').requestTimeoutMs)), redirect: 'error' }); statusCode = res.status; await res.body?.cancel(); } catch { /* report as a measurement, not a management error */ }
   const ok = statusCode !== null && statusCode >= 200 && statusCode < 300;
   return { providerId: p.id, model, protocol: p.protocol, testedAt, latencyMs: elapsed(start), statusCode, ok, ...(!ok ? { error: statusCode ? `Upstream returned HTTP ${statusCode}.` : 'Connection failed.' } : {}) };
 }

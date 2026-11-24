@@ -5,6 +5,8 @@ const runtime = createRuntime(), host = DEFAULT_PROXY_SETTINGS.host;
 const port = Number(process.env.PHUKET_SWITCH_PORT || DEFAULT_SERVER_PORT);
 const server = createManagementApp(undefined, runtime).listen(port, host, () => {
   console.log(`Phuket Switch: http://${host}:${port}`);
+  const direct = runtime.db.state('directBypass');
+  if (direct.enabled && direct.mode === 'physical-nic') void runtime.directBypass.syncFromConfig().catch(() => console.error('Could not resume the physical network route. Check the direct bypass settings.'));
   // Persistent takeover must still work after a workstation restart.
   if (Object.values(runtime.db.state('proxyTakeover')).some(Boolean)) void runtime.proxy.start().catch(() => console.error('Could not resume the local proxy. Check its port in settings.'));
 });

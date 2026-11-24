@@ -762,6 +762,74 @@ class ToolExecutor:
 # Native OpenAI Responses API Client (Streaming SSE + JSON fallback)
 # ---------------------------------------------------------------------------
 
+_direct_lock = threading.Lock()
+_direct_client = None
+
+
+def _physical_client(interface, dns):
+    # Co-installed files only. Isolated Python (-I) does not put this script's folder on sys.path.
+    import importlib.util
+    global _direct_client
+    settings = (interface, dns)
+    with _direct_lock:
+        if _direct_client is not None and _direct_client[0] == settings:
+            return _direct_client[1]
+        def sibling(name):
+            module_name = '_astra_' + name
+            file = Path(__file__).resolve().with_name(name + '.py')
+            if not file.is_file() or file.is_symlink():
+                raise RuntimeError('Direct transport helpers are missing. Reapply the subagent configuration.')
+            spec = importlib.util.spec_from_file_location(module_name, file)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module  # dataclasses resolves annotations by module name
+            try:
+                spec.loader.exec_module(module)
+            except BaseException:
+                sys.modules.pop(module_name, None)
+                raise
+            return module
+        net, dns_module = sibling('direct_net'), sibling('direct_dns')
+        route = net.pick_direct_route(interface, list(dns))
+        client = (net.direct_http_request, route, dns_module.Resolver(route))
+        _direct_client = settings, client
+        return client
+
+
+def _loopback_target(url):
+    import ipaddress
+    host = (urlsplit(url).hostname or '').lower().rstrip('.')
+    if host == 'localhost' or host.endswith('.localhost'):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return (getattr(ip, 'ipv4_mapped', None) or ip).is_loopback
+    except ValueError:
+        return False
+
+
+def _open_api_request(req):
+    mode = os.environ.get('ASTRA_DIRECT_BYPASS', '').strip().lower()
+    if mode in ('', '0', 'off'):
+        return urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS)
+    if mode == 'skip-proxy' or _loopback_target(req.full_url):
+        return urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=HTTP_TIMEOUT_SECONDS)
+    if mode != 'physical-nic':
+        raise ValueError('Unknown direct transport mode.')
+    from email.message import Message
+    from io import BytesIO
+    from urllib.response import addinfourl
+    dns = tuple(s.strip() for s in os.environ.get('ASTRA_DIRECT_DNS', '').split(',') if s.strip())
+    request, route, resolver = _physical_client(os.environ.get('ASTRA_DIRECT_INTERFACE', '').strip(), dns)
+    status, fields, data = request(req.full_url, method=req.get_method(), headers=dict(req.header_items()), body=req.data,
+                                   timeout=HTTP_TIMEOUT_SECONDS, route=route, resolver=resolver)
+    headers = Message()
+    for name, value in fields.items():
+        headers[name] = value
+    if not 200 <= status < 300:
+        raise urllib.error.HTTPError(req.full_url, status, 'Upstream request failed.', headers, BytesIO(data))
+    return addinfourl(BytesIO(data), headers, req.full_url, status)
+
+
 def _api_request(protocol, model, payload, logger, cache_key=None):
     url = build_api_url(DEFAULT_BASE_URL, protocol, model)
     key = resolve_api_key()
@@ -776,7 +844,7 @@ def _api_request(protocol, model, payload, logger, cache_key=None):
         if protocol == "anthropic-messages":
             req.add_header("anthropic-version", "2023-06-01")
         try:
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
+            with _open_api_request(req) as resp:
                 if protocol == "openai-responses" and "text/event-stream" in (resp.headers.get("Content-Type") or "").lower():
                     result = _parse_responses_sse(resp, model)
                 else:

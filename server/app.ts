@@ -10,6 +10,7 @@ import { ApiError, bad, conflict, loopbackRequest, notApplied, now } from './com
 import { apps, SwitchDb, toProviderView } from './db.js';
 import { applyProvider, clearCodexCatalogRoutes, getLiveCliStates, previewProviderDiff, restoreBackup, syncCodexCatalog } from './configSync.js';
 import { PhuketClient } from './phuketClient.js';
+import { DirectBypassManager, type DirectBypassOptions } from './directBypass.js';
 import { ProxyServer } from './proxyServer.js';
 import { runChatTest, runLocalProbe, runSpeedCompare } from './speedLab.js';
 import { applyPrompt, deleteMcp, listMcp, listSkills, upsertMcp } from './extensions.js';
@@ -19,9 +20,12 @@ import { detectCcSwitch, importCcSwitch } from './ccSwitchImport.js';
 import { diagnosticKey, runConnectionCheck } from './diagnostics.js';
 import * as v from './validation.js';
 
-export function createRuntime(options: { db?: SwitchDb; fetch?: typeof fetch; phuketBaseUrl?: string } = {}) {
+export function createRuntime(options: { db?: SwitchDb; fetch?: typeof fetch; phuketBaseUrl?: string; directBypass?: DirectBypassOptions } = {}) {
   const db = options.db ?? new SwitchDb(), proxy = new ProxyServer(db), phuket = new PhuketClient(db, options.fetch, options.phuketBaseUrl);
-  return { db, proxy, phuket, fetch: options.fetch ?? fetch, close: async () => { await proxy.stop(); db.close(); } };
+  const directBypass = new DirectBypassManager(db, options.directBypass);
+  return { db, proxy, phuket, directBypass, fetch: options.fetch ?? fetch, close: async () => {
+    try { await proxy.stop(); } finally { await directBypass.close(); db.close(); }
+  } };
 }
 const defaultWebRoot = resolve(import.meta.dirname, import.meta.filename.endsWith('.ts') ? '../dist/web' : '../web');
 
@@ -56,6 +60,9 @@ export function createManagementApp(webRoot = defaultWebRoot, runtime = createRu
   const num = v.numericId.parse.bind(v.numericId);
 
   route('GET /api/health', 200, null, () => ({ ok: true, app: 'phuket-switch', apiVersion: 1 }));
+  route('GET /api/network/direct-bypass', 200, null, () => runtime.directBypass.getStatus({ refreshAdapters: true }));
+  route('PUT /api/network/direct-bypass', 200, v.updateDirectBypass, req => runtime.directBypass.updateConfig(req));
+  route('POST /api/network/direct-bypass/probe', 200, v.directBypassProbe, req => runtime.directBypass.probe(req));
   route('GET /api/subagent', 200, null, () => getSubagentStatus(db));
   route('POST /api/subagent/preview-diff', 200, v.applySubagent, req => previewSubagent(db, phuket, req));
   route('POST /api/subagent/apply', 200, v.applySubagent, req => applySubagent(db, phuket, req));

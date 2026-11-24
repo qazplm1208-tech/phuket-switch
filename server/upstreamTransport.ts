@@ -40,9 +40,21 @@ function windowsSettings() {
   }
   return registryCache.value;
 }
+export function isLoopbackUrl(url: URL) {
+  const host = unbracket(url.hostname.toLowerCase()).replace(/\.$/, '');
+  return host === 'localhost' || host.endsWith('.localhost') || (isIP(host) === 4 && host.startsWith('127.')) || host === '::1' || /^::ffff:7f[\da-f]{2}:/.test(host);
+}
+export const connectAuthority = (url: URL) => `${url.hostname}:${portOf(url)}`;
+export type DirectPolicy = { kind: 'skip-proxy' } | { kind: 'bridge'; proxyUrl: URL; authorityGrant?: string };
+type PolicyResolver = (url: URL) => Promise<DirectPolicy | undefined>;
+const resolvers = new Set<PolicyResolver>();
+export function setDirectBypassResolver(resolver: PolicyResolver) {
+  resolvers.add(resolver);
+  return () => { resolvers.delete(resolver); };
+}
 function bypassesProxy(url: URL, list: string) {
   const host = unbracket(url.hostname.toLowerCase()).replace(/\.$/, '');
-  if (host === 'localhost' || host.endsWith('.localhost') || /^127\./.test(host) || host === '::1' || /^::ffff:7f[\da-f]{2}:/.test(host)) return true;
+  if (isLoopbackUrl(url)) return true;
   return list.toLowerCase().split(/[,;\s]+/).some(entry => {
     if (!entry) return false;
     if (entry === '*' || (entry === '<local>' && !host.includes('.') && !isIP(host))) return true;
@@ -83,10 +95,11 @@ export function networkTags(error: unknown): string[] {
   }
   return tags;
 }
-function tunnel(target: URL, proxy: URL, signal: AbortSignal) {
+function tunnel(target: URL, proxy: URL, signal: AbortSignal, authorityGrant?: string) {
   return new Promise<Socket>((resolve, reject) => {
-    const authority = `${target.hostname}:${portOf(target)}`;
+    const authority = connectAuthority(target);
     const headers: Record<string, string> = { host: authority };
+    if (authorityGrant) headers['x-phuket-direct-target'] = authorityGrant;
     if (proxy.username || proxy.password) headers['proxy-authorization'] = 'Basic ' + Buffer.from(`${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`).toString('base64');
     const connect = (proxy.protocol === 'https:' ? https : http).request({ hostname: unbracket(proxy.hostname), port: portOf(proxy), method: 'CONNECT', path: authority, headers, signal, agent: false });
     connect.once('error', reject);
@@ -100,12 +113,12 @@ function tunnel(target: URL, proxy: URL, signal: AbortSignal) {
     connect.end();
   });
 }
-async function nodeRequest(url: URL, init: RequestInit, signal: AbortSignal, proxy?: URL | null): Promise<Response> {
+async function nodeRequest(url: URL, init: RequestInit, signal: AbortSignal, proxy?: URL | null, authorityGrant?: string): Promise<Response> {
   signal.throwIfAborted();
   const secure = url.protocol === 'https:', headers = new Headers(init.headers);
   headers.delete('proxy-authorization'); headers.set('accept-encoding', 'identity');
-  if (init.body != null && typeof init.body !== 'string') throw new TypeError('Expected a JSON request body');
-  const socket = proxy ? await tunnel(url, proxy, signal) : undefined;
+  if (init.body != null && typeof init.body !== 'string' && !(init.body instanceof Uint8Array)) throw new TypeError('Expected a string or byte request body');
+  const socket = proxy ? await tunnel(url, proxy, signal, authorityGrant) : undefined;
   try {
     signal.throwIfAborted();
     const host = unbracket(url.hostname);
@@ -166,16 +179,21 @@ async function directLoginAfterProxyError(url: URL, init: RequestInit, signal: A
   } catch { signal.throwIfAborted(); return fallback; }
 }
 
-export async function adaptiveFetch(input: string | URL, init: RequestInit & { signal: AbortSignal }, send: typeof fetch = fetch): Promise<Response> {
-  if (send !== fetch) return send(input, init);
+export async function adaptiveFetch(input: string | URL, init: RequestInit & { signal: AbortSignal }, send: typeof fetch = fetch, policyForRequest?: PolicyResolver): Promise<Response> {
   let url = new URL(input), retried = false;
   const { signal } = init;
   if (!/^https?:$/.test(url.protocol) || url.username || url.password) throw new ApiError(502, 'UPSTREAM_URL', '上游服务地址无效。');
   for (let redirects = 0; ; redirects++) {
     let response: Response;
+    const local = isLoopbackUrl(url), resolver = policyForRequest ?? [...resolvers].at(-1);
+    const policy = !local && resolver ? await resolver(url) : undefined;
+    if (!policy && send !== fetch) return send(url, init);
     const bypass = bypassesProxy(url, [process.env.no_proxy, process.env.NO_PROXY].join(','));
-    const loginProxy = !bypass && !retried && !redirects && init.method?.toUpperCase() === 'POST' && url.pathname === '/api/v1/auth/login' && typeof init.body === 'string' ? nativeEnvProxy(url) : undefined;
-    if (bypass) response = await nodeRequest(url, init, signal);
+    const loginProxy = !policy && !bypass && !retried && !redirects && init.method?.toUpperCase() === 'POST' && url.pathname === '/api/v1/auth/login' && typeof init.body === 'string' ? nativeEnvProxy(url) : undefined;
+    if (policy?.kind === 'bridge') response = await nodeRequest(url, init, signal, policy.proxyUrl, policy.authorityGrant);
+    else if (policy?.kind === 'skip-proxy') response = await nodeRequest(url, init, signal, null);
+    else if (local && !nativeEnvProxy(url)) response = await send(url, { ...init, redirect: 'manual' });
+    else if (bypass) response = await nodeRequest(url, init, signal);
     else try { response = await send(url, { ...init, redirect: 'manual' }); }
     catch (e) {
       signal.throwIfAborted();

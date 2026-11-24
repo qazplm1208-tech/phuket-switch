@@ -69,7 +69,8 @@ test('all nine adapters detect isolated profiles; preview masks both sides and h
   const before = seedFiles(), detected: SubagentStatus = await api('subagent');
   assert.deepEqual(detected.harnesses.filter(h => h.detected).map(h => h.id), [...ids]);
   const diff = await api('subagent/preview-diff', req); noSecrets(diff, secret, previous);
-  assert.deepEqual(new Set(diff.files.map((v: any) => v.path)), new Set(Object.values(f).filter(file => file !== f.clineMcp)));
+  const excluded = [f.clineMcp, f.runtimeDirectDns, f.runtimeDirectNet, f.pluginDirectDns, f.pluginDirectNet];
+  assert.deepEqual(new Set(diff.files.map((v: any) => v.path)), new Set(Object.values(f).filter(file => !excluded.includes(file))));
   assert.equal(JSON.parse(diff.files.find((v: any) => v.path === f.claudeMcp).after).mcpServers[name].env.ASTRA_API_KEY, '[REDACTED]');
   assert.equal(JSON.parse(diff.files.find((v: any) => v.path === f.pluginManifest).after).mcpConfig, './mcp_config.json');
   for (const [file, src] of before) assert.equal(read(file), src);

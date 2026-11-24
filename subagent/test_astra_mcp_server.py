@@ -190,6 +190,70 @@ class AstraTests(unittest.TestCase):
         self.assertEqual('additionalProperties' in schema, protocol != 'gemini-native')
         return request, body, result
 
+    def test_skip_proxy_uses_empty_proxy_handler_and_preserves_json_request(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import socket
+        import threading
+        from unittest.mock import Mock
+        received = []
+        class Source(BaseHTTPRequestHandler):
+            def do_POST(self):
+                received.append((self.path, self.headers.get('Authorization'), json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                self.send_response(200); self.end_headers(); self.wfile.write(b'{"ok":true}')
+            def log_message(self, *args):
+                pass
+        source = ThreadingHTTPServer(('127.0.0.1', 0), Source)
+        threading.Thread(target=source.serve_forever, daemon=True).start()
+        self.addCleanup(source.server_close); self.addCleanup(source.shutdown)
+        lookup = socket.getaddrinfo
+        def local_only(host, port, *args, **kwargs):
+            self.assertEqual(host, 'relay.invalid'); self.assertEqual(port, source.server_port)
+            return lookup('127.0.0.1', port, *args, **kwargs)
+        with patch.dict(os.environ, {'ASTRA_DIRECT_BYPASS': 'skip-proxy', 'http_proxy': 'http://proxy.invalid:1', 'no_proxy': '', 'NO_PROXY': ''}), \
+                patch.object(astra, 'DEFAULT_BASE_URL', f'http://relay.invalid:{source.server_port}'), patch.object(socket, 'getaddrinfo', local_only), \
+                patch.object(astra, '_physical_client', Mock(side_effect=AssertionError('unexpected physical transport'))):
+            result = astra._api_request('openai-chat', 'm', {'model': 'm'}, lambda _: None)
+        self.assertEqual(result, {'ok': True}); self.assertEqual(received, [('/v1/chat/completions', 'Bearer offline-only', {'model': 'm'})])
+
+    def test_physical_transport_loads_only_sibling_helpers_and_dispatches_sse(self):
+        import shutil
+        from unittest.mock import Mock
+        # Exercise the same sibling loader used by a deployed isolated interpreter; mock only the physical network.
+        for name in ('direct_dns.py', 'direct_net.py'):
+            shutil.copyfile(Path(__file__).resolve().parents[1] / 'direct' / name, self.home / name)
+        env = {'ASTRA_DIRECT_BYPASS': 'physical-nic', 'ASTRA_DIRECT_INTERFACE': 'Ethernet', 'ASTRA_DIRECT_DNS': '192.0.2.53, 2001:db8::53'}
+        with patch.dict(os.environ, env), patch.object(astra, '__file__', str(self.home / 'astra_mcp_server.py')), \
+                patch.object(astra, '_direct_client', None), patch.dict(sys.modules), patch.object(subprocess, 'run') as ps, \
+                patch.object(sys, 'platform', 'win32'), patch.object(astra.urllib.request, 'urlopen', side_effect=AssertionError('unexpected fallback')):
+            ps.return_value = subprocess.CompletedProcess([], 0, json.dumps([dict(name='Ethernet', index=7, routes=[dict(family=2, metric=3)],
+                addresses=['192.0.2.7'], dns=['192.0.2.200'])]).encode())
+            client = astra._physical_client('Ethernet', ('192.0.2.53', '2001:db8::53'))
+            send, route, resolver = client
+            self.assertEqual(Path(sys.modules[send.__module__].__file__), self.home / 'direct_net.py')
+            self.assertEqual(Path(sys.modules[type(resolver).__module__].__file__), self.home / 'direct_dns.py')
+            self.assertEqual((route.index, resolver.servers), (7, ('192.0.2.53',)))
+            body = b'data: {"type":"response.completed","response":{"output_text":"ready"}}\n\n'
+            request = Mock(return_value=(200, {'content-type': 'text/event-stream'}, body))
+            astra._direct_client = (astra._direct_client[0], (request, route, resolver))
+            result = astra._api_request('openai-responses', 'm', {'stream': True}, lambda _: None, 'session-one')
+            self.assertEqual(result['output_text'], 'ready'); ps.assert_called_once(); request.assert_called_once()
+            url, = request.call_args.args; kw = request.call_args.kwargs
+            self.assertEqual(url, 'https://offline.invalid/relay/v1/responses'); self.assertEqual(kw['method'], 'POST')
+            self.assertEqual(kw['headers']['Authorization'], 'Bearer offline-only'); self.assertEqual(kw['headers']['Session_id'], 'session-one')
+            self.assertEqual(json.loads(kw['body']), {'stream': True}); self.assertIs(kw['route'], route); self.assertIs(kw['resolver'], resolver)
+
+    def test_loopback_and_disabled_modes_do_not_load_physical_helpers(self):
+        req = astra.urllib.request.Request('https://offline.invalid')
+        with patch.object(astra, '_physical_client', side_effect=AssertionError('unexpected physical transport')), \
+                patch.object(astra.urllib.request, 'urlopen') as default, patch.object(astra.urllib.request, 'build_opener') as direct:
+            for value in ['', 'off', '0']:
+                with patch.dict(os.environ, {'ASTRA_DIRECT_BYPASS': value}):
+                    self.assertIs(astra._open_api_request(req), default.return_value)
+            with patch.dict(os.environ, {'ASTRA_DIRECT_BYPASS': 'physical-nic'}):
+                for host in ['localhost.', 'local.localhost', '127.3.2.1', '[::1]', '[::ffff:127.3.2.1]']:
+                    self.assertIs(astra._open_api_request(astra.urllib.request.Request('http://' + host)), direct.return_value.open.return_value)
+            self.assertEqual(default.call_count, 3); self.assertEqual(direct.call_count, 5)
+
     def test_chat_translation_and_tool_calls(self):
         req, body, result = self.request('openai-chat', {'choices': [{'message': {'content': 'ready', 'tool_calls': [{'id': 'tool-1', 'function': {'name': 'edit_file', 'arguments': '{"path":"a"}'}}]}}], 'usage': {'prompt_tokens': 12, 'completion_tokens': 3, 'prompt_tokens_details': {'cached_tokens': 4}}})
         self.assertEqual(req.full_url, 'https://offline.invalid/relay/v1/chat/completions')

@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { adaptiveFetch } from './upstreamTransport.js';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import express from 'express';
@@ -257,7 +258,7 @@ export class ProxyServer {
         for (;;) {
           log.effectiveModel = modelOnPath ?? (body.model || baseModel); log.serviceTier = ['default','auto','priority','fast','ultrafast','flex'].includes(body.service_tier) ? body.service_tier as ServiceTier : undefined;
           let upstream: Response;
-          try { upstream = await fetch(url, { method: req.method, headers, body: req.method === 'GET' ? undefined : JSON.stringify(body), signal, redirect: 'error' }); }
+          try { upstream = await adaptiveFetch(url, { method: req.method, headers, body: req.method === 'GET' ? undefined : JSON.stringify(body), signal, redirect: 'error' }); }
           catch {
             if (!signal.aborted && i + 1 < list.length) break;
             if (discovery && localNames.length && !disconnected.signal.aborted) { log.statusCode = 200; res.json(modelList(localNames)); return; }

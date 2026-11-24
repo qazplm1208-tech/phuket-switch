@@ -1,5 +1,6 @@
 import { z } from 'zod';
-import { paymentStatuses, subagentHarnessIds, subagentProtocols } from '../shared/types.js';
+import { isIP } from 'node:net';
+import { directBypassModes, paymentStatuses, subagentHarnessIds, subagentProtocols } from '../shared/types.js';
 import { apps } from './db.js';
 import { MODEL_SLUG } from '../shared/constants.js';
 import { httpBase, normalizeLoginEmail, normalizeLoginPassword, normalizeLoginToken } from './common.js';
@@ -37,6 +38,15 @@ export const applyImagePrompt = z.strictObject({
 export const removeImagePrompt = z.strictObject({
   targets: z.array(target).min(1).max(2).transform(a => [...new Set(a)]),
 });
+export const updateDirectBypass = z.strictObject({
+  enabled: z.boolean(), mode: z.enum(directBypassModes), interfaceName: z.string().max(128).regex(/^[^\x00-\x1f\x7f-\x9f]*$/).transform(s => s.trim()),
+  dnsServers: z.array(z.string().max(64).refine(s => !!isIP(s) && !s.includes('%'), 'DNS 服务器必须是 IPv4 或 IPv6 地址。')).max(4, '最多可指定 4 个 DNS 服务器。'), applyToSubagent: z.boolean(),
+}).partial();
+export const directBypassProbe = z.strictObject({ url: z.string().max(4096).refine(s => {
+  const url = URL.parse(s);
+  return !!url && /^https?:\/\/[^/@?#]+(?:[/?#]|$)/i.test(s) && !/[\s\\\x00-\x1f\x7f]/.test(s) && !url.username && !url.password;
+}, '测试地址必须是无用户名和密码的 HTTP 或 HTTPS 网址。').optional() });
+
 const subagentTargets = z.array(z.enum(subagentHarnessIds)).min(1).max(9).transform(a => [...new Set(a)]);
 const subagentFields = {
   pythonPath: z.string().trim().max(4096).regex(/^[^\r\n\0]*$/).optional(), model: model.regex(MODEL_SLUG).optional(),
