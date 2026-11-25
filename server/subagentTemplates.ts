@@ -13,10 +13,9 @@ const notes = (c: SubagentConfig) => c.customInstructions?.trim() ? `\n\n### Wor
 function nativeSettings(c: SubagentConfig) {
   return `Default model: ${c.model}. Protocol: ${c.protocol}. API base: ${c.baseUrl}.\nDefault mode: ${c.defaultMode}; reasoning_effort: ${c.reasoningEffort}; context cap: ${limit(c)} tokens. ${modelPolicy(c)}`;
 }
-const nativeTools = `- astra_run_task: run a synchronous brief with task and absolute cwd. Reuse session_id; max_steps defaults to 30 (maximum 60).
-- astra_spawn_worker: start an independent task with a worker_name. Record both worker_id and session_id; assign disjoint file ownership to parallel workers.
-- astra_worker_status: inspect one worker's progress and effective model, or omit worker_id to list workers.
-- astra_wait_worker: wait up to 120 seconds by default. A timed-out wait does not cancel the worker; check its status or wait again.
+const nativeTools = `- astra_run_task: run a synchronous brief with task and absolute cwd. Reuse session_id. Workers run to completion by default: max_steps=0 is unlimited; pass a positive integer only for an intentional cap.
+- astra_spawn_worker: name independent workers and give them disjoint files and sessions. Launch the returned watch_command as a background shell task (e.g. run_command with WaitMsBeforeAsync=500 or run_in_background=true), then end your turn immediately. Do not poll: the host will wake you with the complete JSON report.
+- Only if the host has no background shell tool, use astra_wait_worker or astra_worker_status with the returned worker_id. A wait timeout does not cancel the worker.
 - astra_list_sessions: filter by cwd to find up to 30 matching sessions, newest first. Check the estimated context and last measured input before resuming.
 - astra_compact_session: use session_id and force=true for an early handoff. With all_over_limit=true and no ID, scan all sessions and compact only those strictly over the requested limit.`;
 
@@ -38,11 +37,11 @@ Review final_response, files_changed, commands_run (including exit codes), and t
 
   // Put operational guidance before optional free text; reserve space for both markers even with CRLF.
   const wind = id === 'windsurf';
-  const brief = `Delegate coding to gpt-astra-subagent. Give astra_run_task an absolute cwd, files, constraints and tests. The planner reviews the diff, files_changed, commands_run and final_response.
-Use astra_list_sessions(cwd=...) and reuse session_id for sequential work, even after restart. Omit model to keep it. Defaults: ${c.model} (${c.protocol}), ${c.defaultMode}, reasoning_effort=${c.reasoningEffort}; overrides ${c.allowModelOverride ? 'allowed' : 'disabled'}.
-Use astra_spawn_worker for independent work with disjoint files and separate sessions. Poll astra_worker_status or astra_wait_worker; a 120s timeout does not cancel work.
-${compactionPolicy(c)} For an early full handoff use force=true. Use readonly for inspections; edit permits trusted shell commands.`;
-  const extra = wind ? '' : '\nKeep allow_outside_cwd=false unless explicitly authorized. Bulk maintenance with all_over_limit=true scans saved sessions, not just the recent listing. If a worker reaches max_steps, review its report before continuing. Report failed verification; do not substitute another provider or disclose credentials.';
+  const brief = `Delegate coding to gpt-astra-subagent. Give astra_run_task an absolute cwd, files and tests. Review the diff, files_changed, commands_run and final_response.
+Reuse session_id via astra_list_sessions(cwd=...). Omit model to keep it. Defaults: ${c.model} (${c.protocol}), ${c.defaultMode}, reasoning_effort=${c.reasoningEffort}; overrides ${c.allowModelOverride ? 'allowed' : 'disabled'}.
+Workers run to completion: max_steps=0 is unlimited; set a positive cap only intentionally. Use astra_spawn_worker for disjoint files and sessions. Launch its watch_command in a background shell (run_in_background=true); end your turn immediately. Do not poll: the host wakes you with the complete JSON report. Only without a background shell use astra_wait_worker or astra_worker_status.
+${compactionPolicy(c)} Use readonly for inspections.`;
+  const extra = wind ? '' : '\nFor an early full handoff use force=true. Keep allow_outside_cwd=false unless authorized. Edit permits trusted shell commands. Bulk maintenance with all_over_limit=true scans all saved sessions. Report failed verification; do not substitute another provider or disclose credentials.';
   const body = brief + extra;
   // Cursor's copyable rule includes front matter outside the managed block.
   const max = wind ? 1400 : id === 'cursor' ? 1740 : 1800;
@@ -64,8 +63,8 @@ ${nativeTools}
 ## Example: implementation followed by review
 1. Look up the workspace with astra_list_sessions(cwd=...). Review any matching session's model, api_format and last activity. Use the plugin session_id, not prompt_cache_key, on the next call.
 2. Supply a self-contained task, target modules, required invariants, and the commands that establish success. A readonly audit cannot write or run commands. Keep permissions stable unless the task calls for a change.
-3. For independent modules launch named workers with separate sessions. Do not assign them overlapping files, generated outputs, or the same test database. Wait for each worker, then use the original integration session to run the combined checks.
-4. Compare final_response with files_changed and commands_run. A step cap asks for a continuation, not a new session. Record what was verified and what remains open.
+3. For independent modules use the background watcher workflow above. Assign disjoint files, generated outputs and test databases. When the host wakes you, use the original integration session for the combined checks.
+4. Compare final_response with files_changed and commands_run. Record what was verified and what remains open.
 
 ## Cache and maintenance
 Responses uses the same sticky UUID in prompt_cache_key and the session_id HTTP header. It sends a developer item rather than replacing the endpoint's native instructions. Other adapters use their native wire formats; do not assume Responses headers or cache accounting on those protocols. Inspect usage.cache_hit_rate_pct for this turn and the session listing for cumulative hits.

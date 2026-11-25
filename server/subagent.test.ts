@@ -107,16 +107,19 @@ test('install writes native shapes, private credentials, bounded Windsurf rules 
   assert.ok(subagentBlock(read(f.windsurfRules))!.length <= 1400); assert.equal(doc(f.desktop3pMcp).mcpServers[name].env.ASTRA_MODEL, req.model);
   assert.equal(fs.existsSync(f.clineMcp), false); assert.equal(read(f.pluginServer), read(bundledScript())); assert.equal(read(f.runtime), read(bundledScript()));
   const manifest = doc(f.pluginManifest);
-  assert.equal(manifest.version, '1.4.0'); assert.equal(manifest.name, name); assert.equal(manifest.mcpConfig, './mcp_config.json');
+  assert.equal(manifest.version, '1.5.0'); assert.equal(manifest.name, name); assert.equal(manifest.mcpConfig, './mcp_config.json');
   assert.deepEqual(manifest.rules, ['./rules/AGENTS.md']); assert.deepEqual(manifest.skills, ['./skills']); assert.ok(manifest.author && manifest.keywords.includes(req.protocol));
   assert.ok(manifest.displayName.includes(req.model) && manifest.description.includes(req.protocol));
   for (const text of [read(f.pluginRules), read(f.pluginSkill)]) {
     for (const setting of [req.model, req.protocol, req.baseUrl, '64,000', req.defaultMode, req.reasoningEffort, 'overrides are disabled', 'x'.repeat(2000)]) assert.ok(text.includes(setting));
     assert.ok(!text.includes('strictly locked')); assert.match(text, /mode="chunk"/); assert.match(text, /compact_context/); assert.match(text, /75%/); noSecrets(text, secret, previous);
+    assert.match(text, /max_steps=0 is unlimited/); assert.match(text, /watch_command/); assert.match(text, /end your turn immediately/);
   }
   for (const h of status.harnesses) {
     for (const tool of ['run_task','spawn_worker','wait_worker','worker_status','compact_session','list_sessions']) assert.ok(h.rulesSnippet.includes(`astra_${tool}`));
     assert.ok(h.rulesSnippet.includes('disjoint')); assert.ok(h.rulesSnippet.includes('session_id'));
+    assert.match(h.rulesSnippet, /max_steps=0 is unlimited/); assert.match(h.rulesSnippet, /watch_command/);
+    assert.match(h.rulesSnippet, /end your turn immediately/); assert.doesNotMatch(h.rulesSnippet, /(?:30|60)[ -]step/i);
     assert.match(h.rulesSnippet, /astra_compact_session\(session_id=\.\.\., mode="chunk"/); assert.match(h.rulesSnippet, /compact_context/); assert.match(h.rulesSnippet, /75%/);
     if (h.id !== 'antigravity') assert.ok(h.rulesSnippet.replace(/\r?\n/g, '\r\n').length <= (h.id === 'windsurf' ? 1400 : 1800));
   }
@@ -227,7 +230,7 @@ test('saved provider inheritance, real MCP handshake and optional read-only upst
   const applied = await api('subagent/apply', { targets: ['gemini-cli'], providerId: p.id, keyStorage: 'mcp-env' });
   assert.equal(applied.status.config.providerId, p.id); assert.equal(applied.status.config.keySource, 'provider'); assert.equal(applied.status.config.protocol, p.protocol);
   let calls = 0; upstream = async (u, init) => { calls++; assert.equal(String(u), 'https://fixture.invalid/relay/v1beta/models'); assert.equal(new Headers(init?.headers).get('x-goog-api-key'), secret); return json({ models: [] }); };
-  const handshake = await api('subagent/test', {}); assert.equal(handshake.ok, true); assert.equal(calls, 0); assert.equal(handshake.serverVersion, '1.4.0'); assert.equal(handshake.toolsCount, 6); assert.equal(new Set(handshake.tools).size, 6);
+  const handshake = await api('subagent/test', {}); assert.equal(handshake.ok, true); assert.equal(calls, 0); assert.equal(handshake.serverVersion, '1.5.0'); assert.equal(handshake.toolsCount, 6); assert.equal(new Set(handshake.tools).size, 6);
   assert.equal(handshake.effectiveModel, p.model); assert.equal(handshake.effectiveProtocol, p.protocol); assert.ok(handshake.pythonExecutable && handshake.pythonVersion);
   const check = await api('subagent/test', { providerId: p.id, testUpstream: true }); assert.equal(check.upstreamOk, true); assert.equal(calls, 1);
   upstream = async () => json({ error: secret }, 403); const denied = await api('subagent/test', { testUpstream: true }); assert.equal(denied.ok, false); assert.equal(denied.upstreamOk, false); noSecrets(denied, secret);
@@ -308,7 +311,8 @@ test('compact template length limits include CRLF, longest model name and option
   const status: SubagentStatus = (await api('subagent/apply', { ...req, model: 'a'.repeat(256), protocol: 'anthropic-messages', maxContextTokens: 272000, targets: ['windsurf'], customInstructions: 'more notes\r\n'.repeat(400) })).status;
   for (const h of status.harnesses.filter(h => h.id !== 'antigravity')) {
     assert.ok(h.rulesSnippet.replace(/\r?\n/g, '\r\n').length <= (h.id === 'windsurf' ? 1400 : 1800), h.name);
-    assert.match(h.rulesSnippet, /compact_context/);
+    if (h.id === 'cursor') assert.ok(subagentBlock(h.rulesSnippet)!.replace(/\r?\n/g, '\r\n').length <= 1740);
+    assert.match(h.rulesSnippet, /compact_context/); assert.match(h.rulesSnippet, /watch_command/);
   }
 });
 

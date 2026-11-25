@@ -1,4 +1,16 @@
-# Phuket Switch v1.1.0 · 2026-11-24
+# Phuket Switch v1.1.1 · 2026-11-25
+
+- **子代理步数**：取消默认 30 步和最高 60 步的限制。默认 `max_steps=0`，由自动压缩兜底，直到任务完成；显式传入正整数仍可限步，减少任务做到一半需要确认续跑的情况。
+- **异步派活**：`astra_spawn_worker` 持久化进度和完整报告，并返回 `watch_command`。主模型在宿主中后台启动该命令后即可结束本回合，完成时会被自动唤醒，无需反复轮询 `astra_wait_worker`。`--wait-worker` 支持多 worker 联合等待，也能检测 MCP 父进程提前退出。
+- **网络稳定性**：子代理请求遇到瞬时断流、TLS EOF 或 HTTP 502/503/504 时最多自动重试两次。内置 Astra MCP 服务升级为 **v1.5.0**。
+
+## 下载与更新
+
+Windows x64 安装版：**`Phuket.Switch.Setup.1.1.1.exe`**；便携版：**`Phuket.Switch.1.1.1.exe`**。请从[官方发布页](https://github.com/qazplm1208-tech/phuket-switch/releases)下载。v1.0.0 至 v1.1.0 安装版可在「扩展与设置 → 偏好设置 → 软件更新」检查并安装更新；便携版请退出旧程序后手动替换。升级后请在「子代理」页重新应用配置，以同步 v1.5.0 服务和派活规则。
+
+---
+
+## Phuket Switch v1.1.0 · 2026-11-24
 
 - **AI 直连下载**：在「扩展与设置 → AI 直连下载」按需部署 Python 3.10+ 下载脚本与 Windows 启动器。HTTP(S) 支持断点续传、并行分片与 URL 清单批量并发；可跟随网络直连设置、绑定物理网卡，或仅跳过代理并沿用系统路由。
 - **种子与磁力链接**：支持 `.torrent` 与 `magnet:`、Tracker 和 DHT 节点发现、按文件选择、分片校验与续传。
@@ -6,7 +18,7 @@
 - **客户端规则**：可向 Codex、Claude Code、Gemini CLI、Antigravity、Windsurf、OpenCode 和 Cline 中的所选客户端写入规则。支持先预览文件差异；写入和移除只调整下载器标记区块，保留其他规则。Cursor、Claude Desktop 等工具可手动复制规则。
 - **子代理与恢复**：启用下载器后，在子代理页重新应用即可向 Astra MCP 提供脚本路径。部署和移除前会备份变更，可从「配置备份」恢复规则、脚本及原下载配置。
 
-## 下载与更新
+### 下载与更新
 
 Windows x64 安装版：**`Phuket.Switch.Setup.1.1.0.exe`**；便携版：**`Phuket.Switch.1.1.0.exe`**。请从[官方发布页](https://github.com/qazplm1208-tech/phuket-switch/releases)下载。使用 v1.0.0、v1.0.1 或 v1.0.2 安装版的用户可在「扩展与设置 → 偏好设置 → 软件更新」检查并安装更新。便携版请退出旧程序后手动替换。
 

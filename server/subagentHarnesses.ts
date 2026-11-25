@@ -123,7 +123,7 @@ export function installPlan(ids: Id[], c: StoredConfig, exe: string, script: str
     if (id === 'antigravity') {
       const manifest = parseJson(managedText(f.pluginManifest));
       if (manifest.mcpServers === './mcp_config.json') delete manifest.mcpServers; // Stage 1 used the wrong manifest key.
-      plan.set(f.pluginManifest, jsonText({ ...manifest, name: serverName, version: '1.4.0', displayName: `${c.model} Subagent`,
+      plan.set(f.pluginManifest, jsonText({ ...manifest, name: serverName, version: '1.5.0', displayName: `${c.model} Subagent`,
         description: `Plan and review with Antigravity; delegate workspace tasks to ${c.model} via ${c.protocol}.`,
         author: manifest.author ?? 'Phuket Switch', keywords: ['subagent', 'mcp', 'coding', c.protocol],
         mcpConfig: './mcp_config.json', rules: c.writeRules ? ['./rules/AGENTS.md'] : [], skills: ['./skills'],

@@ -53,7 +53,7 @@ class AstraTests(unittest.TestCase):
     def test_real_stdio_initialize_and_tools_reflect_environment(self):
         init, tools = self.handshake(ASTRA_MODEL='  custom-8b  ', ASTRA_PROTOCOL='OPENAI-CHAT')
         self.assertEqual(init['protocolVersion'], '2025-11-25')
-        self.assertEqual(init['serverInfo']['version'], '1.4.0')
+        self.assertEqual(init['serverInfo']['version'], '1.5.0')
         self.assertEqual(init['_meta'], {'model': 'custom-8b', 'api_format': 'openai-chat'})
         self.assertEqual({t['name'] for t in tools}, {'astra_run_task', 'astra_spawn_worker', 'astra_worker_status', 'astra_wait_worker', 'astra_list_sessions', 'astra_compact_session'})
         for t in tools:
@@ -61,6 +61,11 @@ class AstraTests(unittest.TestCase):
         for t in tools[:2]:
             self.assertIn('model', t['inputSchema']['properties'])
             self.assertIn('none', t['inputSchema']['properties']['reasoning_effort']['enum'])
+            self.assertEqual(t['inputSchema']['properties']['max_steps'], {
+                'type': 'integer', 'minimum': 0, 'default': 0,
+                'description': 'Optional step cap; 0 (default) means unlimited until the task completes.'})
+        for name in ('astra_spawn_worker', 'astra_wait_worker'):
+            self.assertIn('watch_command', next(t['description'] for t in tools if t['name'] == name))
         schema = next(t for t in tools if t['name'] == 'astra_compact_session')['inputSchema']['properties']
         self.assertEqual(schema['mode']['default'], 'full')
         self.assertTrue({'label', 'summary', 'chunk_groups', 'keep_recent_groups', 'focus'} <= schema.keys())
@@ -319,15 +324,50 @@ class AstraTests(unittest.TestCase):
         self.assertEqual(send.call_args.args[0].get_header('Session_id'), 'sticky')
         self.assertNotIn('reasoning', payload)
 
-    def test_responses_json_fallback_retains_model_cache_and_effort(self):
-        error = HTTPError('https://offline.invalid', 415, 'stream unsupported', {}, io.BytesIO())
-        with patch.object(astra.urllib.request, 'urlopen', side_effect=[error, Response({'output_text': 'ok'})]) as send:
+    def test_responses_transient_retry_retains_model_cache_and_effort(self):
+        error = HTTPError('https://offline.invalid', 503, 'temporarily unavailable', {}, io.BytesIO())
+        with patch.object(astra, 'API_RETRY_DELAYS', (0, 0)), patch.object(astra.urllib.request, 'urlopen', side_effect=[error, Response({'output_text': 'ok'})]) as send:
             result = astra.call_astra_responses_api([], reasoning_effort='low', prompt_cache_key='repeat', model='mini')
         self.assertEqual(result['output_text'], 'ok')
         first, retry = [json.loads(c.args[0].data) for c in send.call_args_list]
-        self.assertEqual(retry, {**first, 'stream': False})
+        self.assertEqual(retry, first)
         self.assertEqual(retry['reasoning'], {'effort': 'low'})
         self.assertEqual(retry['prompt_cache_key'], 'repeat')
+
+    def test_bounded_transport_retries_across_api_protocols(self):
+        for protocol, transient in [('openai-responses', astra.ssl.SSLEOFError()),
+                                    ('openai-chat', astra.urllib.error.URLError('EOF')),
+                                    ('anthropic-messages', TimeoutError()),
+                                    ('gemini-native', ConnectionResetError())]:
+            with self.subTest(protocol=protocol), patch.object(astra.time, 'sleep') as sleep, patch.object(astra, '_open_api_request', side_effect=[transient, HTTPError('u', 504, '', {}, io.BytesIO()), Response({'ok': True})]) as send:
+                self.assertEqual(astra._api_request(protocol, 'm', {}, lambda _: None), {'ok': True})
+                self.assertEqual([c.args[0] for c in sleep.call_args_list], [1.5, 3.5]); self.assertEqual(send.call_count, 3)
+        with patch.object(astra.time, 'sleep'), patch.object(astra, '_open_api_request', side_effect=astra.http.client.RemoteDisconnected()) as send:
+            with self.assertRaisesRegex(RuntimeError, 'RemoteDisconnected'):
+                astra._api_request('openai-responses', 'm', {}, lambda _: None)
+            self.assertEqual(send.call_count, 3)
+
+    def test_client_context_and_other_server_errors_not_transport_retried(self):
+        for code, detail in [(400, 'bad'), (401, 'bad key'), (415, 'stream unsupported'), (429, 'busy'), (500, ''), (502, 'context_length_exceeded')]:
+            with self.subTest(code=code), patch.object(astra.time, 'sleep') as sleep, patch.object(astra, '_open_api_request', side_effect=HTTPError('u', code, '', {}, io.BytesIO(detail.encode()))) as send:
+                with self.assertRaisesRegex(RuntimeError, f'HTTP {code}'):
+                    astra.call_astra_responses_api([])
+                send.assert_called_once(); sleep.assert_not_called()
+
+    def test_default_zero_and_null_run_past_former_ceiling(self):
+        for cap in ({}, {'max_steps': 0}, {'max_steps': None}, {'max_steps': 75}):
+            replies = [{'output': [astra.call_item('list_dir', {}, str(i))]} for i in range(64)] + [{'output_text': 'finished'}]
+            with self.subTest(cap=cap), patch.object(astra, 'call_subagent_api', side_effect=replies), patch.object(astra.ToolExecutor, 'execute', return_value='ok'):
+                r = self.tool('astra_run_task', {'task': 'long task', **cap})
+                self.assertEqual((r['steps_used'], r['status'], r['final_response']), (65, 'completed', 'finished'))
+
+    def test_bad_step_caps_rejected_before_work(self):
+        for name in ('astra_run_task', 'astra_spawn_worker'):
+            for cap in (-1, False, True, '0', 1.5):
+                with self.subTest(name=name, cap=cap):
+                    text, error = astra.handle_tool_call(name, {'task': 'test', 'cwd': str(self.home), 'max_steps': cap})
+                    self.assertTrue(error, text); self.assertIn('max_steps', text)
+        self.assertFalse(astra.WORKERS); self.assertFalse(astra.SESSIONS)
 
     def test_load_resume_and_round_trip_legacy_snapshot(self):
         file = astra._session_file('legacy')
@@ -367,6 +407,96 @@ class AstraTests(unittest.TestCase):
                 astra.run_astra_agent_turn(task='resume', cwd=str(other), session_id=session.session_id)
         self.assertEqual(resumed['prompt_cache_key'], session.prompt_cache_key)
         self.assertEqual(astra._load_session(session.session_id).cwd, str(alias))
+
+    def test_spawn_publishes_progress_and_watcher_returns_full_report(self):
+        import threading
+        entered, release = threading.Event(), threading.Event()
+        saved = []
+        write = astra._save_worker
+        def observe(worker):
+            write(worker)
+            state = json.loads(worker.worker_file.read_bytes())
+            saved.append((state['steps_used'], state['status'], worker.done_event.is_set()))
+        def gateway(**kwargs):
+            if not any(i.get('type') == 'function_call_output' for i in kwargs['input_items']):
+                return {'output': [astra.call_item('list_dir', {}, 'ls')]}
+            entered.set()
+            if not release.wait(10):
+                raise TimeoutError('test did not release worker')
+            return {'output_text': 'full report: \u5b8c\u6210'}
+        data = self.home / 'plugin data'
+        watcher_env = {**os.environ, 'PLUGIN_DATA': str(self.home / 'unrelated'), 'ASTRA_API_KEY': ''}
+        with patch.dict(os.environ, {'PLUGIN_DATA': str(data)}), patch.object(astra, '_save_worker', side_effect=observe), patch.object(astra, 'call_subagent_api', side_effect=gateway):
+            info = self.tool('astra_spawn_worker', {'worker_name': 'docs', 'task': 'inspect'})
+            wid = info['worker_id']; path = Path(info['worker_file'])
+            try:
+                self.assertEqual(path, data / 'workers' / (wid + '.json'))
+                self.assertTrue(entered.wait(10)); running = json.loads(path.read_bytes())
+                self.assertEqual((running['status'], running['steps_used'], running['owner_pid']), ('running', 2, os.getpid()))
+                self.assertIsNone(running['finished_at']); self.assertIsNone(running['result'])
+                with subprocess.Popen(info['watch_argv'] + ['--poll-interval', '0.05'], cwd=self.home, env=watcher_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as watcher:
+                    try:
+                        with self.assertRaises(subprocess.TimeoutExpired):
+                            watcher.wait(timeout=0.2)
+                        release.set(); out, err = watcher.communicate(timeout=10)
+                    finally:
+                        if watcher.poll() is None:
+                            watcher.kill()
+                self.assertEqual(watcher.returncode, 0, err)
+            finally:
+                release.set(); self.assertTrue(astra.WORKERS[wid].done_event.wait(10))
+        final = json.loads(path.read_bytes()); self.assertEqual(json.loads(out), final)
+        self.assertEqual(final['result']['final_response'], 'full report: \u5b8c\u6210')
+        self.assertEqual(saved, [(0, 'running', False), (1, 'running', False), (2, 'running', False), (2, 'completed', False)])
+        self.assertEqual(self.tool('astra_worker_status', {'worker_id': wid}), final)
+        proc = subprocess.run([*astra.SHELL_PREFIX, info['watch_command']], cwd=self.home, env=watcher_env, capture_output=True, text=True, timeout=10, check=True)
+        self.assertEqual(json.loads(proc.stdout), final)
+
+    def test_failed_report_and_shell_metacharacters_in_data_path(self):
+        data = self.home / "it's a $literal (not %TEMP%)"
+        with patch.dict(os.environ, {'PLUGIN_DATA': str(data)}), patch.object(astra, 'call_subagent_api', side_effect=RuntimeError('offline')):
+            info = self.tool('astra_spawn_worker', {'task': 'inspect'})
+            self.assertTrue(astra.WORKERS[info['worker_id']].done_event.wait(10))
+        if os.name == 'nt':
+            import shutil
+            shells = [[exe, '-NoProfile', '-NonInteractive', '-Command'] for name in ('powershell.exe', 'pwsh.exe')
+                      if (exe := shutil.which(name))]
+            self.assertTrue(shells, 'A PowerShell host is required on Windows')
+        else:
+            shells = [['/bin/sh', '-c']]
+        for shell in shells:
+            with self.subTest(shell=shell[0]):
+                proc = subprocess.run([*shell, info['watch_command']], cwd=self.home, capture_output=True, text=True, timeout=10)
+                self.assertEqual(proc.returncode, 1, (proc.stdout, proc.stderr))
+                state = json.loads(proc.stdout)
+                self.assertEqual((state['status'], state['error']), ('failed', 'RuntimeError: offline'))
+                self.assertEqual(state, json.loads(Path(info['worker_file']).read_bytes()))
+
+    def test_cli_wait_all_any_and_dead_owner(self):
+        def cli(*args):
+            return subprocess.run([sys.executable, astra.__file__, '--wait-worker', *args], cwd=self.home, capture_output=True, text=True, timeout=10)
+        directory = astra._plugin_data_subdir('workers')
+        def put(wid, **values):
+            astra._write_json_atomic(directory / (wid + '.json'), {'worker_id': wid, **values})
+        put('a', status='running', owner_pid=os.getpid()); put('b', status='completed', result={'final_response': 'ready'})
+        any_done = cli('a', 'b', '--any'); self.assertEqual(any_done.returncode, 0, any_done.stderr)
+        self.assertEqual([w['worker_id'] for w in json.loads(any_done.stdout)['workers']], ['b'])
+        with subprocess.Popen([sys.executable, '-c', 'pass']) as owner:
+            owner.wait(timeout=10); put('a', status='running', owner_pid=owner.pid)
+            both = cli('a', 'b'); self.assertEqual(both.returncode, 1, both.stderr)
+        a, b = json.loads(both.stdout)['workers']; self.assertEqual((a['status'], b['status']), ('failed', 'completed'))
+        self.assertIn('MCP server exited', a['error']); self.assertEqual(b['result']['final_response'], 'ready')
+        for args in [('../escape',), ('missing',), ('a', '--poll-interval', 'nan')]:
+            with self.subTest(args=args):
+                self.assertEqual(cli(*args).returncode, 2)
+
+    def test_pruning_keeps_running_workers_and_newest_100_finished(self):
+        directory = astra._plugin_data_subdir('workers')
+        for n in range(103):
+            astra._write_json_atomic(directory / f'{n}.json', {'worker_id': str(n), 'status': 'completed' if n % 2 else 'failed', 'finished_at': n})
+        astra._write_json_atomic(directory / 'live.json', {'worker_id': 'live', 'status': 'running', 'started_at': 0})
+        astra._prune_worker_files(directory)
+        self.assertEqual({p.stem for p in directory.glob('*.json')}, {'live', *(str(n) for n in range(3, 103))})
 
     def test_override_sticks_across_workers_and_new_sessions_get_the_default(self):
         with patch.object(astra, 'ALLOW_MODEL_OVERRIDE', True), patch.object(astra, 'DEFAULT_PROTOCOL', 'openai-chat'), patch.object(astra, 'call_subagent_api', return_value={'output': [astra.message('ok')]}) as call:

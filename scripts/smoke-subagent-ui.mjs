@@ -110,7 +110,7 @@ async function renderer({ app, BrowserWindow, session }) {
   try {
     await page(); assert.deepEqual(await js(`[...document.querySelectorAll('.sidebar nav a')].slice(-3).map(x=>x.pathname)`), ['/lab','/subagent','/extensions']);
     await click('验证子代理'); await wait("document.querySelector('.subagent-result')?.textContent.includes('astra_wait_worker')", 'handshake');
-    assert.ok(await js("document.querySelector('.subagent-result').textContent.includes('1.4.0')"));
+    assert.ok(await js("document.querySelector('.subagent-result').textContent.includes('1.5.0')"));
     assert.ok(await js("document.querySelector('.subagent-metrics').textContent.includes('已开启 · 88% 兜底') && document.querySelector('.subagent-compaction').textContent.includes('239,360')"));
     await click('已有供应商'); await wait("field('默认子代理模型').value==='provider-model'", 'provider defaults'); await click('provider-other');
     await probe();

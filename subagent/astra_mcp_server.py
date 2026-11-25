@@ -12,10 +12,13 @@ import base64
 import concurrent.futures
 import fnmatch
 import html
+import http.client
 import json
+import math
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -36,7 +39,7 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 SERVER_NAME = "gpt-astra-subagent"
-SERVER_VERSION = "1.4.0"
+SERVER_VERSION = "1.5.0"
 DEFAULT_MODEL = os.environ.get("ASTRA_MODEL", "gpt-6.2-astra").strip() or "gpt-6.2-astra"
 LOCKED_MODEL = DEFAULT_MODEL  # v1.2 import/patch compatibility
 _STARTUP_MODEL = DEFAULT_MODEL
@@ -79,8 +82,9 @@ COMPACT_KEEP_RECENT_GROUPS = _env_int("ASTRA_COMPACT_KEEP_RECENT_GROUPS", 2, 0, 
 SUMMARY_CHUNK_TOKENS = 95_000
 DEFAULT_WAIT_SECONDS = 120
 
-DEFAULT_MAX_STEPS = 30
-MAX_ALLOWED_STEPS = 60
+DEFAULT_MAX_STEPS = 0  # Unlimited unless the caller opts into a cap.
+API_RETRY_DELAYS = (1.5, 3.5)
+TRANSIENT_TRANSPORT_ERRORS = (urllib.error.URLError, TimeoutError, ConnectionError, ssl.SSLError, http.client.HTTPException)
 HTTP_TIMEOUT_SECONDS = 300
 MAX_TOOL_OUTPUT_CHARS = 24000
 MAX_READ_FILE_CHARS = 32000
@@ -833,19 +837,32 @@ def _open_api_request(req):
     return addinfourl(BytesIO(data), headers, req.full_url, status)
 
 
+class _ContextLengthError(RuntimeError):
+    """The request needs a smaller context, not another transport attempt."""
+
+
+def _context_length_detail(detail: str) -> bool:
+    msg = detail.lower().replace("_", " ").replace("-", " ")
+    return bool(re.search(
+        r"(?:maximum|max) context (?:length|window)|context (?:length|window|limit).{0,40}exceed|"
+        r"exceed.{0,80}context (?:length|window|limit)|too many (?:input )?tokens|input (?:is )?too long",
+        msg, re.DOTALL,
+    ))
+
+
 def _api_request(protocol, model, payload, logger, cache_key=None):
     url = build_api_url(DEFAULT_BASE_URL, protocol, model)
     key = resolve_api_key()
     header = {"anthropic-messages": "x-api-key", "gemini-native": "x-goog-api-key"}.get(protocol, "Authorization")
-    for attempt in range(1, 4):
-        req = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), method="POST",
-                                     headers={"Content-Type": "application/json", "User-Agent": f"{SERVER_NAME}/{SERVER_VERSION}",
-                                              "Accept": "text/event-stream, application/json" if payload.get("stream") else "application/json"})
-        req.add_unredirected_header(header, ("Bearer " if header == "Authorization" else "") + key)
-        if cache_key:
-            req.add_unredirected_header("session_id", cache_key)
-        if protocol == "anthropic-messages":
-            req.add_header("anthropic-version", "2023-06-01")
+    req = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), method="POST",
+                                 headers={"Content-Type": "application/json", "User-Agent": f"{SERVER_NAME}/{SERVER_VERSION}",
+                                          "Accept": "text/event-stream, application/json" if payload.get("stream") else "application/json"})
+    req.add_unredirected_header(header, ("Bearer " if header == "Authorization" else "") + key)
+    if cache_key:
+        req.add_unredirected_header("session_id", cache_key)
+    if protocol == "anthropic-messages":
+        req.add_header("anthropic-version", "2023-06-01")
+    for attempt in range(len(API_RETRY_DELAYS) + 1):
         try:
             with _open_api_request(req) as resp:
                 if protocol == "openai-responses" and "text/event-stream" in (resp.headers.get("Content-Type") or "").lower():
@@ -855,26 +872,29 @@ def _api_request(protocol, model, payload, logger, cache_key=None):
                     if len(body) > MAX_RESPONSE_BYTES:
                         raise ValueError("Upstream response too large.")
                     result = json.loads(body)
-                logger(f"API OK attempt={attempt} model={model} api_format={protocol}")
+                logger(f"API OK attempt={attempt + 1} model={model} api_format={protocol}")
                 return result
-        except urllib.error.HTTPError as exc:
+        except urllib.error.HTTPError as exc:  # HTTPError is also a URLError; classify the status first.
             with exc:
-                detail = exc.read(8192).decode("utf-8", errors="replace")
-            # Recognize the context error without copying provider bodies or secrets to logs/reports.
-            if _context_length_error(RuntimeError(f"HTTP {exc.code}: {detail}")):
-                raise RuntimeError("HTTP 400: context length exceeded") from None
-            if payload.get("stream") and attempt < 3 and (exc.code in (406, 415, 501) or
-                    (exc.code in (400, 422) and re.search(r"stream.{0,30}(?:unsupported|not supported)", detail, re.I))):
-                payload = {**payload, "stream": False}
-                continue
-            if exc.code not in (429, 500, 502, 503, 504) or attempt == 3:
-                raise RuntimeError(f"HTTP {exc.code} from {protocol} endpoint") from None
-            logger(f"API HTTP {exc.code} attempt={attempt}; retrying")
+                try:
+                    detail = exc.read(8192).decode("utf-8", errors="replace")
+                except TRANSIENT_TRANSPORT_ERRORS:
+                    detail = ""
+            if _context_length_detail(detail):
+                if exc.code == 400:
+                    raise _ContextLengthError("HTTP 400: context length exceeded") from None
+                raise RuntimeError(f"HTTP {exc.code}: context length exceeded") from None
+            error = f"HTTP {exc.code} from {protocol} endpoint"
+            if exc.code not in (502, 503, 504):
+                raise RuntimeError(error) from None
+        except TRANSIENT_TRANSPORT_ERRORS as exc:
+            error = f"{protocol} request failed: {type(exc).__name__}"
         except (OSError, ValueError, RuntimeError) as exc:
-            if attempt == 3:
-                raise RuntimeError(f"{protocol} request failed: {type(exc).__name__}") from None
-            logger(f"API ERR attempt={attempt}: {type(exc).__name__}; retrying")
-        time.sleep(2.0 * attempt)
+            raise RuntimeError(f"{protocol} request failed: {type(exc).__name__}") from None
+        if attempt == len(API_RETRY_DELAYS):
+            raise RuntimeError(error)
+        logger(f"{error}; retrying in {API_RETRY_DELAYS[attempt]}s")
+        time.sleep(API_RETRY_DELAYS[attempt])
 
 
 def call_astra_responses_api(input_items, instructions="", tools=None, reasoning_effort=DEFAULT_EFFORT,
@@ -1151,14 +1171,17 @@ def call_subagent_api(input_items, instructions="", tools=None, reasoning_effort
 # Session & Async Worker Management
 # ---------------------------------------------------------------------------
 
-def _validate_session_id(session_id: str) -> str:
-    if (not isinstance(session_id, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", session_id)
-            or session_id in (".", "..")):
-        raise ValueError("Invalid session_id: use only letters, digits, '.', '_' or '-'.")
+def _validate_snapshot_id(value: str, name: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", value) or value in (".", ".."):
+        raise ValueError(f"Invalid {name}: use only letters, digits, '.', '_' or '-'.")
     # A device name remains reserved on Windows even after adding .json or .log.
-    if os.name == "nt" and re.fullmatch(r"CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9]", session_id.split(".")[0], re.I):
-        raise ValueError("Invalid session_id: reserved device name.")
-    return session_id
+    if os.name == "nt" and re.fullmatch(r"CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9]", value.split(".")[0], re.I):
+        raise ValueError(f"Invalid {name}: reserved device name.")
+    return value
+
+
+def _validate_session_id(session_id: str) -> str:
+    return _validate_snapshot_id(session_id, "session_id")
 
 
 @dataclass
@@ -1206,19 +1229,31 @@ def _session_file(session_id: str) -> Path:
     return _resolve_sessions_dir() / f"{session_id}.json"
 
 
+def _write_json_atomic(path: Path, state: dict[str, Any]) -> None:
+    tmp = tempfile.NamedTemporaryFile(dir=path.parent, suffix=".tmp", mode="w", encoding="utf-8", delete=False)
+    try:
+        with tmp:
+            json.dump(state, tmp, ensure_ascii=False, separators=(",", ":"))
+        # A Windows watcher may briefly have the old file open without FILE_SHARE_DELETE.
+        for attempt in range(5):
+            try:
+                os.replace(tmp.name, path)
+                break
+            except PermissionError:
+                if os.name != "nt" or attempt == 4:
+                    raise
+                time.sleep(0.025 * (attempt + 1))
+    finally:
+        Path(tmp.name).unlink(missing_ok=True)
+
+
 def _save_session(session: AstraSession, *, completed_len: int | None = None) -> None:
     path = _session_file(session.session_id)
     state = {**getattr(session, "_extensions", {}), **{key: getattr(session, key) for key in _SESSION_FIELDS}}
     if completed_len is not None:
         state["input_history"] = session.input_history[:completed_len]
-    tmp = tempfile.NamedTemporaryFile(dir=path.parent, suffix=".tmp", mode="w", encoding="utf-8", delete=False)
-    try:
-        with tmp:
-            json.dump(state, tmp, ensure_ascii=False, separators=(",", ":"))
-        os.replace(tmp.name, path)  # Both files must be closed on Windows.
-        session._stamp = _snapshot_stamp(path)
-    finally:
-        Path(tmp.name).unlink(missing_ok=True)
+    _write_json_atomic(path, state)
+    session._stamp = _snapshot_stamp(path)
 
 
 def _load_session(session_id: str) -> AstraSession | None:
@@ -1283,6 +1318,12 @@ class BackgroundWorker:
     result: dict[str, Any] | None = None
     error: str | None = None
     done_event: threading.Event = field(default_factory=threading.Event)
+    owner_pid: int = field(init=False, default_factory=os.getpid)
+    worker_file: Path = field(init=False)
+
+    def __post_init__(self) -> None:
+        _validate_snapshot_id(self.worker_id, "worker_id")
+        self.worker_file = _plugin_data_subdir("workers").resolve() / f"{self.worker_id}.json"
 
 
 SESSIONS: dict[str, AstraSession] = {}
@@ -1886,15 +1927,12 @@ def _model_compact_context(session: AstraSession, call: dict, step_start: int) -
         return {"error": str(exc)}
 
 
-def _context_length_error(exc: RuntimeError) -> bool:
-    msg = str(exc).lower().replace("_", " ").replace("-", " ")
-    if not re.match(r"^http 400\b", msg):
-        return False
-    return bool(re.search(
-        r"(?:maximum|max) context (?:length|window)|context (?:length|window|limit).{0,40}exceed|"
-        r"exceed.{0,80}context (?:length|window|limit)|too many (?:input )?tokens|input (?:is )?too long",
-        msg, re.DOTALL,
-    ))
+def _validate_max_steps(value: int | None) -> int:
+    if value is None:
+        return DEFAULT_MAX_STEPS
+    if type(value) is not int or value < 0:
+        raise ValueError("max_steps must be a non-negative integer (0 means unlimited).")
+    return value
 
 
 def run_astra_agent_turn(
@@ -1905,7 +1943,7 @@ def run_astra_agent_turn(
     reasoning_effort: str = DEFAULT_EFFORT,
     session_id: str | None = None,
     model: str | None = None,
-    max_steps: int = DEFAULT_MAX_STEPS,
+    max_steps: int | None = DEFAULT_MAX_STEPS,
     allow_outside_cwd: bool = False,
     worker_ref: BackgroundWorker | None = None,
 ) -> dict[str, Any]:
@@ -1916,7 +1954,7 @@ def run_astra_agent_turn(
         raise ValueError(f"Invalid reasoning_effort '{effort}'. Must be one of {VALID_EFFORTS}.")
     if model is not None:
         _requested_model(model)
-    max_steps = max(1, min(int(max_steps), MAX_ALLOWED_STEPS))
+    max_steps = _validate_max_steps(max_steps)
 
     sid = _validate_session_id(session_id) if session_id is not None else f"astra-{uuid.uuid4().hex[:10]}"
     with _turn_session(sid, cwd, mode, effort, allow_outside_cwd) as session:
@@ -1959,16 +1997,17 @@ def run_astra_agent_turn(
         turn_reason_tok = 0
         turn_cached_tok = 0
         compactions_this_turn = chunk_compactions_this_turn = 0
-        steps_used = 0
+        step = 0
         final_text = ""
         status = "completed"
         t_start = time.time()
 
         try:
-            for step in range(1, max_steps + 1):
-                steps_used = step
+            while max_steps <= 0 or step < max_steps:
+                step += 1
                 if worker_ref is not None:
                     worker_ref.steps_used = step
+                    _save_worker(worker_ref)
 
                 for attempt in range(2):
                     est = estimate_session_context_tokens(session)
@@ -1988,8 +2027,8 @@ def run_astra_agent_turn(
                             logger=logger,
                         )
                         break
-                    except RuntimeError as exc:
-                        if attempt or not _context_length_error(exc):
+                    except _ContextLengthError:
+                        if attempt:
                             raise
                         logger(f"STEP {step} context length rejected; compacting and retrying once")
 
@@ -2086,7 +2125,7 @@ def run_astra_agent_turn(
 
         elapsed = round(time.time() - t_start, 2)
         logger(
-            f"=== TURN DONE model={session.model} api_format={session.protocol} status={status} steps={steps_used} elapsed={elapsed}s "
+            f"=== TURN DONE model={session.model} api_format={session.protocol} status={status} steps={step} elapsed={elapsed}s "
             f"files_changed={len(executor.files_changed)} ==="
         )
 
@@ -2099,7 +2138,7 @@ def run_astra_agent_turn(
             "mode": mode,
             "cwd": session.cwd,
             "status": status,
-            "steps_used": steps_used,
+            "steps_used": step,
             "context_tokens_est": estimate_session_context_tokens(session),
             "context_limit_tokens": MAX_CONTEXT_TOKENS,
             "compactions_this_turn": compactions_this_turn,
@@ -2141,14 +2180,15 @@ def _mcp_tools():
             "mode": {"type": "string", "enum": ["edit", "readonly"], "default": DEFAULT_MODE},
             "model": text("Optional model. Omit to keep the saved session model or use the configured default for a new session."),
             "reasoning_effort": {"type": "string", "enum": list(VALID_EFFORTS), "default": DEFAULT_EFFORT},
-            "session_id": sid, "max_steps": {"type": "integer", "minimum": 1, "maximum": MAX_ALLOWED_STEPS, "default": DEFAULT_MAX_STEPS},
+            "session_id": sid, "max_steps": {"type": "integer", "minimum": 0, "default": DEFAULT_MAX_STEPS,
+                                             "description": "Optional step cap; 0 (default) means unlimited until the task completes."},
             "allow_outside_cwd": {"type": "boolean", "default": False, "description": "Allow explicit file paths outside the workspace."}}
     return [
-        tool("run_task", "Run a synchronous coding task; reuse session_id for sequential work.", task, ["task", "cwd"]),
-        tool("spawn_worker", "Start a background task. Give parallel workers disjoint file ownership.",
+        tool("run_task", "Run a synchronous coding task to completion (max_steps=0 by default); reuse session_id for sequential work. For a background completion wakeup use astra_spawn_worker.", task, ["task", "cwd"]),
+        tool("spawn_worker", "Start a worker with unlimited steps by default. Give parallel workers disjoint files. Launch the returned watch_command in a background shell task, then end your turn. The host wakes you with the full JSON report.",
              {**task, "worker_name": text("Short worker label.")}, ["task", "cwd"]),
-        tool("worker_status", "Inspect a worker, or omit worker_id to list all workers.", {"worker_id": wid}),
-        tool("wait_worker", "Wait for a worker's report. A timed-out wait does not stop it.",
+        tool("worker_status", "Inspect a worker, or omit worker_id to list workers. Prefer the background watch_command to polling.", {"worker_id": wid}),
+        tool("wait_worker", "Fallback for hosts without background shell tasks. Normally start the spawn result's watch_command in the background and end your turn; the host wakes you on completion. A timed-out wait does not stop the worker.",
              {"worker_id": wid, "timeout_seconds": {"type": "integer", "default": DEFAULT_WAIT_SECONDS}}, ["worker_id"]),
         tool("compact_session", "Back up and compact a session or scan all over-limit sessions.",
              {"session_id": sid, "all_over_limit": {"type": "boolean", "default": False},
@@ -2287,13 +2327,51 @@ def _serialize_worker(w: BackgroundWorker, include_result: bool = True) -> dict[
         "cwd": w.cwd,
         "status": w.status,
         "steps_used": w.steps_used,
+        "started_at": w.started_at,
+        "finished_at": w.finished_at,
+        "owner_pid": w.owner_pid,
         "elapsed_s": elapsed,
+        "error": w.error,
     }
-    if w.error:
-        out["error"] = w.error
-    if include_result and w.result is not None:
+    if include_result:
         out["result"] = w.result
     return out
+
+
+def _save_worker(worker: BackgroundWorker) -> None:
+    _write_json_atomic(worker.worker_file, _serialize_worker(worker))
+
+
+def _prune_worker_files(directory: Path) -> None:
+    # IDs are unique; terminal snapshots are never replaced by running snapshots.
+    finished = []
+    for path in directory.glob("*.json"):
+        try:
+            state = json.loads(path.read_bytes())
+            if isinstance(state, dict) and state.get("status") in ("completed", "failed"):
+                finished.append((float(state["finished_at"]), path))
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    for _, path in sorted(finished, reverse=True)[100:]:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass  # Another server/watcher may have the file open. Retry on the next finish.
+
+
+def _watch_command(argv: list[str]) -> str:
+    if os.name != "nt":
+        import shlex
+        return shlex.join(argv)
+    # Common Windows paths can be pasted directly into PowerShell, cmd or bash.
+    args = [arg.replace("\\", "/") for arg in argv]
+    if re.fullmatch(r"[\w./:+-]+", args[0]) and all(re.fullmatch(r"[\w ./():,@+-]+", a) for a in args[1:]):
+        return " ".join(a if re.fullmatch(r"[\w./:+-]+", a) else f'"{a}"' for a in args)
+    # Keep arbitrary paths as data. PowerShell 5.1 emits a JSON array as one pipeline object.
+    literal = json.dumps(argv, ensure_ascii=True).replace("'", "''")
+    script = (f"$ErrorActionPreference = 'Stop'; $a = ConvertFrom-Json '{literal}'; "
+              "$exe = $a[0]; $rest = $a[1..($a.Length - 1)]; & $exe @rest; exit $LASTEXITCODE")
+    return "powershell.exe -NoProfile -NonInteractive -EncodedCommand " + base64.b64encode(script.encode("utf-16le")).decode("ascii")
 
 
 def handle_tool_call(name: str, arguments: dict[str, Any]) -> tuple[str, bool]:
@@ -2308,7 +2386,7 @@ def handle_tool_call(name: str, arguments: dict[str, Any]) -> tuple[str, bool]:
                 reasoning_effort=str(arguments.get("reasoning_effort", DEFAULT_EFFORT)),
                 session_id=arguments.get("session_id"),
                 model=_requested_model(arguments["model"]) if "model" in arguments else None,
-                max_steps=int(arguments.get("max_steps", DEFAULT_MAX_STEPS)),
+                max_steps=arguments.get("max_steps", DEFAULT_MAX_STEPS),
                 allow_outside_cwd=bool(arguments.get("allow_outside_cwd", False)),
             )
             return json.dumps(res, ensure_ascii=False, indent=2), False
@@ -2318,7 +2396,7 @@ def handle_tool_call(name: str, arguments: dict[str, Any]) -> tuple[str, bool]:
             cwd = str(arguments["cwd"])
             mode = str(arguments.get("mode", DEFAULT_MODE))
             effort = str(arguments.get("reasoning_effort", DEFAULT_EFFORT)).lower()
-            max_steps = int(arguments.get("max_steps", DEFAULT_MAX_STEPS))
+            max_steps = _validate_max_steps(arguments.get("max_steps"))
             allow_outside = bool(arguments.get("allow_outside_cwd", False))
             wname = str(arguments.get("worker_name") or "worker")
             sid = arguments.get("session_id") or f"astra-{uuid.uuid4().hex[:10]}"
@@ -2347,6 +2425,11 @@ def handle_tool_call(name: str, arguments: dict[str, Any]) -> tuple[str, bool]:
                 mode=mode,
                 reasoning_effort=effort,
             )
+            watch_argv = [sys.executable, str(Path(__file__).resolve()), "--wait-worker", wid,
+                          "--plugin-data", str(worker.worker_file.parent.parent)]
+            info = {**_serialize_worker(worker), "worker_file": str(worker.worker_file),
+                    "watch_argv": watch_argv, "watch_command": _watch_command(watch_argv)}
+            _save_worker(worker)  # Visible even if the watcher starts before the first step.
             with WORKERS_LOCK:
                 WORKERS[wid] = worker
 
@@ -2363,32 +2446,39 @@ def handle_tool_call(name: str, arguments: dict[str, Any]) -> tuple[str, bool]:
                         allow_outside_cwd=allow_outside,
                         worker_ref=worker,
                     )
-                    worker.result = res
-                    worker.status = "completed"
                 except Exception as e:
                     worker.error = f"{type(e).__name__}: {e}"
                     worker.status = "failed"
+                else:
+                    worker.result = res
+                    worker.status = "completed"
                 finally:
                     worker.finished_at = time.time()
-                    worker.done_event.set()
+                    try:
+                        _save_worker(worker)  # Publish the terminal report before waking in-process waiters.
+                    except (OSError, ValueError, TypeError) as exc:
+                        worker.status, worker.result = "failed", None
+                        worker.error = f"Could not save worker report: {type(exc).__name__}"
+                        _log_stderr(worker.error)
+                        # Write a small failure report if possible; never intentionally leave a live-looking file.
+                        try:
+                            _save_worker(worker)
+                        except OSError:
+                            worker.worker_file.unlink(missing_ok=True)
+                    finally:
+                        try:
+                            _prune_worker_files(worker.worker_file.parent)
+                        finally:
+                            worker.done_event.set()
 
-            t = threading.Thread(target=_runner, daemon=True)
-            t.start()
-
-            return json.dumps(
-                {
-                    "worker_id": wid,
-                    "worker_name": wname,
-                    "session_id": sid,
-                    "model": worker.model,
-                    "api_format": worker.protocol,
-                    "reasoning_effort": effort,
-                    "mode": mode,
-                    "status": "running",
-                },
-                ensure_ascii=False,
-                indent=2,
-            ), False
+            try:
+                threading.Thread(target=_runner, daemon=True).start()
+            except RuntimeError:
+                with WORKERS_LOCK:
+                    WORKERS.pop(wid, None)
+                worker.worker_file.unlink(missing_ok=True)
+                raise
+            return json.dumps(info, ensure_ascii=False, indent=2), False
 
         if name == "astra_worker_status":
             wid = arguments.get("worker_id")
@@ -2533,14 +2623,93 @@ def main() -> None:
         _log_stderr("Shutting down.")
 
 
+def _owner_alive(pid: int) -> bool:
+    if type(pid) is not int or pid <= 0:
+        raise ValueError("Invalid owner_pid in running worker snapshot.")
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, OverflowError):
+            return False
+        except PermissionError:
+            pass  # Exists, but belongs to a different user.
+        return True
+
+    # os.kill(pid, 0) on Windows is *not* a liveness probe. Wait on a process handle instead.
+    import ctypes
+    from ctypes import wintypes
+    if pid > 0xffffffff:
+        return False
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel.WaitForSingleObject.restype = wintypes.DWORD
+    kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+    handle = kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE only
+    if not handle:
+        error = ctypes.get_last_error()
+        if error == 5:  # ERROR_ACCESS_DENIED
+            return True
+        if error == 87:  # ERROR_INVALID_PARAMETER: no such process
+            return False
+        raise ctypes.WinError(error)
+    try:
+        result = kernel.WaitForSingleObject(handle, 0)
+        if result == 0xffffffff:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return result == 258  # WAIT_TIMEOUT: process is still running
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def _read_worker_file(path: Path) -> dict[str, Any]:
+    state = json.loads(path.read_bytes())
+    if not isinstance(state, dict) or state.get("worker_id") != path.stem or state.get("status") not in ("running", "completed", "failed"):
+        raise ValueError(f"Invalid worker snapshot: {path.name}")
+    return state
+
+
+def _wait_worker_files(directory: Path, ids: list[str], wait_any: bool, poll_interval: float) -> list[dict[str, Any]]:
+    if not math.isfinite(poll_interval):
+        raise ValueError("Poll interval must be finite.")
+    paths = {wid: directory / (_validate_snapshot_id(wid, "worker_id") + ".json") for wid in ids}
+    finished: dict[str, dict[str, Any]] = {}
+    while True:
+        for wid, path in paths.items():
+            if wid in finished:
+                continue  # A result can be pruned while we wait for another worker.
+            state = _read_worker_file(path)
+            if state["status"] == "running" and not _owner_alive(state.get("owner_pid")):
+                # The owner may have published its terminal report just before exiting.
+                state = _read_worker_file(path)
+                if state["status"] == "running":
+                    state.update(status="failed", error="MCP server exited before worker finished.", finished_at=time.time())
+            if state["status"] != "running":
+                finished[wid] = state
+        if len(finished) == len(paths) or (wait_any and finished):
+            return [finished[wid] for wid in paths if wid in finished]
+        time.sleep(max(0.05, poll_interval))
+
+
 def _maintenance_cli() -> None:
-    parser = argparse.ArgumentParser(description="Compact saved Astra sessions (stop other servers using the same PLUGIN_DATA first).")
-    parser.add_argument("--compact-over-limit", action="store_true", required=True)
+    parser = argparse.ArgumentParser(description="Wait for background Astra workers or compact saved sessions.")
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument("--wait-worker", nargs="+", metavar="WORKER_ID", help="Print the complete worker report(s) as JSON and exit")
+    action.add_argument("--compact-over-limit", action="store_true")
+    parser.add_argument("--any", action="store_true", help="Return when any requested worker finishes (default: all)")
+    parser.add_argument("--poll-interval", type=float, default=1.0, metavar="SECONDS")
+    parser.add_argument("--plugin-data", type=Path, help="Plugin data root for worker snapshots (defaults to the server's PLUGIN_DATA location)")
     parser.add_argument("--limit", type=int, default=MAX_CONTEXT_TOKENS)
     parser.add_argument("--session-id")
     parser.add_argument("--force", action="store_true", help="Compact the specified session even below the limit")
     args = parser.parse_args()
     try:
+        if args.wait_worker:
+            directory = args.plugin_data / "workers" if args.plugin_data else _plugin_data_subdir("workers")
+            reports = _wait_worker_files(directory, args.wait_worker, args.any, args.poll_interval)
+            print(json.dumps(reports[0] if len(args.wait_worker) == 1 else {"workers": reports}, indent=2))
+            raise SystemExit(int(any(r["status"] == "failed" for r in reports)))
         report = astra_compact_session(args.session_id, all_over_limit=True, max_context_tokens=args.limit, force=args.force)
     except (OSError, ValueError, KeyError, TypeError) as exc:
         parser.exit(2, f"{parser.prog}: {exc}\n")
