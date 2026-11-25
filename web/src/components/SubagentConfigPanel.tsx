@@ -1,6 +1,6 @@
 import { useId, useLayoutEffect, useRef, useState } from 'react';
 import { ChevronDown, ChevronUp, Eye, EyeOff, KeyRound, LogIn } from 'lucide-react';
-import { allowedGroupModels, MODEL_SLUG, providerModelNames } from '@shared/constants';
+import { allowedGroupModels, isAstraModel, isOnlyAstraGroup, MODEL_SLUG, providerModelNames } from '@shared/constants';
 import { subagentProtocols, type PhuketApiKeyView, type PhuketGroup, type ProviderView, type SubagentStatus } from '@shared/types';
 import { appName } from '../lib/display';
 import { endpointPresets, fallbacks, groupDefaults, maskOnly, needsOriginKey, origin, protocols, providerDefaults, resolvedEndpointPreview, triggerTokenHint, type Draft } from '../lib/subagent';
@@ -30,6 +30,8 @@ export default function SubagentConfigPanel({ d, status, edit, busy, groups, act
   const s = useStudio(), providers = s.providers.data ?? [], [allModels, setAllModels] = useState(false);
   const originKey = needsOriginKey(d, status, provider), endpoint = resolvedEndpointPreview(d.baseUrl, d.protocol, d.model);
   const picks = [...new Set([...(originKey ? [] : d.source === 'provider' && provider ? providerModelNames(provider) : d.source === 'phuket-group' ? allowedGroupModels(group) : []), ...fallbacks[d.protocol]])].filter(m => MODEL_SLUG.test(m));
+  const preferAstra = d.source === 'phuket-group' && isAstraModel(d.model);
+  const groupOptions = preferAstra ? [...groups].sort((a, b) => Number(isOnlyAstraGroup(b)) - Number(isOnlyAstraGroup(a))) : groups;
   const source = (v: Draft['source']) => {
     if (v === d.source) return;
     const p = provider ?? providers.find(p => p.isCurrent) ?? providers[0], g = group ?? groups[0];
@@ -54,10 +56,10 @@ export default function SubagentConfigPanel({ d, status, edit, busy, groups, act
         {groupsError && <Notice retry={reloadGroups}>未能读取推理分组。</Notice>}
         {keysError && <Notice retry={reloadKeys}>未能读取账号密钥。</Notice>}
         <div className="form-grid">
-          <Field label="推理分组"><select value={d.groupId} onChange={e => { const g = groups.find(g => String(g.id) === e.target.value); if (g) { edit(groupDefaults(g)); setAllModels(false); } }}>
+          <Field label="推理分组" hint={preferAstra ? 'Astra 模型可选 Only astra 分组；使用本地代理时可自动按模型分流。' : undefined}><select value={d.groupId} onChange={e => { const g = groups.find(g => String(g.id) === e.target.value); if (g) { edit(groupDefaults(g)); setAllModels(false); } }}>
             <option value="" disabled>{groupsLoading ? '正在读取分组…' : groups.length ? '请选择推理分组' : '暂无可用推理分组'}</option>
             {d.groupId && !group && <option value={d.groupId} disabled>原分组已不可用</option>}
-            {groups.map(g => <option key={g.id} value={g.id}>{g.name} · {protocols[g.protocol!][0]}</option>)}
+            {groupOptions.map(g => <option key={g.id} value={g.id}>{g.name} · {preferAstra && isOnlyAstraGroup(g) ? `仅 Astra · ${g.rate_multiplier}x` : protocols[g.protocol!][0]}</option>)}
           </select></Field>
           <Field label="分组密钥" hint={keysLoading ? '正在读取账号密钥…' : '仅列出此分组当前有效的密钥。'}><select value={d.keyChoice} disabled={!group || !s.session?.authenticated} onChange={e => edit({ keyChoice: e.target.value })}>
             <option value="auto">自动复用或新建</option><option value="create">新建专用密钥</option>

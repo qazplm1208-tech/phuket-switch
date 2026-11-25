@@ -1,10 +1,21 @@
-# Phuket Switch v1.1.1 · 2026-11-25
+# Phuket Switch v1.1.2 · 2026-11-25
+
+- **仅 Astra 自动分流**：在 Codex 速度栏一键绑定 PhuketAI 的 `Only astra` 分组（155，参考倍率 0.08x）并开启本地代理接管。保留当前 Codex 供应商；标准与 Fast 的 Astra 请求使用专属密钥，其他模型不变，UltraFast 仍走 Pro500 ultrafast。此功能默认关闭。
+- **模型目录**：启用后，代理和 Codex 菜单会列出绑定供应商的 Astra 型号，包括可用的 `gpt-6.2-astra-pro` 及其 Fast 直选项。子代理选用 Astra 模型时，分组列表优先显示 Only astra。
+
+## 下载与更新
+
+Windows x64 安装版：**`Phuket.Switch.Setup.1.1.2.exe`**；便携版：**`Phuket.Switch.1.1.2.exe`**。安装版可在「扩展与设置 → 偏好设置 → 软件更新」检查更新；便携版请从[官方发布页](https://github.com/qazplm1208-tech/phuket-switch/releases)下载后手动替换。
+
+---
+
+## Phuket Switch v1.1.1 · 2026-11-25
 
 - **子代理步数**：取消默认 30 步和最高 60 步的限制。默认 `max_steps=0`，由自动压缩兜底，直到任务完成；显式传入正整数仍可限步，减少任务做到一半需要确认续跑的情况。
 - **异步派活**：`astra_spawn_worker` 持久化进度和完整报告，并返回 `watch_command`。主模型在宿主中后台启动该命令后即可结束本回合，完成时会被自动唤醒，无需反复轮询 `astra_wait_worker`。`--wait-worker` 支持多 worker 联合等待，也能检测 MCP 父进程提前退出。
 - **网络稳定性**：子代理请求遇到瞬时断流、TLS EOF 或 HTTP 502/503/504 时最多自动重试两次。内置 Astra MCP 服务升级为 **v1.5.0**。
 
-## 下载与更新
+### 下载与更新
 
 Windows x64 安装版：**`Phuket.Switch.Setup.1.1.1.exe`**；便携版：**`Phuket.Switch.1.1.1.exe`**。请从[官方发布页](https://github.com/qazplm1208-tech/phuket-switch/releases)下载。v1.0.0 至 v1.1.0 安装版可在「扩展与设置 → 偏好设置 → 软件更新」检查并安装更新；便携版请退出旧程序后手动替换。升级后请在「子代理」页重新应用配置，以同步 v1.5.0 服务和派活规则。
 

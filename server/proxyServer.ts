@@ -4,12 +4,12 @@ import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import express from 'express';
 import type { Request, Response as LocalResponse } from 'express';
-import { isUltraFastGroup, providerModelNames } from '../shared/constants.js';
+import { isAstraModel, isOnlyAstraGroup, isUltraFastGroup, providerModelNames } from '../shared/constants.js';
 import type { AppType, GptFastConfig, Provider, ProxyRequestLog, ProxySettings, ProxyStatus, ProxyTakeoverResult, ServiceTier } from '../shared/types.js';
 import type { SwitchDb } from './db.js';
 import { ApiError, bad, conflict, elapsed, isRecord, loopbackRequest, notApplied, now, redactRecognizable, stripV1, stripV1Beta } from './common.js';
 import { applyProvider, desktopModelNames, restoreBackup } from './configSync.js';
-import { fallbackCodexModels, hybridBase, missingUltraFastMessage, parseVirtualSpeedModel, resolveRequestSpeedMode, resolveUltraFastProvider, rewriteResponses, speedMenuModels } from './fastMode.js';
+import { astraDedicatedModels, fallbackCodexModels, hybridBase, missingAstraOnlyMessage, missingUltraFastMessage, parseVirtualSpeedModel, resolveAstraOnlyProvider, resolveRequestSpeedMode, resolveUltraFastProvider, rewriteResponses, speedMenuModels } from './fastMode.js';
 import { readJson } from './httpClient.js';
 import { StreamMetrics } from './streamMetrics.js';
 import { anthropicToResponsesRequest, responsesToAnthropicRequest, responsesToAnthropicResponse, anthropicToResponsesResponse, streamResponsesToAnthropicSse, streamAnthropicToResponsesSse } from './protocolTranslator.js';
@@ -174,7 +174,7 @@ export class ProxyServer {
     if (!isRecord(raw) || raw.model !== undefined && (typeof raw.model !== 'string' || raw.model.length > 256 || /[\r\n]/.test(raw.model))) throw bad('Expected a JSON object and a valid model name.');
     const virtual = gptRequest ? parseVirtualSpeedModel(raw.model ?? '') : { baseModel: String(raw.model ?? '') };
     const model = gemini ? decodeURIComponent(/^\/v1beta\/models\/([^/:]+)/.exec(route)?.[1] ?? '') : virtual.baseModel;
-    const input = virtual.forcedMode ? { ...raw, model } : raw;
+    let input = virtual.forcedMode ? { ...raw, model } : raw;
     if (virtual.forcedMode && (!model || parseVirtualSpeedModel(model).forcedMode)) throw bad('Invalid virtual speed model.');
     const all = this.db.providers(), rules = this.db.state('modelRoutes');
     const client = gemini ? geminiApp : anthropic ? anthropicApp : 'codex', sourceProtocol = gemini ? 'gemini-native' : anthropic ? 'anthropic-messages' : 'openai-responses';
@@ -185,6 +185,7 @@ export class ProxyServer {
     const globalFast = this.db.state('fastMode'), currentCodex = all.find(p => p.isCurrent && p.appType === 'codex');
     const codexFast = currentCodex?.codexFastConfig ?? globalFast;
     const dedicated = resolveUltraFastProvider(all, currentCodex, codexFast);
+    const astraDedicated = resolveAstraOnlyProvider(all, currentCodex, codexFast);
     let list: Provider[] = [];
     let forcedMode = virtual.forcedMode;
     const localNames: string[] = [];
@@ -194,13 +195,14 @@ export class ProxyServer {
         const desktop = active.find(p => p.appType === 'claude-desktop');
         localNames.push(...(desktop ? [desktop] : active.filter(p => p.protocol === 'anthropic-messages')).flatMap(desktopModelNames));
       } else {
-        localNames.push(...[...active.flatMap(p => providerModelNames(p)), ...rules.filter(r => r.enabled && r.sourceModel !== '*').map(r => r.sourceModel)].filter(m => !parseVirtualSpeedModel(m).forcedMode));
+        const astraModels = astraDedicatedModels(astraDedicated);
+        localNames.push(...[...active.flatMap(p => providerModelNames(p)), ...astraModels, ...rules.filter(r => r.enabled && r.sourceModel !== '*').map(r => r.sourceModel)].filter(m => !parseVirtualSpeedModel(m).forcedMode));
+        if (currentCodex && this.db.state('proxyTakeover').codex && globalFast.catalogSpeedVariants !== false && codexFast.catalogSpeedVariants !== false) {
+          const normal = providerModelNames(currentCodex), routed = new Set(enabled.map(r => r.sourceModel));
+          const menu = speedMenuModels([...(normal.length ? normal : fallbackCodexModels), ...astraModels], true, dedicated);
+          localNames.push(...menu.filter(row => row.mode && !routed.has(row.baseModel)).map(row => row.slug));
+        }
       }
-    }
-    if (discovery && !isDesktop && currentCodex && this.db.state('proxyTakeover').codex && globalFast.catalogSpeedVariants !== false && codexFast.catalogSpeedVariants !== false) {
-      const normal = providerModelNames(currentCodex), routed = new Set(enabled.map(r => r.sourceModel));
-      const menu = speedMenuModels(normal.length ? normal : fallbackCodexModels, true, dedicated);
-      localNames.push(...menu.filter(row => row.mode && !routed.has(row.baseModel)).map(row => row.slug));
     }
     const log: ProxyRequestLog = { id: randomUUID(), createdAt: now(), protocol: sourceProtocol, appType: client, model, effectiveModel: model, providerId: null, statusCode: 503, latencyMs: 0, failoverCount: 0, fastFallback: false };
     this.count++;
@@ -218,8 +220,14 @@ export class ProxyServer {
           list = [dedicated]; // Never fail over to a normal group with an UltraFast tier.
         } else {
           // Exclude dedicated keys even from normal failover, unless explicitly selected as current Codex.
-          const normal = all.filter(p => p === currentCodex || (p.id !== codexFast.ultraFastProviderId && !isUltraFastGroup(p)));
+          const requestedModel = model || currentCodex?.model || '';
+          const normal = all.filter(p => p === currentCodex || (p.id !== codexFast.ultraFastProviderId && !isUltraFastGroup(p) && p.id !== codexFast.astraOnlyProviderId && !isOnlyAstraGroup(p)));
           list = this.candidates(route, model, settings.failoverEnabled, normal, anthropicApp, undefined, virtual.forcedMode === 'fast');
+          if (codexFast.routeAstraToOnlyAstra && isAstraModel(requestedModel)) {
+            if (!astraDedicated) throw new ApiError(503, 'ASTRA_ONLY_PROVIDER_MISSING', missingAstraOnlyMessage);
+            if (!model) input = { ...input, model: requestedModel };
+            list = [astraDedicated, ...(settings.failoverEnabled ? list.filter(p => p.id !== astraDedicated.id) : [])];
+          }
         }
       } else list = this.candidates(route, model, settings.failoverEnabled, all, anthropicApp, target);
       if (!list.length && discovery) { log.statusCode = 200; res.json(modelList(localNames)); return; }

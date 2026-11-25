@@ -1,10 +1,11 @@
 import { useState } from 'react';
-import { Check, ChevronDown, ListChecks, ListPlus, X } from 'lucide-react';
+import { Check, ChevronDown, ListChecks, ListPlus, Route, X } from 'lucide-react';
 import type { GptFastConfig } from '@shared/types';
 import {
   allowedGroupModels,
   buildAllFastModelMap,
   effectiveSpeedMode,
+  isOnlyAstraGroup,
   isUltraFastGroup,
   sortModelsNewestFirst,
 } from '@shared/constants';
@@ -13,7 +14,7 @@ import { systemNote, withSpeedMode } from '../lib/display';
 import { useAction, useFeedback } from '../lib/feedback';
 import { messageOf, useResource } from '../lib/resource';
 import { useStudio } from '../lib/studio';
-import { Btn, Choices, IconBtn } from './ui';
+import { Badge, Btn, Choices, IconBtn } from './ui';
 
 const speeds = [
   ['standard', '标准'],
@@ -31,9 +32,12 @@ export default function FastModeBar() {
   const providers = s.providers.data ?? [];
   const codexProviders = providers.filter(p => p.appType === 'codex');
   const current = codexProviders.find(p => p.isCurrent);
-  const menuProvider = current ?? codexProviders.find(p => p.id !== cfg.ultraFastProviderId && !isUltraFastGroup(p)) ?? codexProviders[0];
-  const candidates = providers.filter(p => (p.appType === 'codex' || p.appType === 'gpt-native') && p.protocol === 'openai-responses')
-    .sort((a, b) => Number(isUltraFastGroup(b)) - Number(isUltraFastGroup(a)));
+  const menuProvider = current ?? codexProviders.find(p => p.id !== cfg.ultraFastProviderId && !isUltraFastGroup(p) && p.id !== cfg.astraOnlyProviderId && !isOnlyAstraGroup(p)) ?? codexProviders[0];
+  const eligible = providers.filter(p => (p.appType === 'codex' || p.appType === 'gpt-native') && p.protocol === 'openai-responses');
+  const candidates = [...eligible].sort((a, b) => Number(isUltraFastGroup(b)) - Number(isUltraFastGroup(a)));
+  const astraCandidates = [...eligible].sort((a, b) => Number(isOnlyAstraGroup(b)) - Number(isOnlyAstraGroup(a)));
+  const astraSelection = astraCandidates.find(p => p.id === cfg.astraOnlyProviderId);
+  const astraBound = astraSelection ?? (current && isOnlyAstraGroup(current) ? current : astraCandidates.find(isOnlyAstraGroup));
   const bound = candidates.find(p => p.id === cfg.ultraFastProviderId);
   const autoMatch = current && isUltraFastGroup(current) ? current : candidates.find(isUltraFastGroup);
   const unbound = mode === 'ultrafast' && !bound;
@@ -120,6 +124,27 @@ export default function FastModeBar() {
       notify('已自动绑定 Pro500 ultrafast 通道');
     });
   }
+  function setupAstraOnly() {
+    void run('astra-setup', async () => {
+      try {
+        const { fastMode, proxy, provider } = await api.setupAstraOnly({ enableProxyTakeover: true });
+        s.fastResource.replace(fastMode);
+        if (proxy) s.proxyResource.replace(proxy);
+        notify('已启用 Astra 自动分流', provider.name);
+      } finally {
+        s.refreshAll();
+      }
+    });
+  }
+  function enableAstraTakeover() {
+    void run('astra-takeover', async () => {
+      if (!current && astraBound?.appType === 'codex') await api.activateProvider(astraBound.id, { applyToSystem: false });
+      const { proxy } = await api.takeover({ appType: 'codex', enable: true });
+      s.proxyResource.replace(proxy);
+      s.refreshProviders();
+      notify('已开启 Codex 接管');
+    });
+  }
   async function fillAll() {
     const map = buildAllFastModelMap(allGptModels, cfg.fastModelMap);
     if (await write({ ...cfg, fastModelMap: map })) notify(`已自动填充 ${Object.keys(map).length} 个模型映射`);
@@ -140,6 +165,7 @@ export default function FastModeBar() {
           title={unbound && autoMatch ? `自动匹配：${autoMatch.name}` : undefined}>
           {caption}
         </span>
+        {cfg.routeAstraToOnlyAstra && <Badge tone={astraBound ? 'blue' : 'amber'}>Astra → {astraBound?.name ?? '未绑定'}</Badge>}
         <div className="fast-actions">
           <Btn kind="ghost" className="advanced-trigger" aria-expanded={expanded} aria-controls="fast-menu-options fast-options"
             onClick={() => setExpanded(!expanded)}>
@@ -171,6 +197,31 @@ export default function FastModeBar() {
             </span>
           </>
         )}
+      </div>
+      <div className="codex-menu-strip astra-route-strip" role="group" aria-labelledby="astra-route-title">
+        <strong id="astra-route-title">仅 Astra 自动分流（Only astra · 0.08x）</strong>
+        <label className="check">
+          <input type="checkbox" checked={!!cfg.routeAstraToOnlyAstra} disabled={disabled}
+            onChange={e => patch({ routeAstraToOnlyAstra: e.target.checked }, codexTakeoverOn)} />
+          自动将 Astra 请求发往仅 Astra 分组
+        </label>
+        <select aria-label="仅 Astra 供应商" value={cfg.astraOnlyProviderId ?? ''} disabled={disabled || !s.providers.data}
+          onChange={e => patch({ astraOnlyProviderId: e.target.value || null }, codexTakeoverOn)}>
+          <option value="">自动匹配 Only astra 供应商</option>
+          {cfg.astraOnlyProviderId && !astraSelection && <option value={cfg.astraOnlyProviderId} disabled>已绑定的供应商不可用</option>}
+          {astraCandidates.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+        </select>
+        <Btn icon={Route} className="codex-menu-enable" disabled={disabled} busy={pending === 'astra-setup'} onClick={setupAstraOnly}>
+          一键配置并启用 Only astra
+        </Btn>
+        {cfg.routeAstraToOnlyAstra && astraBound && !codexTakeoverOn && <Btn disabled={disabled || (!current && astraBound.appType !== 'codex')}
+          busy={pending === 'astra-takeover'} onClick={enableAstraTakeover}>开启 Codex 接管</Btn>}
+        <span className="codex-menu-note" role="status">
+          {!cfg.routeAstraToOnlyAstra ? '未启用 Astra 自动分流。'
+            : !astraBound ? '未绑定：请选择供应商或一键配置 Only astra 分组。'
+            : codexTakeoverOn ? `已生效：Astra 模型（如 gpt-6.2-astra）自动发往 ${astraBound.name}，其他模型走当前分组，UltraFast 仍走 Pro500 ultrafast。`
+            : `已绑定 ${astraBound.name}，开启本地代理 Codex 接管后自动按模型分流。`}
+        </span>
       </div>
       <div className={'fast-fold ' + (showOptions ? 'open' : '')} inert={!showOptions}>
         <div>

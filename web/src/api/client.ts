@@ -87,6 +87,7 @@ export const api = {
   testProvider: (id: string) => send('POST /api/providers/:id/test', undefined, { id }),
   fastMode: (s?: AbortSignal) => send('GET /api/fast-mode', undefined, {}, s),
   updateFastMode: (body: Input<'PUT /api/fast-mode'>) => send('PUT /api/fast-mode', body),
+  setupAstraOnly: (body: Input<'POST /api/fast-mode/setup-astra-only'> = {}) => send('POST /api/fast-mode/setup-astra-only', body),
   setupUltraFast: (body: Input<'POST /api/fast-mode/setup-ultrafast'> = {}) =>
     send('POST /api/fast-mode/setup-ultrafast', body),
   auth: (s?: AbortSignal) => send('GET /api/phuket/status', undefined, {}, s),

@@ -1,4 +1,4 @@
-import { effectiveSpeedMode, isSpeedVariantCandidateModel, isUltraFastGroup, sortModelsNewestFirst, VIRTUAL_FAST_SUFFIX, VIRTUAL_ULTRAFAST_SUFFIX } from '../shared/constants.js';
+import { effectiveSpeedMode, isAstraModel, isOnlyAstraGroup, isSpeedVariantCandidateModel, isUltraFastGroup, providerModelNames, sortModelsNewestFirst, VIRTUAL_FAST_SUFFIX, VIRTUAL_ULTRAFAST_SUFFIX } from '../shared/constants.js';
 import type { GptFastConfig, Provider, SpeedMode } from '../shared/types.js';
 export { effectiveSpeedMode };
 export const fallbackCodexModels = ['gpt-6.2-astra', 'gpt-6.2-sol', 'gpt-6.1-terra'];
@@ -43,6 +43,18 @@ export function resolveUltraFastProvider(all: Provider[], current: Provider | nu
   if (bound) return bound;
   if (current?.protocol === 'openai-responses' && isUltraFastGroup(current)) return current;
   return all.find(p => (p.appType === 'codex' || p.appType === 'gpt-native') && p.protocol === 'openai-responses' && isUltraFastGroup(p));
+}
+
+export const missingAstraOnlyMessage = '未配置仅 Astra 专属供应商（Only astra），请先在 Phuket Switch 绑定或一键配置 Only astra 分组。';
+export function resolveAstraOnlyProvider(all: Provider[], current: Provider | null | undefined, cfg: GptFastConfig) {
+  if (!cfg.routeAstraToOnlyAstra) return undefined;
+  const bound = all.find(p => p.id === cfg.astraOnlyProviderId && p.protocol === 'openai-responses');
+  if (bound) return bound;
+  if (current?.protocol === 'openai-responses' && isOnlyAstraGroup(current)) return current;
+  return all.find(p => (p.appType === 'codex' || p.appType === 'gpt-native') && p.protocol === 'openai-responses' && isOnlyAstraGroup(p));
+}
+export function astraDedicatedModels(dedicated?: Provider | null) {
+  return dedicated ? sortModelsNewestFirst(providerModelNames(dedicated).filter(isAstraModel)) : [];
 }
 
 export function fastModel(model: string, config: GptFastConfig, mode = effectiveSpeedMode(config)) {

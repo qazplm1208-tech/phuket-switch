@@ -1,6 +1,6 @@
 import { Fragment, useState } from 'react';
 import { Boxes, Image as ImageIcon, Plus, RefreshCw, UserRound } from 'lucide-react';
-import { FALLBACK_PHUKET_GROUPS, isUltraFastGroup } from '@shared/constants';
+import { FALLBACK_PHUKET_GROUPS, isOnlyAstraGroup, isUltraFastGroup } from '@shared/constants';
 import type { PhuketGroup, PhuketModelPricing, PhuketPricingInterval } from '@shared/types';
 import { api } from '../api/client';
 import { credits, groupApp, num, saleRate, supportedGroup } from '../lib/display';
@@ -89,6 +89,7 @@ function GroupCard({
           <Badge>{g.adapterCategory === 'antigravity' ? '反重力 · 多协议' : g.protocol === 'gemini-native' ? 'Gemini 原生' : g.protocol === 'anthropic-messages' ? 'Anthropic' : 'GPT 原生'}</Badge>
         )}
         {ultraFast && <Badge tone="amber">UltraFast 专属</Badge>}
+        {isOnlyAstraGroup(g) && <Badge tone="blue">仅 Astra</Badge>}
         {g.is_exclusive && <Badge tone="blue">专属</Badge>}
         {sale != null && <Badge tone="amber">限时优惠</Badge>}
         {blocked && <Badge>账户受限</Badge>}

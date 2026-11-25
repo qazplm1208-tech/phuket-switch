@@ -12,16 +12,21 @@ const safeKey = z.string().min(1).max(256).refine(k => !['__proto__','constructo
 export const fast = z.strictObject({
   enabled: z.boolean(), serviceTier: z.enum(['default','auto','priority','fast','ultrafast','flex']), strategy: z.enum(['tier_only','fast_suffix','hybrid']),
   reasoningEffort: z.enum(['none','low','medium','high','xhigh','max','ultra']).optional(), injectCodexCatalogFast: z.boolean(), fastModelMap: z.record(safeKey, model),
+  astraOnlyProviderId: z.string().min(1).max(128).nullable().optional(), routeAstraToOnlyAstra: z.boolean().optional(),
   speedMode: z.enum(['standard','fast','ultrafast']).optional(), ultraFastProviderId: text.nullable().optional(), respectClientServiceTier: z.boolean().optional(), catalogSpeedVariants: z.boolean().optional(),
 });
 const claudeMap = z.strictObject({ defaultModel: model, sonnet: model, haiku: model, opus: model }).partial();
 const provider = z.strictObject({ appType, name: text, protocol, baseUrl: z.string().max(4096).refine(httpBase), apiKey: z.string().min(1).max(16384).regex(/^[\x21-\x7e]+$/).optional(), phuketKeyId: z.int().positive().optional(), autoCreatePhuketKey: z.boolean().optional(), phuketGroupId: z.int().positive().optional(), phuketGroupName: text.optional(), phuketPlatform: text.optional(), rateMultiplier: z.number().nonnegative().optional(), model: model.optional(), claudeModelMap: claudeMap.optional(), codexFastConfig: fast.optional(), availableModels: z.array(model).max(4096).optional(), inFailoverQueue: z.boolean().optional(), priority: z.int().optional(), notes: z.string().max(8192).optional() });
 const sourceCount = (r: { apiKey?: string; phuketKeyId?: number; autoCreatePhuketKey?: boolean }) =>
   Number(r.apiKey !== undefined) + Number(r.phuketKeyId !== undefined) + Number(r.autoCreatePhuketKey === true);
-export const setupUltraFast = z.strictObject({
+const dedicatedKeyFields = {
   groupId: z.int().positive().optional(), phuketKeyId: provider.shape.phuketKeyId, autoCreatePhuketKey: provider.shape.autoCreatePhuketKey,
-  apiKey: provider.shape.apiKey, applyToCodex: z.boolean().optional(), enableCodexMenu: z.boolean().optional(),
-}).refine(r => sourceCount(r) <= 1, { message: '不能同时指定多个密钥来源。' });
+  apiKey: provider.shape.apiKey,
+};
+const oneKeySource = (r: Parameters<typeof sourceCount>[0]) => sourceCount(r) <= 1;
+const keySourceError = { message: '不能同时指定多个密钥来源。' };
+export const setupUltraFast = z.strictObject({ ...dedicatedKeyFields, applyToCodex: z.boolean().optional(), enableCodexMenu: z.boolean().optional() }).refine(oneKeySource, keySourceError);
+export const setupAstraOnly = z.strictObject({ ...dedicatedKeyFields, enableProxyTakeover: z.boolean().optional() }).refine(oneKeySource, keySourceError);
 const imagePromptModel = model.regex(MODEL_SLUG);
 export const applyImagePrompt = z.strictObject({
   groupId: z.int().positive().optional(),

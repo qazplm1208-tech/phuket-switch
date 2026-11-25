@@ -18,6 +18,8 @@ export interface GptFastConfig {
   /** Authoritative when present; older configs infer the mode from enabled and serviceTier. */
   speedMode?: SpeedMode;
   ultraFastProviderId?: string | null;
+  astraOnlyProviderId?: string | null;
+  routeAstraToOnlyAstra?: boolean;
   /** Codex omits the wire tier for Standard. When false, an omitted tier uses the configured mode. */
   respectClientServiceTier?: boolean;
   /** Offer model-menu speed variants only when Codex points at the local proxy. */
@@ -123,6 +125,11 @@ export interface SetupUltraFastRequest {
   enableCodexMenu?: boolean;
 }
 export interface SetupUltraFastResult { provider: ProviderView; fastMode: GptFastConfig; system: SystemApplyResult; proxy?: ProxyStatus }
+
+export type SetupAstraOnlyRequest = Pick<SetupUltraFastRequest, 'groupId' | 'phuketKeyId' | 'autoCreatePhuketKey' | 'apiKey'> & {
+  enableProxyTakeover?: boolean;
+};
+export interface SetupAstraOnlyResult { provider: ProviderView; fastMode: GptFastConfig; proxy?: ProxyStatus; system: SystemApplyResult }
 
 // Phuket wire data: preserve upstream field names, numeric IDs and nulls.
 export type GroupAdapterCategory = 'claude' | 'gpt' | 'gemini' | 'antigravity' | 'domestic' | 'grok' | 'image_prompt' | 'media_coming_soon';
@@ -933,6 +940,7 @@ export interface ApiContract {
   'POST /api/providers/:id/test': Route<NoBody, ProviderTestResult>;
   'GET /api/fast-mode': Route<NoBody, GptFastConfig>;
   'PUT /api/fast-mode': Route<UpdateFastModeRequest, UpdateFastModeResult>;
+  'POST /api/fast-mode/setup-astra-only': Route<SetupAstraOnlyRequest, SetupAstraOnlyResult>;
   'POST /api/fast-mode/setup-ultrafast': Route<SetupUltraFastRequest, SetupUltraFastResult>;
   'GET /api/phuket/status': Route<NoBody, PhuketAuthStatus>;
   'POST /api/phuket/login': Route<PhuketLoginRequest, PhuketAuthStatus>;

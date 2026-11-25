@@ -380,6 +380,9 @@
   padding-block: 8px;
   border-top: 1px solid var(--divider);
 }
+.astra-route-strip > strong { font-size: 12px; }
+.astra-route-strip select { width: auto; max-width: min(100%, 20em); }
+.astra-route-strip .codex-menu-note { flex-basis: 100%; }
 .codex-menu-enable.btn {
   min-height: 28px;
   height: auto;

@@ -1,7 +1,7 @@
 import type { PhuketApiKeyView, PhuketGroupMetadata } from './types.js';
 import type { AppType, ClaudeModelMap, GptFastConfig, PhuketGroup, ProtocolType, ProxySettings, SpeedMode } from './types.js';
 
-export const APP_VERSION = '1.1.1';
+export const APP_VERSION = '1.1.2';
 export const GITHUB_REPO_OWNER = 'qazplm1208-tech';
 export const GITHUB_REPO_NAME = 'phuket-switch';
 export const GITHUB_REPO_URL = `https://github.com/${GITHUB_REPO_OWNER}/${GITHUB_REPO_NAME}`;
@@ -35,10 +35,20 @@ export const DEFAULT_PROXY_SETTINGS: ProxySettings = {
   logRequests: true,
 };
 
-export function isUltraFastGroup(target: { id?: number | string | null; name?: string | null; phuketGroupId?: number | null; phuketGroupName?: string | null }): boolean {
+type GroupTarget = { id?: number | string | null; name?: string | null; phuketGroupId?: number | null; phuketGroupName?: string | null };
+export function isUltraFastGroup(target: GroupTarget): boolean {
   // Provider IDs are opaque strings; only numeric Phuket group IDs identify a group.
   return target.id === 153 || target.id === 154 || target.phuketGroupId === 153 || target.phuketGroupId === 154
     || /ultra[-_\s]?fast/i.test(`${target.name ?? ''} ${target.phuketGroupName ?? ''}`);
+}
+
+export function isOnlyAstraGroup(target: GroupTarget): boolean {
+  return target.id === 155 || target.phuketGroupId === 155
+    || /(?:^|[\s_-])only[-_\s]?astra(?:$|[\s_-])|仅\s*astra/i.test(`${target.name ?? ''} ${target.phuketGroupName ?? ''}`);
+}
+
+export function isAstraModel(model: string | null | undefined): boolean {
+  return /(?:^|[-_/:])astra(?:[-_]|$)/i.test((model ?? '').trim().replace(/--(?:ultra)?fast$/i, ''));
 }
 
 export function effectiveSpeedMode(cfg: Pick<GptFastConfig, 'enabled' | 'serviceTier' | 'speedMode'>): SpeedMode {
@@ -59,6 +69,8 @@ export const DEFAULT_GPT_FAST_CONFIG: GptFastConfig = {
   serviceTier: 'priority',
   speedMode: 'fast',
   ultraFastProviderId: null,
+  astraOnlyProviderId: null,
+  routeAstraToOnlyAstra: false,
   respectClientServiceTier: false,
   catalogSpeedVariants: true,
   strategy: 'tier_only',
@@ -193,6 +205,7 @@ const referenceGroups: (GroupIdentity & { rate_multiplier: number; is_exclusive?
   { id: 142, name: 'VIP专属分组 Pro 500', platform: 'openai', rate_multiplier: 0.16, is_exclusive: true },
   { id: 153, name: 'Pro500 ultrafast', platform: 'openai', rate_multiplier: 0.5 },
   { id: 154, name: 'Pro500 ultrafast 下游', platform: 'openai', rate_multiplier: 1 },
+  { id: 155, name: 'Only astra', platform: 'openai', rate_multiplier: 0.08 },
   { id: 136, name: '下游Pro500分组', platform: 'openai', rate_multiplier: 1 },
   { id: 65, name: '0.50 官方GPT', platform: 'openai', rate_multiplier: 0.5 },
   { id: 107, name: '1.2 Claude CC MAX 不含Fable', platform: 'anthropic', rate_multiplier: 1.1 },

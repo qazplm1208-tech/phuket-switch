@@ -3,7 +3,7 @@ import { resolve } from 'node:path';
 import express from 'express';
 import type { ZodType } from 'zod';
 import { ZodError } from 'zod';
-import { canCreateGroupKey, allowedGroupModels, isUltraFastGroup, MODEL_SLUG, providerModelNames, buildSuggestedClaudeMap, classifyPhuketGroup, defaultBaseUrlForApp, protocolForApp, pickRecommendedModel, PHUKET_BASE_URL, PHUKET_GPT_BASE_URL } from '../shared/constants.js';
+import { canCreateGroupKey, allowedGroupModels, isOnlyAstraGroup, isUltraFastGroup, MODEL_SLUG, providerModelNames, buildSuggestedClaudeMap, classifyPhuketGroup, defaultBaseUrlForApp, protocolForApp, pickRecommendedModel, PHUKET_BASE_URL, PHUKET_GPT_BASE_URL } from '../shared/constants.js';
 import type { ApiContract, ApiErrorResponse, AppType, GptFastConfig, PhuketAuthStatus, PhuketGroup, Provider, SetupUltraFastRequest, UpdateProviderRequest } from '../shared/types.js';
 import { effectiveSpeedMode, fastTier } from './fastMode.js';
 import { ApiError, bad, conflict, loopbackRequest, notApplied, now } from './common.js';
@@ -20,6 +20,13 @@ import { applyImagePrompt, getImagePromptStatus, removeImagePrompt } from './ima
 import { detectCcSwitch, importCcSwitch } from './ccSwitchImport.js';
 import { diagnosticKey, runConnectionCheck } from './diagnostics.js';
 import * as v from './validation.js';
+
+type DedicatedSetupRequest = Pick<SetupUltraFastRequest, 'apiKey' | 'phuketKeyId' | 'autoCreatePhuketKey' | 'groupId'>;
+const dedicatedGroups = {
+  ultrafast: { id: 153, label: 'UltraFast', name: 'Pro500 ultrafast', match: isUltraFastGroup, binding: 'ultraFastProviderId', keyName: 'phuket-switch-ultrafast' },
+  astra: { id: 155, label: 'Only astra', name: 'Only astra', match: isOnlyAstraGroup, binding: 'astraOnlyProviderId', keyName: 'phuket-switch-only-astra' },
+} as const;
+type DedicatedGroup = (typeof dedicatedGroups)[keyof typeof dedicatedGroups];
 
 export function createRuntime(options: { db?: SwitchDb; fetch?: typeof fetch; phuketBaseUrl?: string; directBypass?: DirectBypassOptions } = {}) {
   const db = options.db ?? new SwitchDb(), proxy = new ProxyServer(db), phuket = new PhuketClient(db, options.fetch, options.phuketBaseUrl);
@@ -116,11 +123,17 @@ export function createManagementApp(webRoot = defaultWebRoot, runtime = createRu
     const speedMode = effectiveSpeedMode(config);
     return { ...config, speedMode, enabled: speedMode !== 'standard', serviceTier: fastTier(config, speedMode) };
   }
-  function syncMenuPreference(current: Provider | null, cfg: GptFastConfig) {
-    // A saved provider override must not hide the menu or route it to a different key after an explicit apply.
+  function syncMenuPreference(current: Provider | null, cfg: GptFastConfig, syncSpeedMenu = true) {
     const pref = current?.codexFastConfig;
-    if (!current || !pref || (pref.catalogSpeedVariants === cfg.catalogSpeedVariants && pref.ultraFastProviderId === cfg.ultraFastProviderId)) return;
-    db.updateProvider(current.id, { codexFastConfig: { ...pref, catalogSpeedVariants: cfg.catalogSpeedVariants, ultraFastProviderId: cfg.ultraFastProviderId } });
+    if (!current || !pref) return;
+    const fields = {
+      ...(syncSpeedMenu ? { catalogSpeedVariants: cfg.catalogSpeedVariants, ultraFastProviderId: cfg.ultraFastProviderId } : {}),
+      ...(cfg.astraOnlyProviderId !== undefined ? { astraOnlyProviderId: cfg.astraOnlyProviderId } : {}),
+      ...(cfg.routeAstraToOnlyAstra !== undefined ? { routeAstraToOnlyAstra: cfg.routeAstraToOnlyAstra } : {}),
+    };
+    if ((Object.keys(fields) as (keyof typeof fields)[]).some(k => fields[k] !== pref[k])) {
+      db.updateProvider(current.id, { codexFastConfig: { ...pref, ...fields } });
+    }
   }
   function saveFastConfig(config: GptFastConfig) {
     db.setState('fastMode', config);
@@ -128,8 +141,19 @@ export function createManagementApp(webRoot = defaultWebRoot, runtime = createRu
   }
   route('DELETE /api/providers/:id', 204, null, (_, { id }) => {
     db.deleteProvider(id);
-    const config = db.state('fastMode');
-    if (config.ultraFastProviderId === id) db.transaction(() => saveFastConfig({ ...config, ultraFastProviderId: null }));
+    const unbind = (config: GptFastConfig) => {
+      if (config.astraOnlyProviderId !== id && config.ultraFastProviderId !== id) return;
+      return { ...config, ...(config.ultraFastProviderId === id ? { ultraFastProviderId: null } : {}),
+        ...(config.astraOnlyProviderId === id ? { astraOnlyProviderId: null, routeAstraToOnlyAstra: false } : {}) };
+    };
+    db.transaction(() => {
+      const config = unbind(db.state('fastMode'));
+      if (config) saveFastConfig(config);
+      for (const p of db.providers()) {
+        const pref = p.codexFastConfig && unbind(p.codexFastConfig);
+        if (pref) db.updateProvider(p.id, { codexFastConfig: pref });
+      }
+    });
   });
   route('POST /api/providers/:id/activate', 200, v.activate, (req, { id }) => {
     const p = db.provider(id), system = req.applyToSystem !== false ? applyProvider(db, p, { proxyRoot: proxy.configRoot(p.appType) }) : notApplied();
@@ -144,14 +168,14 @@ export function createManagementApp(webRoot = defaultWebRoot, runtime = createRu
     const proxyRoot = proxy.configRoot('codex');
     const system = current && req.applyToCodex ? applyProvider(db, current, { fast: config, proxyRoot }) : notApplied();
     db.transaction(() => {
-      if (req.applyToCodex && proxyRoot) syncMenuPreference(current, config);
+      syncMenuPreference(current, config, !!(req.applyToCodex && proxyRoot));
       saveFastConfig(config);
     });
     return { config, system };
   });
-  async function ultraFastKey(req: SetupUltraFastRequest, group: PhuketGroup, t: string | null) {
+  async function dedicatedKey(req: DedicatedSetupRequest, group: PhuketGroup, t: string | null, spec: DedicatedGroup) {
     if (req.apiKey) return req.apiKey;
-    if (!t) throw new ApiError(401, 'LOGIN_REQUIRED', '请先登录 PhuketAI 账号，或手动填写 UltraFast 分组密钥。');
+    if (!t) throw new ApiError(401, 'LOGIN_REQUIRED', `请先登录 PhuketAI 账号，或手动填写 ${spec.label} 分组密钥。`);
     const activeKey = (id: number) => activeGroupKey(t, id, group.id);
     if (req.phuketKeyId !== undefined) return activeKey(req.phuketKeyId);
     if (!req.autoCreatePhuketKey) {
@@ -172,35 +196,35 @@ export function createManagementApp(webRoot = defaultWebRoot, runtime = createRu
         if (seen.size === count || seen.size >= total) break;
       }
     }
-    if (!canCreateGroupKey(group, session()?.account.allowed_groups)) throw bad('当前账户无法为 UltraFast 分组新建密钥。');
-    return (await phuket.createKey(t, { name: 'phuket-switch-ultrafast', group_id: group.id })).key;
+    if (!canCreateGroupKey(group, session()?.account.allowed_groups)) throw bad(`当前账户无法为 ${spec.label} 分组新建密钥。`);
+    return (await phuket.createKey(t, { name: spec.keyName, group_id: group.id })).key;
   }
-  async function prepareUltraFastProvider(req: SetupUltraFastRequest) {
+  async function prepareDedicatedProvider(req: DedicatedSetupRequest, spec: DedicatedGroup) {
     const t = session()?.token ?? null;
     if (!t && !req.apiKey && req.phuketKeyId === undefined && !req.autoCreatePhuketKey) {
-      const saved = db.providers('codex').filter(p => p.protocol === 'openai-responses' && isUltraFastGroup(p) && (req.groupId === undefined || p.phuketGroupId === req.groupId));
-      const boundId = db.state('fastMode').ultraFastProviderId;
-      const existing = saved.find(p => p.id === boundId) ?? saved.find(p => p.phuketGroupId === 153) ?? saved[0];
+      const saved = db.providers('codex').filter(p => p.protocol === 'openai-responses' && spec.match(p) && (req.groupId === undefined || p.phuketGroupId === req.groupId));
+      const boundId = db.state('fastMode')[spec.binding];
+      const existing = saved.find(p => p.id === boundId) ?? saved.find(p => p.phuketGroupId === spec.id) ?? saved[0];
       if (existing) return existing;
-      throw new ApiError(401, 'LOGIN_REQUIRED', '请先登录 PhuketAI 账号，或手动填写 UltraFast 分组密钥。');
+      throw new ApiError(401, 'LOGIN_REQUIRED', `请先登录 PhuketAI 账号，或手动填写 ${spec.label} 分组密钥。`);
     }
-    const groups = (await phuket.getMergedGroups(t)).filter(g => g.protocol === 'openai-responses' && isUltraFastGroup(g));
-    const group = req.groupId !== undefined ? groups.find(g => g.id === req.groupId) : groups.find(g => g.id === 153) ?? groups[0];
-    if (!group) throw bad('未找到所选的 Pro500 ultrafast 专属分组。');
-    const apiKey = await ultraFastKey(req, group, t), models = allowedGroupModels(group);
+    const groups = (await phuket.getMergedGroups(t)).filter(g => g.protocol === 'openai-responses' && spec.match(g));
+    const group = req.groupId !== undefined ? groups.find(g => g.id === req.groupId) : groups.find(g => g.id === spec.id) ?? groups[0];
+    if (!group) throw bad(`未找到所选的 ${spec.name} 专属分组。`);
+    const apiKey = await dedicatedKey(req, group, t, spec), models = allowedGroupModels(group);
     return { protocol: 'openai-responses' as const, baseUrl: PHUKET_GPT_BASE_URL, apiKey, phuketGroupId: group.id, phuketGroupName: group.name, phuketPlatform: group.platform,
       rateMultiplier: group.rate_multiplier, availableModels: models, model: pickRecommendedModel(models, 'openai-responses') };
   }
+  function upsertDedicatedProvider(prepared: Awaited<ReturnType<typeof prepareDedicatedProvider>>) {
+    if ('id' in prepared) return prepared;
+    const existing = db.providers('codex').find(p => p.phuketGroupId === prepared.phuketGroupId);
+    return existing ? db.updateProvider(existing.id, prepared) : db.createProvider({ ...prepared, name: prepared.phuketGroupName, appType: 'codex' });
+  }
   route('POST /api/fast-mode/setup-ultrafast', 200, v.setupUltraFast, async req => {
     if (req.applyToCodex && !req.enableCodexMenu && !db.current('codex')) throw conflict('请先选择一个当前 Codex 供应商，再应用速度设置。');
-    const prepared = await prepareUltraFastProvider(req);
+    const prepared = await prepareDedicatedProvider(req, dedicatedGroups.ultrafast);
     const result = db.transaction(() => {
-      let provider: Provider;
-      if ('id' in prepared) provider = prepared;
-      else {
-        const existing = db.providers('codex').find(p => p.phuketGroupId === prepared.phuketGroupId);
-        provider = existing ? db.updateProvider(existing.id, prepared) : db.createProvider({ ...prepared, name: prepared.phuketGroupName, appType: 'codex' });
-      }
+      const provider = upsertDedicatedProvider(prepared);
       const fastMode = normalizedFastConfig({ ...db.state('fastMode'), ultraFastProviderId: provider.id, ...(req.enableCodexMenu ? { catalogSpeedVariants: true } : {}) });
       const current = db.current('codex');
       const system = current && req.applyToCodex && !req.enableCodexMenu ? applyProvider(db, current, { fast: fastMode, proxyRoot: proxy.configRoot('codex') }) : notApplied();
@@ -211,6 +235,19 @@ export function createManagementApp(webRoot = defaultWebRoot, runtime = createRu
     if (!req.enableCodexMenu) return result;
     if (db.current('codex')) result.system = (await proxy.takeover('codex', true, result.fastMode)).system;
     return { ...result, proxy: proxy.getStatus() };
+  });
+  route('POST /api/fast-mode/setup-astra-only', 200, v.setupAstraOnly, async req => {
+    const prepared = await prepareDedicatedProvider(req, dedicatedGroups.astra);
+    const result = db.transaction(() => {
+      const provider = upsertDedicatedProvider(prepared);
+      const fastMode = normalizedFastConfig({ ...db.state('fastMode'), astraOnlyProviderId: provider.id, routeAstraToOnlyAstra: true });
+      syncMenuPreference(db.current('codex') ?? provider, fastMode);
+      saveFastConfig(fastMode);
+      return { provider: toProviderView(db.provider(provider.id)), fastMode };
+    });
+    if (!db.current('codex')) result.provider = toProviderView(db.setCurrentProvider('codex', result.provider.id));
+    if (req.enableProxyTakeover === false) return { ...result, system: notApplied() };
+    return { ...result, ...await proxy.takeover('codex', true, result.fastMode) };
   });
   route('GET /api/phuket/status', 200, null, authStatus);
   route('POST /api/phuket/login', 200, v.login, async req => {

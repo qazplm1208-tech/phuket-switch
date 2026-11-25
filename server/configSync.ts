@@ -6,7 +6,7 @@ import type { AppType, ConfigDiffPreview, GptFastConfig, LiveCliState, ModelRout
 import { apps, type SwitchDb } from './db.js';
 import { conflict, isRecord, normalizeV1Base, notApplied, now, own, redactRecognizable, secretField, stripV1, stripV1Beta } from './common.js';
 import { CLAUDE_DESKTOP_PROFILE_ID, CLAUDE_DESKTOP_PROFILE_NAME, cliPaths, commitFiles, desktopConfigText, jsonText, parseJson, restoreBackup as restoreFiles, textFile, type Plan } from './configFiles.js';
-import { codexConfigTier, effectiveSpeedMode, fallbackCodexModels as fallbackModels, fastModel, missingUltraFastMessage, parseVirtualSpeedModel, resolveUltraFastProvider, speedMenuModels } from './fastMode.js';
+import { astraDedicatedModels, codexConfigTier, effectiveSpeedMode, fallbackCodexModels as fallbackModels, fastModel, missingUltraFastMessage, parseVirtualSpeedModel, resolveAstraOnlyProvider, resolveUltraFastProvider, speedMenuModels } from './fastMode.js';
 import { parseToml, redactToml, replaceTomlSubtree, updateTomlFields } from './surgicalToml.js';
 
 const baseInstructions = 'You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user\'s goals.';
@@ -76,8 +76,13 @@ function readCatalog(file: string): Record<string, any> | null {
 function routeSlugs(routes: ModelRouteRule[]) {
   return [...new Set(routes.filter(r => r.enabled && r.sourceClient === 'codex' && r.sourceModel !== '*' && !parseVirtualSpeedModel(r.sourceModel).forcedMode).map(r => r.sourceModel))];
 }
-type CatalogOptions = { includeRoutedModels: boolean; includeSpeedVariants: boolean; ultraFastProvider?: Provider | null; previousRouteSlugs: string[] };
-function catalog(provider: Provider, fast: GptFastConfig, routes: ModelRouteRule[], { includeRoutedModels, includeSpeedVariants, ultraFastProvider, previousRouteSlugs }: CatalogOptions) {
+type DedicatedProviders = { ultraFastProvider?: Provider; astraOnlyProvider?: Provider };
+function dedicatedProviders(db: SwitchDb, current: Provider, fast: GptFastConfig): DedicatedProviders {
+  const all = db.providers();
+  return { ultraFastProvider: resolveUltraFastProvider(all, current, fast), astraOnlyProvider: resolveAstraOnlyProvider(all, current, fast) };
+}
+type CatalogOptions = DedicatedProviders & { includeRoutedModels: boolean; includeSpeedVariants: boolean; previousRouteSlugs: string[] };
+function catalog(provider: Provider, fast: GptFastConfig, routes: ModelRouteRule[], { includeRoutedModels, includeSpeedVariants, ultraFastProvider, astraOnlyProvider, previousRouteSlugs }: CatalogOptions) {
   const target = cliPaths().catalog, dir = path.dirname(target);
   const documents = [
     readCatalog(target),
@@ -93,7 +98,8 @@ function catalog(provider: Provider, fast: GptFastConfig, routes: ModelRouteRule
   const routed = new Set(routeSlugs(routes));
   const knownRoutes = new Set([...previousRouteSlugs, ...routes.filter(r => r.sourceClient === 'codex').map(r => r.sourceModel)]);
   const providerModels = [provider.model, ...sortModelsNewestFirst(provider.availableModels ?? [])].filter((m): m is string => !!m && !parseVirtualSpeedModel(m).forcedMode);
-  const nativeSlugs = providerModels.length ? providerModels : [...metadata.keys()].filter(slug => !knownRoutes.has(slug) && !metadata.get(slug)?.phuket_switch_route).concat(fallbackModels);
+  const baseSlugs = providerModels.length ? providerModels : [...metadata.keys()].filter(slug => !knownRoutes.has(slug) && !metadata.get(slug)?.phuket_switch_route).concat(fallbackModels);
+  const nativeSlugs = [...new Set([...baseSlugs, ...astraDedicatedModels(astraOnlyProvider)])];
   const effectiveFastModels = effectiveSpeedMode(fast) === 'fast' && fast.strategy !== 'tier_only'
     ? nativeSlugs.flatMap(baseModel => Object.hasOwn(fast.fastModelMap, baseModel) ? [fast.fastModelMap[baseModel]] : []) : [];
   const menu = speedMenuModels([...nativeSlugs, ...effectiveFastModels], includeSpeedVariants, ultraFastProvider);
@@ -152,10 +158,10 @@ function writeCatalogRoutes(db: SwitchDb, includeRoutedModels: boolean): SystemA
   const routes = db.state('modelRoutes');
   let result: SystemApplyResult = notApplied();
   if (p) {
-    const fast = p.codexFastConfig ?? db.state('fastMode'), dedicated = resolveUltraFastProvider(db.providers(), p, fast);
-    const upstream = !takeover && effectiveSpeedMode(fast) === 'ultrafast' ? dedicated ?? p : p;
+    const fast = p.codexFastConfig ?? db.state('fastMode'), { ultraFastProvider, astraOnlyProvider } = dedicatedProviders(db, p, fast);
+    const upstream = !takeover && effectiveSpeedMode(fast) === 'ultrafast' ? ultraFastProvider ?? p : p;
     const content = catalog(upstream, fast, routes, { includeRoutedModels, includeSpeedVariants: takeover && fast.catalogSpeedVariants !== false,
-      ultraFastProvider: dedicated, previousRouteSlugs: db.state('codexCatalogRouteSlugs') });
+      ultraFastProvider, astraOnlyProvider: takeover ? astraOnlyProvider : undefined, previousRouteSlugs: db.state('codexCatalogRouteSlugs') });
     result = commitFiles(db, 'codex', includeRoutedModels ? 'Sync routed models to Codex catalog' : 'Remove routed models from Codex catalog', new Map([[cliPaths().catalog, content]]));
   }
   db.transaction(() => {
@@ -183,7 +189,7 @@ export function restoreBackup(db: SwitchDb, id: string, directProvider?: Provide
   }
   return restoreFiles(db, id);
 }
-export function providerPlan(p: Provider, fast: GptFastConfig, proxyRoot?: string, routes: ModelRouteRule[] = [], previousRouteSlugs: string[] = [], ultraFastProvider?: Provider | null, includeRoutedModels = false, agyBindings: Record<string, string> = {}): Plan {
+export function providerPlan(p: Provider, fast: GptFastConfig, proxyRoot?: string, routes: ModelRouteRule[] = [], previousRouteSlugs: string[] = [], { ultraFastProvider, astraOnlyProvider }: DedicatedProviders = {}, includeRoutedModels = false, agyBindings: Record<string, string> = {}): Plan {
   const f = cliPaths();
   const directUltra = p.appType === 'codex' && !proxyRoot && effectiveSpeedMode(fast) === 'ultrafast';
   const upstream = directUltra ? ultraFastProvider ?? (isUltraFastGroup(p) ? p : null) : p;
@@ -209,15 +215,15 @@ export function providerPlan(p: Provider, fast: GptFastConfig, proxyRoot?: strin
   const top = updateTomlFields(current, [], { service_tier: codexConfigTier(fast), model_provider: 'custom', model, model_catalog_json: 'phuket-switch-model-catalog.json' });
   const config = replaceTomlSubtree(top, ['model_providers', 'custom'], { name: upstream.name, base_url: normalizeV1Base(url), wire_api: 'responses', requires_openai_auth: false, experimental_bearer_token: key });
   const existingAuth = parseJson(textFile(f.auth));
-  const content = catalog(upstream, fast, routes, { includeRoutedModels: !!proxyRoot && includeRoutedModels, includeSpeedVariants: !!proxyRoot && fast.catalogSpeedVariants !== false, ultraFastProvider, previousRouteSlugs });
+  const content = catalog(upstream, fast, routes, { includeRoutedModels: !!proxyRoot && includeRoutedModels, includeSpeedVariants: !!proxyRoot && fast.catalogSpeedVariants !== false, ultraFastProvider, astraOnlyProvider: proxyRoot ? astraOnlyProvider : undefined, previousRouteSlugs });
   const plan: Plan = new Map([[f.codex, config], [f.catalog, content]]);
   // The custom bearer authenticates inference independently of the user's Desktop session.
   if (!hasInteractiveAuth(existingAuth)) plan.set(f.auth, jsonText({ ...existingAuth, OPENAI_API_KEY: key }));
   return plan;
 }
 function planForProvider(db: SwitchDb, p: Provider, fast: GptFastConfig, proxyRoot?: string) {
-  const ultraFastProvider = p.appType === 'codex' ? resolveUltraFastProvider(db.providers(), p, fast) : undefined;
-  return providerPlan(p, fast, proxyRoot, db.state('modelRoutes'), db.state('codexCatalogRouteSlugs'), ultraFastProvider, db.state('codexIncludeRoutedModels'), p.appType === 'antigravity' ? db.state('antigravityModelBindings') : {});
+  const dedicated = p.appType === 'codex' ? dedicatedProviders(db, p, fast) : undefined;
+  return providerPlan(p, fast, proxyRoot, db.state('modelRoutes'), db.state('codexCatalogRouteSlugs'), dedicated, db.state('codexIncludeRoutedModels'), p.appType === 'antigravity' ? db.state('antigravityModelBindings') : {});
 }
 export function applyProvider(db: SwitchDb, p: Provider, options: { fast?: GptFastConfig; proxyRoot?: string; takeover?: boolean } = {}): SystemApplyResult {
   const plan = planForProvider(db, p, options.fast ?? p.codexFastConfig ?? db.state('fastMode'), options.proxyRoot);

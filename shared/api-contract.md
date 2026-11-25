@@ -57,6 +57,7 @@ Subagent preview and apply accept `enableChunkCompaction` (default `true`), `com
 | `POST /api/providers/:id/test` | `NoBody` | 200 | `ProviderTestResult` |
 | `GET /api/fast-mode` | `NoBody` | 200 | `GptFastConfig` |
 | `PUT /api/fast-mode` | `UpdateFastModeRequest` | 200 | `UpdateFastModeResult` |
+| `POST /api/fast-mode/setup-astra-only` | `SetupAstraOnlyRequest` | 200 | `SetupAstraOnlyResult` |
 | `POST /api/fast-mode/setup-ultrafast` | `SetupUltraFastRequest` | 200 | `SetupUltraFastResult` |
 | `GET /api/phuket/status` | `NoBody` | 200 | `PhuketAuthStatus` |
 | `POST /api/phuket/login` | `PhuketLoginRequest` | 200 | `PhuketAuthStatus` |
