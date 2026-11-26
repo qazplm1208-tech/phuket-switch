@@ -256,6 +256,35 @@ class AstraTests(unittest.TestCase):
             self.assertEqual(kw['headers']['Authorization'], 'Bearer offline-only'); self.assertEqual(kw['headers']['Session_id'], 'session-one')
             self.assertEqual(json.loads(kw['body']), {'stream': True}); self.assertIs(kw['route'], route); self.assertIs(kw['resolver'], resolver)
 
+    def test_physical_route_rediscovered_once_only_on_connection_failures(self):
+        from unittest.mock import Mock
+        req = astra.urllib.request.Request('https://offline.invalid/relay', data=b'body')
+        fail = OSError(astra.errno.ENETUNREACH, 'unreachable')
+        with patch.dict(os.environ, {'ASTRA_DIRECT_BYPASS': 'physical-nic'}), \
+                patch.object(astra.urllib.request, 'urlopen', side_effect=AssertionError('fallback')), \
+                patch.object(astra.urllib.request, 'build_opener', side_effect=AssertionError('fallback')):
+            for retry_error in (None, fail):
+                old = (Mock(side_effect=fail), object(), object())
+                new = (Mock(side_effect=retry_error, return_value=(200, {}, b'recovered')), object(), object())
+                with patch.object(astra, '_direct_client', (('', ()), old)), patch.object(astra, '_physical_client', side_effect=[old, new]) as pick:
+                    if retry_error:
+                        with self.assertRaisesRegex(RuntimeError, 'rediscovery'):
+                            astra._open_api_request(req)
+                    else:
+                        with astra._open_api_request(req) as response:
+                            self.assertEqual(response.read(), b'recovered')
+                    self.assertIsNone(astra._direct_client)
+                    self.assertEqual(pick.call_count, 2)
+                    self.assertIs(new[0].call_args.kwargs['resolver'], new[2])
+            sent = OSError(astra.errno.ENETUNREACH, 'response read failed')
+            sent.route_request_started = True
+            for error in (sent, astra.ssl.SSLCertVerificationError(), HTTPError('u', 401, 'auth', {}, io.BytesIO())):
+                cached = (Mock(side_effect=error), object(), object())
+                with patch.object(astra, '_direct_client', ('settings', cached)), patch.object(astra, '_physical_client', return_value=cached) as pick:
+                    with self.assertRaises(type(error)):
+                        astra._open_api_request(req)
+                    pick.assert_called_once(); self.assertIs(astra._direct_client[1], cached)
+
     def test_loopback_and_disabled_modes_do_not_load_physical_helpers(self):
         req = astra.urllib.request.Request('https://offline.invalid')
         with patch.object(astra, '_physical_client', side_effect=AssertionError('unexpected physical transport')), \
@@ -324,6 +353,36 @@ class AstraTests(unittest.TestCase):
         self.assertEqual(send.call_args.args[0].get_header('Session_id'), 'sticky')
         self.assertNotIn('reasoning', payload)
 
+    def test_truncated_stream_cannot_execute_tools_or_commit_partial_text(self):
+        pending = astra.call_item('write_file', {'path': 'uncommitted', 'content': 'bad'}, 'pending')
+        events = [{'type': 'response.output_text.delta', 'delta': 'partial'},
+                  {'type': 'response.output_item.done', 'item': pending}]
+        partial = ''.join('data: '+json.dumps(e)+'\n\n' for e in events).encode() + b'data: [DONE]\n\n'
+        good = b'event: response.completed\ndata: {"response":{"output_text":"final"}}\n\n'
+        with patch.object(astra.time, 'sleep'), patch.object(astra, '_open_api_request', side_effect=[
+                Response(partial, 'text/event-stream'), Response(good, 'text/event-stream')]) as send:
+            result = self.tool('astra_run_task', {'task': 'stream'})
+        self.assertEqual((send.call_count, result['steps_used'], result['final_response']), (2, 1, 'final'))
+        self.assertIs(send.call_args_list[0].args[0], send.call_args_list[1].args[0])
+        self.assertFalse((self.home/'uncommitted').exists())
+        history = astra._load_session(result['session_id']).input_history
+        self.assertNotIn('partial', json.dumps(history)); self.assertNotIn(pending, history)
+        with patch.object(astra.time, 'sleep'), patch.object(astra, '_open_api_request', side_effect=lambda *_: Response(partial, 'text/event-stream')) as send:
+            with self.assertRaisesRegex(RuntimeError, 'IncompleteRead'):
+                astra.call_astra_responses_api([])
+            self.assertEqual(send.call_count, 3)
+
+    def test_terminal_incomplete_and_failed_streams_do_not_retry(self):
+        for event in ['response.incomplete', 'response.failed', 'error']:
+            body = ('event: '+event+'\ndata: {"response":{"output_text":"unfinished"}}\n\n').encode()
+            with self.subTest(event=event), patch.object(astra, '_open_api_request', return_value=Response(body, 'text/event-stream')) as send:
+                if event == 'response.incomplete':
+                    self.assertEqual(astra.call_astra_responses_api([])['status'], 'incomplete')
+                else:
+                    with self.assertRaises(RuntimeError):
+                        astra.call_astra_responses_api([])
+                send.assert_called_once()
+
     def test_responses_transient_retry_retains_model_cache_and_effort(self):
         error = HTTPError('https://offline.invalid', 503, 'temporarily unavailable', {}, io.BytesIO())
         with patch.object(astra, 'API_RETRY_DELAYS', (0, 0)), patch.object(astra.urllib.request, 'urlopen', side_effect=[error, Response({'output_text': 'ok'})]) as send:
@@ -356,10 +415,121 @@ class AstraTests(unittest.TestCase):
 
     def test_default_zero_and_null_run_past_former_ceiling(self):
         for cap in ({}, {'max_steps': 0}, {'max_steps': None}, {'max_steps': 75}):
-            replies = [{'output': [astra.call_item('list_dir', {}, str(i))]} for i in range(64)] + [{'output_text': 'finished'}]
+            replies = [{'output': [astra.call_item('read_file', {'path': 'log', 'start_line': i+1}, str(i))]} for i in range(64)] + [{'output_text': 'finished'}]
             with self.subTest(cap=cap), patch.object(astra, 'call_subagent_api', side_effect=replies), patch.object(astra.ToolExecutor, 'execute', return_value='ok'):
                 r = self.tool('astra_run_task', {'task': 'long task', **cap})
                 self.assertEqual((r['steps_used'], r['status'], r['final_response']), (65, 'completed', 'finished'))
+
+    def test_repeated_no_op_tool_rounds_stop_but_session_can_continue(self):
+        self.home.joinpath('same').write_bytes(b'unchanged')
+        counter = 0
+        def model(**_):
+            nonlocal counter
+            counter += 1
+            self.assertLessEqual(counter, 6)
+            args = {'path': 'same', 'content': 'unchanged'}
+            return {'output': [astra.call_item('write_file', args, str(counter))]}
+        with patch.object(astra, 'call_subagent_api', side_effect=model):
+            text, err = astra.handle_tool_call('astra_run_task', {'cwd': str(self.home), 'task': 'repeat', 'session_id': 'repeat'})
+        result = json.loads(text)
+        self.assertTrue(err); self.assertEqual((result['status'], counter, result['files_changed']), ('no_progress', astra.NO_PROGRESS_ROUNDS, []))
+        saved = astra._load_session('repeat')
+        self.assertEqual([i['call_id'] for i in saved.input_history if i.get('type') == 'function_call_output'],
+                         [str(i+1) for i in range(counter)])
+        self.assertEqual(self.home.joinpath('same').read_bytes(), b'unchanged')
+        with patch.object(astra, 'call_subagent_api', return_value={'output_text': 'resumed'}):
+            resumed = self.tool('astra_run_task', {'task': 'continue', 'session_id': 'repeat'})
+        self.assertEqual(resumed['final_response'], 'resumed')
+        self.assertEqual(resumed['prompt_cache_key'], result['prompt_cache_key'])
+        # JSON argument ordering and elapsed time alone are not progress.
+        self.assertEqual(astra._tool_fingerprint('run_command', '{"a":1,"b":2}', '{"elapsed_s":1,"stdout":"ok"}'),
+                         astra._tool_fingerprint('run_command', '{"b":2,"a":1}', '{"elapsed_s":2,"stdout":"ok"}'))
+
+    def test_cancellation_between_sibling_tools_preserves_replayable_results(self):
+        import threading
+        cancelled = threading.Event()
+        original = astra.ToolExecutor.execute
+        def first(executor, name, args):
+            result = original(executor, name, args)
+            cancelled.set()
+            return result
+        calls = [astra.call_item('write_file', {'path': p, 'content': 'data'}, p) for p in ['first', 'skipped']]
+        with patch.object(astra, 'DEFAULT_PROTOCOL', 'openai-chat'), patch.object(astra, 'call_subagent_api', return_value={'output': calls}) as model, \
+                patch.object(astra.ToolExecutor, 'execute', first):
+            text, err = astra.handle_tool_call('astra_run_task', {'task': 'work', 'cwd': str(self.home), 'session_id': 'cancel'}, cancel_event=cancelled)
+        self.assertTrue(err); self.assertEqual(json.loads(text)['status'], 'cancelled'); model.assert_called_once()
+        self.assertTrue((self.home/'first').is_file()); self.assertFalse((self.home/'skipped').exists())
+        tail = astra._load_session('cancel').input_history[-4:]
+        self.assertEqual([i['call_id'] for i in tail], ['first', 'skipped', 'first', 'skipped'])
+        self.assertTrue(json.loads(tail[-2]['output'])['ok']); self.assertIn('cancelled', json.loads(tail[-1]['output'])['error'])
+
+    def test_stdio_cancellation_ignores_late_model_result_and_eof_stops_worker(self):
+        import threading
+        from types import SimpleNamespace
+        def record(**msg):
+            return (json.dumps({'jsonrpc': '2.0', **msg}) + '\n').encode()
+        for spawn in (False, True):
+            sid = 'eof' if spawn else 'cancel-rpc'
+            entered, release, closed, saved = (threading.Event() for _ in range(4))
+            replies = []
+            args = {'task': 'wait', 'cwd': str(self.home), 'session_id': sid}
+            name = 'astra_spawn_worker' if spawn else 'astra_run_task'
+            def messages():
+                yield record(id='work', method='tools/call', params={'name': name, 'arguments': args})
+                self.assertTrue(entered.wait(3), 'model request did not start')
+                if not spawn:
+                    yield record(method='notifications/cancelled', params={'requestId': 'work'})
+                    self.assertTrue(saved.wait(3), 'cancelled turn waited for blocked transport')
+                yield record(id=2, method='ping')
+                # EOF cancels a worker too, even after its spawn RPC has returned.
+            class Late(Response):
+                def close(self):
+                    super().close(); closed.set()
+            def send(req):
+                entered.set()
+                if not release.wait(6):
+                    raise AssertionError('blocked transport was not released')
+                return Late({'output': [astra.call_item('write_file', {'path': 'late-file', 'content': 'wrong'}, 'late')]})
+            write = astra._save_session
+            def checkpoint(session):
+                write(session); saved.set()
+            with self.subTest(spawn=spawn), patch.object(astra.sys, 'stdin', SimpleNamespace(buffer=messages())), \
+                    patch.object(astra, 'send_jsonrpc', side_effect=replies.append), patch.object(astra, '_save_session', side_effect=checkpoint), \
+                    patch.object(astra, '_open_api_request', side_effect=send) as upstream:
+                try:
+                    astra.main()
+                    self.assertTrue(saved.is_set())
+                    self.assertIn(2, [r['id'] for r in replies])
+                    if not spawn:
+                        self.assertNotIn('work', [r['id'] for r in replies])
+                    else:
+                        worker = next(iter(astra.WORKERS.values()))
+                        state = json.loads(worker.worker_file.read_bytes())
+                        self.assertEqual((state['status'], state['result']['status']), ('failed', 'cancelled'))
+                    self.assertFalse(any(i.get('type') == 'function_call' for i in astra._load_session(sid).input_history))
+                finally:
+                    release.set(); self.assertTrue(closed.wait(3))
+                upstream.assert_called_once()
+            self.assertFalse((self.home/'late-file').exists())
+
+    def test_cancel_wait_does_not_cancel_background_work(self):
+        import threading
+        entered, release = threading.Event(), threading.Event()
+        def model(**_):
+            entered.set(); release.wait(5)
+            return {'output_text': 'finished'}
+        with patch.object(astra, 'call_subagent_api', side_effect=model):
+            info = self.tool('astra_spawn_worker', {'task': 'inspect'})
+            worker = astra.WORKERS[info['worker_id']]
+            try:
+                self.assertTrue(entered.wait(3))
+                cancelled = threading.Event(); cancelled.set()
+                text, err = astra.handle_tool_call('astra_wait_worker', {'worker_id': worker.worker_id}, cancel_event=cancelled)
+                self.assertTrue(err); self.assertEqual(json.loads(text)['status'], 'cancelled')
+                self.assertFalse(worker.cancel_event.is_set())
+            finally:
+                release.set(); self.assertTrue(worker.done_event.wait(3))
+        self.assertEqual((worker.status, worker.result['final_response']), ('completed', 'finished'))
 
     def test_bad_step_caps_rejected_before_work(self):
         for name in ('astra_run_task', 'astra_spawn_worker'):
@@ -489,6 +659,22 @@ class AstraTests(unittest.TestCase):
         for args in [('../escape',), ('missing',), ('a', '--poll-interval', 'nan')]:
             with self.subTest(args=args):
                 self.assertEqual(cli(*args).returncode, 2)
+
+    def test_multi_worker_watch_reports_bad_inputs_without_losing_good_results(self):
+        directory = astra._plugin_data_subdir('workers')
+        astra._write_json_atomic(directory / 'good.json', {'worker_id': 'good', 'status': 'completed', 'result': {'final_response': 'kept'}})
+        (directory / 'broken.json').write_bytes(b'{')
+        (directory / 'wrong.json').write_text('{"worker_id":"other","status":"completed"}', encoding='utf-8')
+        ids = ['broken', 'missing', 'good', 'wrong']
+        for flags in ([], ['--any']):
+            proc = subprocess.run([sys.executable, '-B', astra.__file__, '--wait-worker', *ids, *flags],
+                                  cwd=self.home, capture_output=True, text=True, timeout=5)
+            self.assertEqual((proc.returncode, proc.stderr), (1, ''))
+            reports = json.loads(proc.stdout)['workers']
+            self.assertEqual([r['worker_id'] for r in reports], ids)
+            self.assertEqual([r['status'] for r in reports], ['failed', 'failed', 'completed', 'failed'])
+            self.assertEqual(reports[2]['result']['final_response'], 'kept')
+            self.assertTrue(all(r['error'] for r in reports if r['status'] == 'failed'))
 
     def test_pruning_keeps_running_workers_and_newest_100_finished(self):
         directory = astra._plugin_data_subdir('workers')

@@ -64,6 +64,10 @@ def _read_exact(stream, length):
     return bytes(data)
 
 
+class _NameNotFound(OSError):
+    """NXDOMAIN applies to the name, not just the requested record type."""
+
+
 def _parse(packet, ident, host, kind):
     token, flags, questions, answers, _, _ = struct.unpack_from("!6H", packet)
     if token != ident or flags & 0x7800 or not flags & 0x8000 or questions != 1:
@@ -76,7 +80,7 @@ def _parse(packet, ident, host, kind):
     if (flags & 15) not in (0, 3):
         raise OSError("DNS 服务器未能完成查询。")
     if (flags & 15) == 3:
-        return [], host, 0
+        raise _NameNotFound(f'NXDOMAIN: {host}')
     at += 4
     aliases, values = {}, {}
     for _ in range(answers):
@@ -135,6 +139,7 @@ class Resolver:
         self.cache = {}
 
     def _records(self, host, kind):
+        last_error = None
         for server in self.servers:
             name, seen, ttl = host, set(), 120
             try:
@@ -145,10 +150,14 @@ class Resolver:
                     if items:
                         return items, ttl
                     if name == alias:
-                        break
+                        return [], 0  # NODATA: definitive for this record type.
                     name = alias
-            except (OSError, ValueError, struct.error):
-                continue
+            except _NameNotFound:
+                raise
+            except (OSError, ValueError, struct.error) as exc:
+                last_error = exc
+        if isinstance(last_error, OSError):
+            raise last_error
         return [], 0
 
     def __call__(self, host, port):
@@ -169,15 +178,24 @@ class Resolver:
         cached = self.cache.get(name)
         if cached and cached[0] > time.monotonic():
             return cached[1]
+        last_error = None
         items, ttls = [], []
         for kind, family in ((1, socket.AF_INET), (28, socket.AF_INET6)):
             if family not in self.route.families:
                 continue
-            found, ttl = self._records(name, kind)
+            try:
+                found, ttl = self._records(name, kind)
+            except _NameNotFound:
+                raise
+            except OSError as exc:
+                last_error = exc
+                continue
             if found:
                 items.extend(found)
                 ttls.append(ttl)
         if not items:
+            if last_error is not None:
+                raise last_error
             raise OSError(f"通过所选网卡未解析到 {name} 的可用地址。可用 --dns 指定服务器，或 --resolve 指定该域名的 IP。")
         ips = tuple(dict.fromkeys(items))
         self.cache[name] = (time.monotonic() + min(ttls), ips)

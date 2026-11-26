@@ -1,6 +1,7 @@
 import type { ConnectionStepError, OnlineCheckStepResult } from '../shared/types.js';
 import { elapsed, own, redactRecognizable } from './common.js';
 import { StreamMetrics } from './streamMetrics.js';
+import { adaptiveFetch } from './upstreamTransport.js';
 
 export const diagnosticPrompt = '请仅回复 OK';
 export function scrub(value: string, secrets: string[]) {
@@ -46,7 +47,7 @@ export async function checkInference(send: typeof fetch, endpoint: string, model
     }
   }(start, 8192);
   try {
-    const response = await send(endpoint, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal, redirect: 'error' });
+    const response = await adaptiveFetch(endpoint, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal, redirect: 'error' }, send);
     if (!response.ok) {
       const data = await readPayload(response).catch(() => null);
       error = upstreamDetails(data, `HTTP_${response.status}`, typeof data === 'string' && data.trim() || `上游返回 HTTP ${response.status}`, response.status);

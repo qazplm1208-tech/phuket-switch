@@ -1,6 +1,6 @@
 import { useId, useLayoutEffect, useRef, useState } from 'react';
 import { ChevronDown, ChevronUp, Eye, EyeOff, KeyRound, LogIn } from 'lucide-react';
-import { allowedGroupModels, isAstraModel, isOnlyAstraGroup, MODEL_SLUG, providerModelNames } from '@shared/constants';
+import { allowedGroupModels, DEFAULT_PROXY_PORT, isAstraModel, isOnlyAstraGroup, MODEL_SLUG, providerModelNames } from '@shared/constants';
 import { subagentProtocols, type PhuketApiKeyView, type PhuketGroup, type ProviderView, type SubagentStatus } from '@shared/types';
 import { appName } from '../lib/display';
 import { endpointPresets, fallbacks, groupDefaults, maskOnly, needsOriginKey, origin, protocols, providerDefaults, resolvedEndpointPreview, triggerTokenHint, type Draft } from '../lib/subagent';
@@ -28,6 +28,7 @@ interface Props {
 }
 export default function SubagentConfigPanel({ d, status, edit, busy, groups, activeKeys, groupsLoading, keysLoading, groupsError, keysError, reloadGroups, reloadKeys, provider, group, secret, setSecret, secretEpoch }: Props) {
   const s = useStudio(), providers = s.providers.data ?? [], [allModels, setAllModels] = useState(false);
+  const localProxyUrl = `http://127.0.0.1:${s.proxy?.settings.port ?? DEFAULT_PROXY_PORT}`;
   const originKey = needsOriginKey(d, status, provider), endpoint = resolvedEndpointPreview(d.baseUrl, d.protocol, d.model);
   const picks = [...new Set([...(originKey ? [] : d.source === 'provider' && provider ? providerModelNames(provider) : d.source === 'phuket-group' ? allowedGroupModels(group) : []), ...fallbacks[d.protocol]])].filter(m => MODEL_SLUG.test(m));
   const preferAstra = d.source === 'phuket-group' && isAstraModel(d.model);
@@ -78,8 +79,8 @@ export default function SubagentConfigPanel({ d, status, edit, busy, groups, act
       <div className="form-grid subagent-model-fields">
         <Field label="接口协议"><select value={d.protocol} onChange={e => edit({ protocol: e.target.value as Draft['protocol'] })}>{subagentProtocols.map(p => <option value={p} key={p}>{protocols[p][0]} ({protocols[p][1]})</option>)}</select></Field>
         <div className="subagent-endpoint">
-          <Field label="接口 Base URL"><input className="mono" type="text" inputMode="url" spellCheck={false} maxLength={4096} value={d.baseUrl} placeholder="http://127.0.0.1:15722" onChange={e => edit({ baseUrl: e.target.value })} /></Field>
-          <div className="subagent-chips" role="group" aria-label="接口地址预设">{endpointPresets.map(({ label, baseUrl, protocol }) =>
+          <Field label="接口 Base URL"><input className="mono" type="text" inputMode="url" spellCheck={false} maxLength={4096} value={d.baseUrl} placeholder={localProxyUrl} onChange={e => edit({ baseUrl: e.target.value })} /></Field>
+          <div className="subagent-chips" role="group" aria-label="接口地址预设">{endpointPresets(localProxyUrl).map(({ label, baseUrl, protocol }) =>
             <button type="button" key={label} className="subagent-chip" aria-pressed={d.baseUrl.trim() === baseUrl && (!protocol || protocol === d.protocol)}
               onClick={() => edit({ baseUrl, protocol: protocol ?? d.protocol })}>{label}</button>)}</div>
           {endpoint && <small>实际请求：<code>{endpoint}</code></small>}

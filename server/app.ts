@@ -108,17 +108,29 @@ export function createManagementApp(webRoot = defaultWebRoot, runtime = createRu
   route('GET /api/providers', 200, v.providerQuery, q => db.providers(q.appType).map(toProviderView));
   route('POST /api/providers', 201, v.createProvider, async ({ phuketKeyId, autoCreatePhuketKey, ...fields }) => {
     protocolCheck(fields.appType, fields.protocol);
+    if (fields.codexFastConfig) validateFastBindings(fields.codexFastConfig);
     const apiKey = await resolveProviderApiKey({ ...fields, phuketKeyId, autoCreatePhuketKey }, fields.appType);
     return toProviderView(db.createProvider({ ...fields, apiKey }));
   });
   route('PUT /api/providers/:id', 200, v.updateProvider, async ({ phuketKeyId, autoCreatePhuketKey, ...patch }, { id }) => {
     const p = db.provider(id);
     protocolCheck(p.appType, patch.protocol ?? p.protocol);
+    if (patch.baseUrl !== undefined && new URL(patch.baseUrl).origin !== URL.parse(p.baseUrl)?.origin &&
+        patch.apiKey === undefined && phuketKeyId === undefined && !autoCreatePhuketKey) {
+      throw bad('切换供应商域名来源时请填写对应的新 API 密钥。');
+    }
+    if (patch.codexFastConfig) validateFastBindings(patch.codexFastConfig);
     if (phuketKeyId !== undefined || autoCreatePhuketKey) {
       patch.apiKey = await resolveProviderApiKey({ phuketKeyId, autoCreatePhuketKey, phuketGroupId: patch.phuketGroupId ?? p.phuketGroupId, name: patch.name ?? p.name }, p.appType);
     }
     return toProviderView(db.updateProvider(id, patch));
   });
+  function validateFastBindings(config: GptFastConfig) {
+    for (const { binding, label } of Object.values(dedicatedGroups)) {
+      const id = config[binding];
+      if (id != null && !db.hasProvider(id, 'openai-responses')) throw bad(`${label} 绑定需要选择现有的 Responses 供应商。`);
+    }
+  }
   function normalizedFastConfig(config: GptFastConfig): GptFastConfig {
     const speedMode = effectiveSpeedMode(config);
     return { ...config, speedMode, enabled: speedMode !== 'standard', serviceTier: fastTier(config, speedMode) };
@@ -163,6 +175,7 @@ export function createManagementApp(webRoot = defaultWebRoot, runtime = createRu
   route('POST /api/providers/:id/test', 200, null, (_, { id }) => phuket.testProvider(db.provider(id)));
   route('GET /api/fast-mode', 200, null, () => db.state('fastMode'));
   route('PUT /api/fast-mode', 200, v.updateFastMode, req => {
+    validateFastBindings(req.config);
     const config = normalizedFastConfig(req.config), current = db.current('codex');
     if (req.applyToCodex && !current) throw conflict('请先选择一个当前 Codex 供应商，再应用速度设置。');
     const proxyRoot = proxy.configRoot('codex');
@@ -240,14 +253,14 @@ export function createManagementApp(webRoot = defaultWebRoot, runtime = createRu
     const prepared = await prepareDedicatedProvider(req, dedicatedGroups.astra);
     const result = db.transaction(() => {
       const provider = upsertDedicatedProvider(prepared);
-      const fastMode = normalizedFastConfig({ ...db.state('fastMode'), astraOnlyProviderId: provider.id, routeAstraToOnlyAstra: true });
-      syncMenuPreference(db.current('codex') ?? provider, fastMode);
+      const fastMode = { ...db.state('fastMode'), astraOnlyProviderId: provider.id, routeAstraToOnlyAstra: true };
+      syncMenuPreference(db.current('codex') ?? provider, fastMode, false);
       saveFastConfig(fastMode);
       return { provider: toProviderView(db.provider(provider.id)), fastMode };
     });
     if (!db.current('codex')) result.provider = toProviderView(db.setCurrentProvider('codex', result.provider.id));
     if (req.enableProxyTakeover === false) return { ...result, system: notApplied() };
-    return { ...result, ...await proxy.takeover('codex', true, result.fastMode) };
+    return { ...result, ...await proxy.takeover('codex', true, db.current('codex')?.codexFastConfig ?? result.fastMode) };
   });
   route('GET /api/phuket/status', 200, null, authStatus);
   route('POST /api/phuket/login', 200, v.login, async req => {
@@ -355,6 +368,7 @@ export function createManagementApp(webRoot = defaultWebRoot, runtime = createRu
   route('GET /api/extensions/skills', 200, null, listSkills);
   route('GET /api/settings', 200, null, () => db.state('settings'));
   route('PUT /api/settings', 200, v.settings, s => db.transaction(() => {
+    validateFastBindings(s.defaultGptFastConfig);
     const settings = { ...db.state('settings'), ...s, defaultGptFastConfig: normalizedFastConfig(s.defaultGptFastConfig) };
     db.setState('settings', settings); db.setState('fastMode', settings.defaultGptFastConfig);
     return settings;

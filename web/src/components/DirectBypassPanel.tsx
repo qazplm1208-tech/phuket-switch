@@ -5,7 +5,6 @@ import type { DirectBypassProbeResult, DirectBypassStatus, UpdateDirectBypassReq
 import { api } from '../api/client';
 import { ms } from '../lib/display';
 import { useAction } from '../lib/feedback';
-import { useResource } from '../lib/resource';
 import { useStudio } from '../lib/studio';
 import { Badge, Btn, Choices, Field, Notice, Section, Skeleton, Toggle } from './ui';
 
@@ -22,7 +21,7 @@ export function DirectBypassBadge({ status }: { status: DirectBypassStatus }) {
 
 export default function DirectBypassPanel() {
   const s = useStudio();
-  const r = useResource('direct-bypass', api.directBypass), status = r.data, config = status?.config;
+  const r = s.directBypassResource, status = r.data, config = status?.config;
   const { pending, run } = useAction(), busy = r.loading || !!pending;
   // A null draft follows the saved value. Refreshes and unrelated PUTs leave an edit in progress alone.
   const [nicDraft, setNic] = useState<string | null>(null), [dnsDraft, setDns] = useState<string | null>(null);

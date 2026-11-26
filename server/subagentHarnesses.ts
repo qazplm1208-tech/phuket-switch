@@ -3,6 +3,7 @@ import path from 'node:path';
 import type { DirectBypassConfig, DirectDownloadConfig } from '../shared/types.js';
 import { bundledDirectFile } from './directFiles.js';
 import { subagentHarnessIds, subagentProtocols, type SubagentConfig, type SubagentHarnessId as Id, type SubagentHarnessState } from '../shared/types.js';
+import { parseSubagentBase } from '../shared/subagentEndpoint.js';
 import { conflict, getUserHome, isRecord, own } from './common.js';
 import { directDownloadPaths, jsonText, managedText, parseJson, subagentPaths, type Plan } from './configFiles.js';
 import { parseToml, replaceTomlSubtree } from './surgicalToml.js';
@@ -89,17 +90,26 @@ export function harnessStates(c: StoredConfig, exe: string, direct: DirectBypass
     return state;
   });
 }
-export function checkUserKeyDestinations(c: StoredConfig, plan: Plan) {
-  if (!useUserEnv(c) || !c.apiKey) return;
+function* mcpLocations() {
   const f = subagentPaths();
   for (const id of subagentHarnessIds) {
-    for (const file of id === 'cline' ? [f.clineMcp, f.clineVsMcp] : paths(id).mcp) {
-      if (plan.has(file)) continue;
-      const src = managedText(file); if (src === null) continue;
-      const server = own(configNode(id, src).servers[serverName]), env = own(server.environment ?? server.env);
-      if (typeof env.ASTRA_BASE_URL === 'string' && !env.ASTRA_API_KEY && URL.parse(env.ASTRA_BASE_URL)?.origin !== new URL(c.baseUrl).origin) {
-        throw conflict('Another harness uses the Windows user key at a different origin. Update it too, or select MCP key storage.');
-      }
+    const candidates = id === 'cline' ? [f.clineMcp, f.clineVsMcp] : id === 'claude-desktop' ? [f.desktopMcp, f.desktop3pMcp] : paths(id).mcp;
+    for (const file of candidates) yield { id, file };
+  }
+}
+export const planTouchesMcp = (plan: Plan) => [...mcpLocations()].some(({ file }) => plan.has(file));
+// A user-key write affects untouched entries too; a file-only restore changes just the entries in the plan.
+export function checkUserKeyDestinations(baseUrl: string | null, plan: Plan, includeUntouched = true) {
+  const origin = baseUrl && parseSubagentBase(baseUrl)?.origin;
+  for (const { id, file } of mcpLocations()) {
+    if (!includeUntouched && !plan.has(file)) continue;
+    const src = plan.has(file) ? plan.get(file)?.toString() : managedText(file);
+    if (src == null) continue;
+    const server = configNode(id, src).servers[serverName];
+    if (!isRecord(server)) continue;
+    const env = own(id === 'opencode' ? server.environment : server.env);
+    if (!env.ASTRA_API_KEY && (!origin || typeof env.ASTRA_BASE_URL !== 'string' || parseSubagentBase(env.ASTRA_BASE_URL)?.origin !== origin)) {
+      throw conflict('Another harness uses the Windows user key at a different or unknown origin. Update it too, or select MCP key storage.');
     }
   }
 }

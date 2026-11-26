@@ -78,6 +78,55 @@ test('startup waits 8 seconds, respects opt-out and settings failures, and stays
   u.scheduleStartupCheck(); u.cancelStartupCheck(); t.mock.timers.tick(8000); assert.equal(reads, 3);
 });
 
+test('packaged windows ignore PHUKET_DEV_URL; dev windows accept only local HTTP(S) origins', async () => {
+  const { backendURL, selectUiURL } = await import(new URL('../electron/backend.mjs', import.meta.url).href);
+  for (const value of ['https://remote.invalid', 'file:///local', 'http://localhost:5173', undefined]) assert.equal(selectUiURL(true, value).href, backendURL.href);
+  assert.equal(selectUiURL(false, undefined).href, backendURL.href);
+  for (const url of ['http://localhost:5173/', 'http://127.0.0.1:5173/ui', 'https://[::1]:3000/']) assert.equal(selectUiURL(false, url).href, url);
+  for (const value of ['https://remote.invalid', 'http://localhost.example', 'http://user@localhost:80', 'file:///local', 'not a URL']) assert.throws(() => selectUiURL(false, value), /loopback/);
+});
+
+test('tray speed actions apply the freshly read Codex preset both during and outside takeover', async () => {
+  const { createTray } = await import(new URL('../electron/tray.mjs', import.meta.url).href);
+  type Item = { type?: string; enabled?: boolean; click?(): void };
+  class Tray extends EventEmitter {
+    menu: Item[] = []; setToolTip() {} isDestroyed() { return false; } popUpContextMenu(menu: Item[]) { this.menu = menu; }
+  }
+  const Menu = { buildFromTemplate: (items: Item[]) => items }, nativeImage = { createFromPath: () => ({ resize() {} }) };
+  for (const codex of [true, false]) {
+    const preset = { speedMode: 'standard', enabled: false, serviceTier: 'default', catalogSpeedVariants: false };
+    const writes: unknown[] = [], changed: string[] = [];
+    const tray = createTray({ Menu, nativeImage, Tray, showWindow() {}, quit() {}, notify: (topic: string) => changed.push(topic),
+      dialog: { showMessageBox: assert.fail }, request: async (route: string, options?: { body: unknown }) => {
+        if (route === '/proxy/status') return { running: true, settings: { port: 15722 }, takeover: { codex } };
+        assert.equal(route, '/fast-mode'); if (options) writes.push(options); return { ...preset };
+      } }) as Tray;
+    tray.emit('right-click'); await nextTurn(); preset.catalogSpeedVariants = true;
+    const button = tray.menu.filter(row => row.type === 'radio')[1]; assert.ok(button.enabled); button.click!(); await nextTurn();
+    assert.deepEqual(writes, [{ method: 'PUT', body: { config: { ...preset, speedMode: 'fast', enabled: true, serviceTier: 'priority' }, applyToCodex: true } }]);
+    assert.deepEqual(changed, ['fast-mode']);
+  }
+});
+
+test('install failures after cleanup are reported without secrets and quit once, including late native errors', async t => {
+  const previous = process.env.PORTABLE_EXECUTABLE_DIR; delete process.env.PORTABLE_EXECUTABLE_DIR;
+  t.after(() => { if (previous !== undefined) process.env.PORTABLE_EXECUTABLE_DIR = previous; });
+  for (const kind of ['throw', 'reject', 'event']) {
+    const order: string[] = [], secret = 'installer-private-detail'; let dialog = '';
+    const native = Object.assign(new EventEmitter(), { autoInstallOnAppQuit: true, quitAndInstall() {
+      order.push('install'); if (kind === 'throw') throw Error(secret); if (kind === 'reject') return Promise.reject(Error(secret));
+    } });
+    const u = createUpdater({ ...opts, app: { isPackaged: true, quit() { assert.equal(native.autoInstallOnAppQuit, false); order.push('quit'); } }, nativeUpdater: native,
+      prepareQuit: async () => { order.push('cleanup'); }, showInstallError(msg: string) { dialog = msg; order.push('dialog'); },
+      notify(_: string, s: { status: string }) { if (s.status === 'error') order.push('notify'); } });
+    native.emit('update-downloaded', { version: '1.0.1' }); await u.install();
+    if (kind === 'event') assert.deepEqual(order, ['cleanup', 'install']);
+    native.emit('error', Error(secret)); native.emit('error', Error(secret));
+    assert.equal(u.getState().status, 'error'); assert.equal(u.getState().error, dialog); assert.ok(dialog && !dialog.includes(secret));
+    assert.deepEqual(order, ['cleanup', 'install', 'notify', 'dialog', 'quit']);
+  }
+});
+
 test('NSIS native events drive download state and installation waits for cleanup', async t => {
   const previous = process.env.PORTABLE_EXECUTABLE_DIR; delete process.env.PORTABLE_EXECUTABLE_DIR;
   t.after(() => { if (previous !== undefined) process.env.PORTABLE_EXECUTABLE_DIR = previous; });

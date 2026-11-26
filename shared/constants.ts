@@ -1,7 +1,7 @@
 import type { PhuketApiKeyView, PhuketGroupMetadata } from './types.js';
 import type { AppType, ClaudeModelMap, GptFastConfig, PhuketGroup, ProtocolType, ProxySettings, SpeedMode } from './types.js';
 
-export const APP_VERSION = '1.1.2';
+export const APP_VERSION = '1.1.3';
 export const GITHUB_REPO_OWNER = 'qazplm1208-tech';
 export const GITHUB_REPO_NAME = 'phuket-switch';
 export const GITHUB_REPO_URL = `https://github.com/${GITHUB_REPO_OWNER}/${GITHUB_REPO_NAME}`;

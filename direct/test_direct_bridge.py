@@ -44,6 +44,49 @@ class RouteTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             dns._name(b'\xc0\x00', 0)
 
+    def test_definitive_dns_negatives_and_transient_fallback(self):
+        servers = ['192.0.2.1', '192.0.2.2']
+        route = net.DirectRoute(1, 'fixture', '192.0.2.10', '2001:db8::10', dns_servers=tuple(servers))
+        resolver = dns.Resolver(route)
+        name = 'test.invalid'
+        question = b'\x04test\x07invalid\0' + struct.pack('!HH', 1, 1)
+        def packet(flags):
+            return struct.pack('!6H', 1, flags, 1, 0, 0, 0) + question
+        with self.assertRaises(dns._NameNotFound) as nx:
+            dns._parse(packet(0x8183), 1, name, 1)
+        with patch.object(dns, '_query', side_effect=nx.exception) as query, patch.object(socket, 'getaddrinfo') as system_dns:
+            with self.assertRaises(dns._NameNotFound):
+                resolver(name, 443)
+            query.assert_called_once_with(route, servers[0], name, 1, 3)
+            system_dns.assert_not_called()
+        nodata = dns._parse(packet(0x8180), 1, name, 1)
+        with patch.object(dns, '_query', side_effect=[nodata, TimeoutError(), (['2001:db8::1'], name, 60)]) as query:
+            self.assertEqual(resolver(name, 443), ('2001:db8::1',))
+            self.assertEqual([(c.args[1], c.args[3]) for c in query.call_args_list],
+                             [(servers[0], 1), (servers[0], 28), (servers[1], 28)])
+
+    def test_route_connect_error_retains_last_socket_failure(self):
+        route = MagicMock()
+        errors = [ConnectionRefusedError('first'), OSError(10049, 'address unavailable')]
+        route.connect.side_effect = errors
+        conn = net.DirectHTTPConnection('test.invalid', 80, route=route, resolver=lambda *_: ['192.0.2.1', '192.0.2.2'], timeout=1)
+        with self.assertRaises(net.RouteConnectError) as raised:
+            conn.connect()
+        self.assertEqual(raised.exception.errno, 10049)
+        self.assertIs(raised.exception.__cause__, errors[-1])
+
+    def test_route_error_after_request_is_not_a_pre_send_failure(self):
+        import errno
+        read_error = OSError(errno.ENETUNREACH, 'read failed')
+        with patch.object(net, 'DirectHTTPConnection') as connection:
+            conn = connection.return_value
+            conn.getresponse.side_effect = read_error
+            with self.assertRaises(OSError) as raised:
+                net.direct_http_request('http://test.invalid/', method='POST', body=b'data', route=object(), resolver=object())
+            self.assertIs(raised.exception, read_error)
+            self.assertTrue(raised.exception.route_request_started)
+            conn.connect.assert_called_once(); conn.request.assert_called_once(); conn.close.assert_called_once()
+
     def test_read_only_powershell_json_route_selection_and_filtering(self):
         def row(idx, metric, family, ip):
             return dict(name=f'nic{idx}', description=f'adapter {idx}', index=idx, addresses=[ip, '127.0.0.1'],
@@ -125,6 +168,42 @@ class LiveBridgeTests(unittest.TestCase):
 
     def auth(self):
         return 'Basic ' + base64.b64encode(('bridge:' + self.token).encode()).decode()
+
+    def test_half_close_drains_reply_then_quiet_peer_times_out(self):
+        client, inbound = socket.socketpair()
+        outbound, peer = socket.socketpair()
+        for sock in (client, inbound, outbound, peer):
+            self.addCleanup(sock.close); sock.settimeout(3)
+        with patch.object(bridge, 'DRAIN_TIMEOUT', .5):
+            thread = threading.Thread(target=bridge._relay, args=(inbound, outbound), daemon=True)
+            thread.start()
+            client.sendall(b'abc'); client.shutdown(socket.SHUT_WR)
+            self.assertEqual(peer.recv(3), b'abc'); self.assertEqual(peer.recv(1), b'')
+            peer.sendall(b'ack'); self.assertEqual(client.recv(3), b'ack')
+            thread.join(3); self.assertFalse(thread.is_alive(), 'half-closed tunnel did not expire')
+
+    def test_server_close_wakes_both_ends_of_idle_tunnel(self):
+        route = net.DirectRoute(name='System')
+        server = bridge.bridge_server(route, lambda host, port: ['127.0.0.1'], self.token, set(), 1)
+        with socket.socket() as listener, server:
+            listener.bind(('127.0.0.1', 0)); listener.listen(1); listener.settimeout(3)
+            port = listener.getsockname()[1]
+            thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .02}, daemon=True)
+            thread.start()
+            try:
+                with socket.create_connection(server.server_address, timeout=3) as client:
+                    client.sendall(f'CONNECT localhost:{port} HTTP/1.1\r\nProxy-Authorization: {self.auth()}\r\n\r\n'.encode())
+                    peer, _ = listener.accept()
+                    with peer, client.makefile('rb') as reply:
+                        peer.settimeout(3)
+                        self.assertIn(b'200', reply.readline()); self.assertEqual(reply.readline(), b'\r\n')
+                        with server.clients_lock:
+                            self.assertEqual(len(server.clients), 2)
+                        server.shutdown()
+                        server.server_close()
+                        self.assertEqual(peer.recv(1), b''); self.assertEqual(reply.read(1), b'')
+            finally:
+                server.shutdown(); thread.join(3)
 
     def test_incremental_sse_survives_idle_and_stdin_eof_closes_open_tunnel(self):
         resume, finish = threading.Event(), threading.Event()

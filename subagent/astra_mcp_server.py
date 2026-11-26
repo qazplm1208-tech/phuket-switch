@@ -10,7 +10,9 @@ from __future__ import annotations
 import argparse
 import base64
 import concurrent.futures
+import errno
 import fnmatch
+import hashlib
 import html
 import http.client
 import json
@@ -29,6 +31,7 @@ import urllib.error
 import urllib.request
 import uuid
 from contextlib import contextmanager
+from contextvars import ContextVar
 from urllib.parse import quote, urlsplit, urlunsplit
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -83,6 +86,7 @@ SUMMARY_CHUNK_TOKENS = 95_000
 DEFAULT_WAIT_SECONDS = 120
 
 DEFAULT_MAX_STEPS = 0  # Unlimited unless the caller opts into a cap.
+NO_PROGRESS_ROUNDS = 3
 API_RETRY_DELAYS = (1.5, 3.5)
 TRANSIENT_TRANSPORT_ERRORS = (urllib.error.URLError, TimeoutError, ConnectionError, ssl.SSLError, http.client.HTTPException)
 HTTP_TIMEOUT_SECONDS = 300
@@ -391,6 +395,7 @@ class ToolExecutor:
         self.allow_outside_cwd = allow_outside_cwd
         self.logger = logger
         self.files_changed: list[str] = []
+        self.file_writes = 0  # The public list contains unique paths, even across repeated edits.
         self.commands_run: list[dict[str, Any]] = []
 
     def _resolve_path(self, raw_path: str) -> Path:
@@ -404,6 +409,7 @@ class ToolExecutor:
         return target
 
     def _record_file_change(self, path: Path) -> None:
+        self.file_writes += 1
         s = str(path)
         if s not in self.files_changed:
             self.files_changed.append(s)
@@ -595,15 +601,17 @@ class ToolExecutor:
         target = self._resolve_path(raw_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         existed = target.exists()
-        with target.open("w", encoding="utf-8", newline="\n") as f:
-            f.write(content)
-        self._record_file_change(target)
+        payload = content.encode("utf-8")
+        same = existed and target.stat().st_size == len(payload) and target.read_bytes() == payload
+        if not same:
+            target.write_bytes(payload)
+            self._record_file_change(target)
         return json.dumps(
             {
                 "ok": True,
-                "action": "overwritten" if existed else "created",
+                "action": "unchanged" if same else "overwritten" if existed else "created",
                 "path": str(target),
-                "bytes": len(content.encode("utf-8")),
+                "bytes": len(payload),
                 "lines": content.count("\n") + (1 if content else 0),
             },
             ensure_ascii=False,
@@ -654,9 +662,12 @@ class ToolExecutor:
             )
             replaced = count if replace_all else 1
 
-        with target.open("w", encoding="utf-8", newline="") as f:
-            f.write(updated)
-        self._record_file_change(target)
+        if updated != original:
+            with target.open("w", encoding="utf-8", newline="") as f:
+                f.write(updated)
+            self._record_file_change(target)
+        else:
+            replaced = 0
         return json.dumps(
             {"ok": True, "path": str(target), "replacements": replaced},
             ensure_ascii=False,
@@ -702,10 +713,25 @@ class ToolExecutor:
         }
         if sys.platform == "win32":
             popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        else:
+            popen_kwargs['start_new_session'] = True
 
+        _check_cancelled()
         proc = subprocess.Popen(full_cmd, **popen_kwargs)
+        event = _cancel_event.get()
+        deadline = time.monotonic() + timeout
         try:
-            stdout_raw, stderr_raw = proc.communicate(timeout=timeout)
+            while True:
+                _check_cancelled()
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise subprocess.TimeoutExpired(full_cmd, timeout)
+                try:
+                    stdout_raw, stderr_raw = proc.communicate(timeout=left if event is None else min(left, .2))
+                    break
+                except subprocess.TimeoutExpired:
+                    if event is None:
+                        raise
             elapsed = round(time.time() - t0, 2)
             stdout = stdout_raw or ""
             stderr = stderr_raw or ""
@@ -730,8 +756,9 @@ class ToolExecutor:
                 },
                 ensure_ascii=False,
             )
-        except subprocess.TimeoutExpired:
+        except (subprocess.TimeoutExpired, _TurnCancelled) as exc:
             elapsed = round(time.time() - t0, 2)
+            cancelled = isinstance(exc, _TurnCancelled)
             if sys.platform == "win32":
                 subprocess.run(
                     ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
@@ -741,23 +768,28 @@ class ToolExecutor:
                     timeout=10,
                 )
             else:
-                proc.kill()
+                import signal
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             try:
                 stdout_raw, stderr_raw = proc.communicate(timeout=5)
-            except Exception:
-                stdout_raw, stderr_raw = "", ""
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout_raw, stderr_raw = '', ''
             self.commands_run.append(
                 {
                     "command": command,
                     "cwd": str(work_dir),
                     "exit_code": -1,
                     "elapsed_s": elapsed,
-                    "timed_out": True,
+                    ("cancelled" if cancelled else "timed_out"): True,
                 }
             )
             return json.dumps(
                 {
-                    "error": f"Command timed out after {timeout}s",
+                    "error": "Command cancelled" if cancelled else f"Command timed out after {timeout}s",
                     "stdout": (stdout_raw or "")[:4000],
                     "stderr": (stderr_raw or "")[:4000],
                 },
@@ -814,7 +846,18 @@ def _loopback_target(url):
         return False
 
 
+def _route_failure(exc):
+    # The bound transport marks failures before HTTP bytes were sent. Also accept
+    # native address/interface errors (including Winsock's WSA* codes).
+    if getattr(exc, 'route_request_started', False) or isinstance(exc, ssl.SSLError):
+        return False
+    codes = {errno.EADDRNOTAVAIL, errno.ENETDOWN, errno.ENETUNREACH, errno.EHOSTUNREACH,
+             errno.ENODEV, 10049, 10050, 10051, 10065}
+    return getattr(exc, 'route_connect_failed', False) or exc.errno in codes or getattr(exc, 'winerror', None) in codes
+
+
 def _open_api_request(req):
+    global _direct_client
     mode = os.environ.get('ASTRA_DIRECT_BYPASS', '').strip().lower()
     if mode in ('', '0', 'off'):
         return urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS)
@@ -826,9 +869,23 @@ def _open_api_request(req):
     from io import BytesIO
     from urllib.response import addinfourl
     dns = tuple(s.strip() for s in os.environ.get('ASTRA_DIRECT_DNS', '').split(',') if s.strip())
-    request, route, resolver = _physical_client(os.environ.get('ASTRA_DIRECT_INTERFACE', '').strip(), dns)
-    status, fields, data = request(req.full_url, method=req.get_method(), headers=dict(req.header_items()), body=req.data,
-                                   timeout=HTTP_TIMEOUT_SECONDS, route=route, resolver=resolver)
+    interface = os.environ.get('ASTRA_DIRECT_INTERFACE', '').strip()
+    for attempt in range(2):
+        _check_cancelled()
+        client = _physical_client(interface, dns)
+        request, route, resolver = client
+        try:
+            status, fields, data = request(req.full_url, method=req.get_method(), headers=dict(req.header_items()),
+                                           body=req.data, timeout=HTTP_TIMEOUT_SECONDS, route=route, resolver=resolver)
+            break
+        except OSError as exc:
+            if not _route_failure(exc):
+                raise
+            with _direct_lock:
+                if _direct_client is not None and _direct_client[1] is client:
+                    _direct_client = None  # Don't evict another caller's freshly discovered route.
+            if attempt:
+                raise RuntimeError('Physical connection failed after route rediscovery') from exc
     headers = Message()
     for name, value in fields.items():
         headers[name] = value
@@ -862,11 +919,46 @@ def _api_request(protocol, model, payload, logger, cache_key=None):
         req.add_unredirected_header("session_id", cache_key)
     if protocol == "anthropic-messages":
         req.add_header("anthropic-version", "2023-06-01")
+    event = _cancel_event.get()
+    if event is None:
+        return _exchange(req, protocol, model, logger)
+
+    # urllib cannot cancel a blocked connect/read portably. Isolate the transport,
+    # never session mutation or tool execution. Late data is discarded. Limit
+    # outstanding exchanges even if cancelled sockets take their full timeout.
+    while not _transport_slots.acquire(timeout=.1):
+        _check_cancelled()
+    future = concurrent.futures.Future()
+    def read_response():
+        try:
+            with _cancel_scope(event):
+                future.set_result(_exchange(req, protocol, model, logger))
+        except BaseException as exc:
+            future.set_exception(exc)
+        finally:
+            _transport_slots.release()
+    try:
+        threading.Thread(target=read_response, daemon=True).start()
+    except BaseException:
+        _transport_slots.release()
+        raise
+    while not future.done():
+        _check_cancelled()
+        concurrent.futures.wait((future,), timeout=.1)
+    _check_cancelled()
+    return future.result()
+
+
+_transport_slots = threading.BoundedSemaphore(16)
+
+
+def _exchange(req, protocol, model, logger):
     for attempt in range(len(API_RETRY_DELAYS) + 1):
+        _check_cancelled()
         try:
             with _open_api_request(req) as resp:
                 if protocol == "openai-responses" and "text/event-stream" in (resp.headers.get("Content-Type") or "").lower():
-                    result = _parse_responses_sse(resp, model)
+                    result = _parse_responses_sse(resp)
                 else:
                     body = resp.read(MAX_RESPONSE_BYTES + 1)
                     if len(body) > MAX_RESPONSE_BYTES:
@@ -894,7 +986,11 @@ def _api_request(protocol, model, payload, logger, cache_key=None):
         if attempt == len(API_RETRY_DELAYS):
             raise RuntimeError(error)
         logger(f"{error}; retrying in {API_RETRY_DELAYS[attempt]}s")
-        time.sleep(API_RETRY_DELAYS[attempt])
+        event = _cancel_event.get()
+        if event is None:
+            time.sleep(API_RETRY_DELAYS[attempt])
+        elif event.wait(API_RETRY_DELAYS[attempt]):
+            raise _TurnCancelled
 
 
 def call_astra_responses_api(input_items, instructions="", tools=None, reasoning_effort=DEFAULT_EFFORT,
@@ -910,55 +1006,43 @@ def call_astra_responses_api(input_items, instructions="", tools=None, reasoning
     return _api_request("openai-responses", model, payload, logger or (lambda _: None), prompt_cache_key)
 
 
-def _parse_responses_sse(resp, model=None) -> dict[str, Any]:
-    completed_response: dict[str, Any] | None = None
-    output_items: list[dict[str, Any]] = []
-    text_deltas: list[str] = []
-    current_event: str | None = None
-    data_lines: list[str] = []
-    last_error: str | None = None
+def _parse_responses_sse(resp) -> dict[str, Any]:
+    terminal_response = None
+    current_event = None
+    data_lines = []
 
-    def flush_event() -> None:
-        nonlocal completed_response, last_error, current_event, data_lines
-        if not data_lines:
-            current_event = None
-            return
+    def flush_event():
+        nonlocal terminal_response, current_event, data_lines
         raw = "\n".join(data_lines).strip()
-        data_lines = []
-        ev = current_event
-        current_event = None
-        if not raw or raw == "[DONE]":
+        event, current_event, data_lines = current_event, None, []
+        if not raw:
             return
+        if raw == '[DONE]':
+            raise http.client.IncompleteRead(b'')  # Sentinel without a terminal response.
         try:
             obj = json.loads(raw)
         except json.JSONDecodeError:
             return
-        ev_type = obj.get("type") or ev or ""
-        if ev_type in ("response.completed", "response.incomplete"):
-            if isinstance(obj.get("response"), dict):
-                completed_response = obj["response"]
-        elif ev_type == "response.failed":
-            resp_obj = obj.get("response") if isinstance(obj.get("response"), dict) else obj
-            last_error = json.dumps(resp_obj.get("error", resp_obj), ensure_ascii=False)
-        elif ev_type == "error":
-            last_error = json.dumps(obj, ensure_ascii=False)
-        elif ev_type == "response.output_item.done":
-            item = obj.get("item")
-            if isinstance(item, dict):
-                output_items.append(item)
-        elif ev_type == "response.output_text.delta":
-            delta = obj.get("delta")
-            if isinstance(delta, str):
-                text_deltas.append(delta)
+        if not isinstance(obj, dict):
+            return
+        event = obj.get("type") or event
+        if event in ("response.failed", "error"):
+            raise RuntimeError("Responses API stream error")
+        if event in ("response.completed", "response.incomplete") and isinstance(obj.get("response"), dict):
+            terminal_response = obj["response"]
+            terminal_response.setdefault("status", event.split(".")[1])
 
     size = 0
     for raw_line in resp:
+        _check_cancelled()
         size += len(raw_line)
         if size > MAX_RESPONSE_BYTES:
             raise ValueError("Upstream stream too large.")
         line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
         if line == "":
             flush_event()
+            if terminal_response is not None:
+                return terminal_response
             continue
         if line.startswith(":"):
             continue
@@ -968,26 +1052,10 @@ def _parse_responses_sse(resp, model=None) -> dict[str, Any]:
             data_lines.append(line[5:].lstrip())
     flush_event()
 
-    if last_error and completed_response is None:
-        raise RuntimeError("Responses API stream error")
-    if completed_response is not None:
-        return completed_response
-
-    # Fallback synthesis if gateway closed cleanly without response.completed
-    if not output_items and text_deltas:
-        output_items = [
-            {
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": "".join(text_deltas)}],
-            }
-        ]
-    return {
-        "model": model or _default_model(),
-        "status": "completed",
-        "output": output_items,
-        "usage": {},
-    }
+    # EOF (even after [DONE] or output_item.done) is not a committed response.
+    if terminal_response is None:
+        raise http.client.IncompleteRead(b"")
+    return terminal_response
 
 
 def dump(value):
@@ -1318,6 +1386,7 @@ class BackgroundWorker:
     result: dict[str, Any] | None = None
     error: str | None = None
     done_event: threading.Event = field(default_factory=threading.Event)
+    cancel_event: threading.Event = field(default_factory=threading.Event)
     owner_pid: int = field(init=False, default_factory=os.getpid)
     worker_file: Path = field(init=False)
 
@@ -1935,6 +2004,46 @@ def _validate_max_steps(value: int | None) -> int:
     return value
 
 
+def _tool_fingerprint(name, raw_args, output):
+    try:
+        args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+    except ValueError:
+        args = raw_args  # Malformed tool arguments can loop too.
+    if name == 'run_command':
+        try:
+            result = json.loads(output)
+            if isinstance(result, dict):
+                result.pop('elapsed_s', None)  # Timing jitter isn't progress.
+                output = result
+        except ValueError:
+            pass
+    data = json.dumps([name, args, output], sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(data.encode('ascii')).digest()
+
+
+class _TurnCancelled(Exception):
+    pass
+
+
+# Requests share a pool. Keep retries (including compaction) tied to this turn only.
+_cancel_event = ContextVar("_cancel_event", default=None)
+
+
+@contextmanager
+def _cancel_scope(event):
+    token = _cancel_event.set(event)
+    try:
+        yield
+    finally:
+        _cancel_event.reset(token)
+
+
+def _check_cancelled():
+    event = _cancel_event.get()
+    if event is not None and event.is_set():
+        raise _TurnCancelled
+
+
 def run_astra_agent_turn(
     *,
     task: str,
@@ -1946,6 +2055,7 @@ def run_astra_agent_turn(
     max_steps: int | None = DEFAULT_MAX_STEPS,
     allow_outside_cwd: bool = False,
     worker_ref: BackgroundWorker | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     if mode not in ("edit", "readonly"):
         raise ValueError(f"Invalid mode '{mode}'. Must be 'edit' or 'readonly'.")
@@ -1957,7 +2067,7 @@ def run_astra_agent_turn(
     max_steps = _validate_max_steps(max_steps)
 
     sid = _validate_session_id(session_id) if session_id is not None else f"astra-{uuid.uuid4().hex[:10]}"
-    with _turn_session(sid, cwd, mode, effort, allow_outside_cwd) as session:
+    with _cancel_scope(cancel_event), _turn_session(sid, cwd, mode, effort, allow_outside_cwd) as session:
         if Path(cwd).resolve() != Path(session.cwd).resolve():
             raise ValueError("Use a new session for a different workspace.")
         if model is not None:
@@ -2000,10 +2110,12 @@ def run_astra_agent_turn(
         step = 0
         final_text = ""
         status = "completed"
+        previous_round, identical_rounds = None, 0
         t_start = time.time()
 
         try:
             while max_steps <= 0 or step < max_steps:
+                _check_cancelled()
                 step += 1
                 if worker_ref is not None:
                     worker_ref.steps_used = step
@@ -2016,6 +2128,7 @@ def run_astra_agent_turn(
                         budget = min(COMPACT_TAIL_TOKENS // 2, max(0, est - BASE_PROMPT_OVERHEAD_TOKENS) // 2) if attempt else None
                         compact_session(session, tail_budget=budget)
                         compactions_this_turn += 1
+                    _check_cancelled()
                     pre_step_len = len(session.input_history)
                     try:
                         resp = call_subagent_api(
@@ -2032,6 +2145,7 @@ def run_astra_agent_turn(
                             raise
                         logger(f"STEP {step} context length rejected; compacting and retrying once")
 
+                _check_cancelled()
                 usage = resp.get("usage") or {}
                 in_t = int(usage.get("input_tokens") or 0)
                 session.last_input_tokens = in_t
@@ -2066,8 +2180,9 @@ def run_astra_agent_turn(
                 msg_text = _extract_output_text(output_items) or resp.get("output_text", "")
                 if msg_text:
                     session.input_history.append({"role": "assistant", "content": msg_text})
+                _check_cancelled()
                 function_calls = [o for o in output_items if o.get("type") == "function_call"]
-                if not function_calls:
+                if not function_calls or resp.get("status") == "incomplete":
                     final_text = msg_text
                     status = resp.get("status") or "completed"
                     break
@@ -2075,6 +2190,8 @@ def run_astra_agent_turn(
                 # Other protocols represent all calls from one assistant turn together,
                 # followed by their results. Keep the v1.2 Responses prefix unchanged.
                 pending_results = []
+                round_tools = []
+                writes_before = executor.file_writes
                 for fc in function_calls:
                     call_id = fc.get("call_id") or f"call_{uuid.uuid4().hex[:12]}"
                     fn_name = fc.get("name", "")
@@ -2090,7 +2207,9 @@ def run_astra_agent_turn(
                         }
                     )
                     nfiles, ncommands = len(executor.files_changed), len(executor.commands_run)
-                    if fn_name == "compact_context":
+                    if cancel_event is not None and cancel_event.is_set():
+                        tool_output = dump({"error": "Request cancelled; tool was not executed."})
+                    elif fn_name == "compact_context":
                         trailing_len = len(session.input_history) - step_group_start
                         report = _model_compact_context(session, session.input_history[-1], step_group_start)
                         step_group_start = len(session.input_history) - trailing_len
@@ -2100,6 +2219,7 @@ def run_astra_agent_turn(
                         tool_output = dump(report)
                     else:
                         tool_output = executor.execute(fn_name, fn_args)
+                    round_tools.append(_tool_fingerprint(fn_name, fn_args, tool_output))
                     for fp in executor.files_changed[nfiles:]:
                         if fp not in session.files_changed:
                             session.files_changed.append(fp)
@@ -2110,14 +2230,27 @@ def run_astra_agent_turn(
                     else:
                         pending_results.append(result)
                 session.input_history.extend(pending_results)
-                if compactions_this_turn != compactions_before_tools:
-                    _save_session(session)  # All calls and outputs now form a replayable step.
+                _save_session(session)  # Publish only replayable groups, before the next model request.
+                _check_cancelled()
+                signature = tuple(sorted(round_tools))
+                if writes_before != executor.file_writes or compactions_this_turn != compactions_before_tools:
+                    previous_round, identical_rounds = None, 0
+                else:
+                    identical_rounds = identical_rounds + 1 if signature == previous_round else 1
+                    previous_round = signature
+                    if identical_rounds >= NO_PROGRESS_ROUNDS:
+                        status = "no_progress"
+                        final_text = (f"Stopped after {identical_rounds} identical tool rounds with no progress. "
+                                      "Continue with the same session_id and a different approach.")
+                        break
             else:
                 status = "max_steps_reached"
                 final_text = (
                     f"Reached max_steps={max_steps} before final answer. "
                     "You may continue with the same session_id to finish the task."
                 )
+        except _TurnCancelled:
+            status, final_text = "cancelled", "Turn cancelled. Completed tool results are saved in this session."
         finally:
             # Preserve completed steps even if a later API request fails.
             session.updated_at = time.time()
@@ -2374,7 +2507,7 @@ def _watch_command(argv: list[str]) -> str:
     return "powershell.exe -NoProfile -NonInteractive -EncodedCommand " + base64.b64encode(script.encode("utf-16le")).decode("ascii")
 
 
-def handle_tool_call(name: str, arguments: dict[str, Any]) -> tuple[str, bool]:
+def handle_tool_call(name: str, arguments: dict[str, Any], *, cancel_event=None) -> tuple[str, bool]:
     try:
         if name in ("astra_run_task", "astra_spawn_worker") and type(arguments.get("allow_outside_cwd", False)) is not bool:
             raise ValueError("allow_outside_cwd must be a boolean.")
@@ -2388,8 +2521,9 @@ def handle_tool_call(name: str, arguments: dict[str, Any]) -> tuple[str, bool]:
                 model=_requested_model(arguments["model"]) if "model" in arguments else None,
                 max_steps=arguments.get("max_steps", DEFAULT_MAX_STEPS),
                 allow_outside_cwd=bool(arguments.get("allow_outside_cwd", False)),
+                cancel_event=cancel_event,
             )
-            return json.dumps(res, ensure_ascii=False, indent=2), False
+            return json.dumps(res, ensure_ascii=False, indent=2), res['status'] in ('cancelled', 'no_progress')
 
         if name == "astra_spawn_worker":
             task = str(arguments["task"])
@@ -2418,6 +2552,7 @@ def handle_tool_call(name: str, arguments: dict[str, Any]) -> tuple[str, bool]:
             worker = BackgroundWorker(
                 worker_id=wid,
                 worker_name=wname,
+                cancel_event=cancel_event if cancel_event is not None else threading.Event(),
                 session_id=sid,
                 cwd=str(resolved_cwd),
                 model=model if model is not None else existing.model if existing else _default_model(),
@@ -2445,13 +2580,17 @@ def handle_tool_call(name: str, arguments: dict[str, Any]) -> tuple[str, bool]:
                         max_steps=max_steps,
                         allow_outside_cwd=allow_outside,
                         worker_ref=worker,
+                        cancel_event=worker.cancel_event,
                     )
                 except Exception as e:
                     worker.error = f"{type(e).__name__}: {e}"
                     worker.status = "failed"
                 else:
                     worker.result = res
-                    worker.status = "completed"
+                    if res['status'] in ('cancelled', 'no_progress'):
+                        worker.status, worker.error = 'failed', res['final_response']
+                    else:
+                        worker.status = "completed"
                 finally:
                     worker.finished_at = time.time()
                     try:
@@ -2498,7 +2637,17 @@ def handle_tool_call(name: str, arguments: dict[str, Any]) -> tuple[str, bool]:
                 w = WORKERS.get(wid)
             if not w:
                 return json.dumps({"error": f"Unknown worker_id: {wid}"}), True
-            finished = w.done_event.wait(timeout=timeout_s)
+            if cancel_event is None:
+                finished = w.done_event.wait(timeout=timeout_s)
+            else:
+                deadline = time.monotonic() + timeout_s
+                while not (finished := w.done_event.is_set()):
+                    if cancel_event.is_set():
+                        return dump({'status': 'cancelled', 'worker_id': wid}), True
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        break
+                    w.done_event.wait(min(.1, left))
             data = _serialize_worker(w, include_result=True)
             data["wait_timed_out"] = not finished
             return json.dumps(data, ensure_ascii=False, indent=2), (w.status == "failed")
@@ -2545,14 +2694,24 @@ def main() -> None:
         f"(model={_default_model()}, api_format={DEFAULT_PROTOCOL}, default_effort={DEFAULT_EFFORT})"
     )
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+    pending, pending_lock = {}, threading.Lock()
 
     def dispatch_request(msg: dict[str, Any]) -> None:
         req_id = msg.get("id")
         method = msg.get("method", "")
         params = msg.get("params") or {}
 
-        # Notifications have no id -> never send a response
         if req_id is None:
+            if method == 'notifications/cancelled' and isinstance(params, dict):
+                target = params.get('requestId')
+                if type(target) in (str, int):
+                    with pending_lock:
+                        event = pending.get(target)
+                        if event is not None:
+                            event.set()
+            return  # Notifications never get their own response.
+        if type(req_id) not in (str, int) or not isinstance(params, dict):
+            send_error(None, -32600, 'Invalid request')
             return
 
         if method == "initialize":
@@ -2589,15 +2748,24 @@ def main() -> None:
             tool_name = params.get("name", "")
             tool_args = params.get("arguments") or {}
 
+            event = threading.Event()
+            with pending_lock:
+                if req_id in pending:
+                    send_error(req_id, -32600, 'Duplicate active request ID')
+                    return
+                pending[req_id] = event  # Register before submitting; cancellation may arrive while queued.
+
             def _run_tool() -> None:
-                text, is_err = handle_tool_call(tool_name, tool_args)
-                send_result(
-                    req_id,
-                    {
-                        "content": [{"type": "text", "text": text}],
-                        "isError": is_err,
-                    },
-                )
+                try:
+                    if event.is_set():
+                        return
+                    with _cancel_scope(event):
+                        text, is_err = handle_tool_call(tool_name, tool_args, cancel_event=event)
+                finally:
+                    with pending_lock:
+                        pending.pop(req_id, None)
+                if not event.is_set():
+                    send_result(req_id, {"content": [{"type": "text", "text": text}], "isError": is_err})
 
             pool.submit(_run_tool)
             return
@@ -2619,7 +2787,19 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        pool.shutdown(wait=False)
+        # A disconnected host cannot receive a result. Stop new steps and let active
+        # turns publish their last replayable session/worker snapshot.
+        with pending_lock:
+            for event in pending.values():
+                event.set()
+        with WORKERS_LOCK:
+            workers = list(WORKERS.values())
+            for worker in workers:
+                worker.cancel_event.set()
+        pool.shutdown(wait=True, cancel_futures=True)
+        deadline = time.monotonic() + 3
+        for worker in workers:
+            worker.done_event.wait(max(0, deadline - time.monotonic()))
         _log_stderr("Shutting down.")
 
 
@@ -2673,22 +2853,28 @@ def _read_worker_file(path: Path) -> dict[str, Any]:
 def _wait_worker_files(directory: Path, ids: list[str], wait_any: bool, poll_interval: float) -> list[dict[str, Any]]:
     if not math.isfinite(poll_interval):
         raise ValueError("Poll interval must be finite.")
-    paths = {wid: directory / (_validate_snapshot_id(wid, "worker_id") + ".json") for wid in ids}
+    ids = list(dict.fromkeys(ids))
     finished: dict[str, dict[str, Any]] = {}
     while True:
-        for wid, path in paths.items():
+        for wid in ids:
             if wid in finished:
                 continue  # A result can be pruned while we wait for another worker.
-            state = _read_worker_file(path)
-            if state["status"] == "running" and not _owner_alive(state.get("owner_pid")):
-                # The owner may have published its terminal report just before exiting.
+            try:
+                path = directory / (_validate_snapshot_id(wid, 'worker_id') + '.json')
                 state = _read_worker_file(path)
-                if state["status"] == "running":
-                    state.update(status="failed", error="MCP server exited before worker finished.", finished_at=time.time())
-            if state["status"] != "running":
+                if state['status'] == 'running' and not _owner_alive(state.get('owner_pid')):
+                    # The owner may have published its terminal report just before exiting.
+                    state = _read_worker_file(path)
+                    if state['status'] == 'running':
+                        state.update(status='failed', error='MCP server exited before worker finished.', finished_at=time.time())
+            except (OSError, ValueError) as exc:
+                if len(ids) == 1:
+                    raise  # Preserve the single-worker CLI's input-error exit code.
+                state = {'worker_id': wid, 'status': 'failed', 'error': f'Could not read worker snapshot: {type(exc).__name__}: {exc}'}
+            if state['status'] != 'running':
                 finished[wid] = state
-        if len(finished) == len(paths) or (wait_any and finished):
-            return [finished[wid] for wid in paths if wid in finished]
+        if len(finished) == len(ids) or (wait_any and finished):
+            return [finished[wid] for wid in ids if wid in finished]
         time.sleep(max(0.05, poll_interval))
 
 

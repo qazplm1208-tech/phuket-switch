@@ -161,7 +161,7 @@ function ProxyControls() {
   const s = useStudio(),
     { notify, confirm } = useFeedback(),
     { pending, run } = useAction(),
-    direct = useResource('direct-bypass', api.directBypass),
+    direct = s.directBypassResource,
     status = direct.data,
     p = s.proxy;
   const endpoint = p ? (p.baseUrl ?? `http://${p.settings.host}:${p.settings.port}`) : '';

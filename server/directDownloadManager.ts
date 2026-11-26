@@ -8,7 +8,7 @@ import { directDownloadTargets, type ApplyDirectDownloadRequest, type ApplyDirec
   type DirectDownloadDiffPreview, type DirectDownloadStatus, type DirectDownloadTarget as Id, type DirectDownloadTestRequest,
   type DirectDownloadTestResult, type RemoveDirectDownloadRequest } from '../shared/types.js';
 import { bad, conflict, elapsed, getUserHome, now, redactRecognizable } from './common.js';
-import { cliPaths, commitFiles, directDownloadPaths, managedBytes, managedText, subagentPaths, type Plan } from './configFiles.js';
+import { cliPaths, commitFiles, directDownloadPaths, jsonText, managedBytes, managedText, parseJson, subagentPaths, type Plan } from './configFiles.js';
 import type { SwitchDb } from './db.js';
 import { directDownloadBlock, downloadRouteArgs, editDirectDownloadBlock, effectiveDownloadRoute, renderDirectDownloadRule } from './directDownloadRules.js';
 import { bundledDirectFile, childEnv, routeInfo } from './directFiles.js';
@@ -25,7 +25,7 @@ function perTarget<T>(value: (id: Id) => T): Record<Id, T> {
 function targetFiles() {
   const cli = cliPaths(), sub = subagentPaths(), dd = directDownloadPaths();
   const files: Record<Id, string> = { codex: cli.codexPrompt, 'claude-code': cli.claudePrompt, 'gemini-cli': sub.geminiRules,
-    antigravity: sub.pluginRules, windsurf: sub.windsurfRules, opencode: sub.opencodeRules, cline: dd.clineRules };
+    antigravity: dd.antigravityRules, windsurf: sub.windsurfRules, opencode: sub.opencodeRules, cline: dd.clineRules };
   return perTarget(id => ({ path: files[id], src: managedText(files[id]) }));
 }
 function liveTargets(files: ReturnType<typeof targetFiles>) {
@@ -35,17 +35,35 @@ function liveTargets(files: ReturnType<typeof targetFiles>) {
     const root = id === 'antigravity' ? path.join(getUserHome(), '.gemini', 'config') : id === 'windsurf' ? path.dirname(sub.windsurfMcp)
       : id === 'cline' ? path.join(getUserHome(), '.cline') : path.dirname(file);
     return { id, name: names[id], path: file, exists: src !== null, detected: src !== null || fs.lstatSync(root, { throwIfNoEntry: false })?.isDirectory() === true,
-      injected: directDownloadBlock(src ?? '') !== null };
+      injected: directDownloadBlock(src ?? '') !== null || (id === 'antigravity' && directDownloadBlock(managedText(sub.pluginRules) ?? '') !== null) };
   });
 }
+function stripLegacyDownloadRule(plan: Plan) {
+  const file = subagentPaths().pluginRules, src = managedText(file);
+  if (src && directDownloadBlock(src)) plan.set(file, editDirectDownloadBlock(src, null));
+}
+const pluginRule = './rules/AGENTS.md';
+const pluginManifest = { name: 'phuket-direct-download', version: '1.0.0', displayName: 'Phuket Direct Download', rules: [pluginRule] };
+function registerPlugin(plan: Plan, file: string, install: boolean) {
+  const src = managedText(file);
+  if (src === null) { if (install) plan.set(file, jsonText(pluginManifest)); return; }
+  const manifest = parseJson(src);
+  if (manifest.name !== pluginManifest.name || !Array.isArray(manifest.rules) || !manifest.rules.every(r => typeof r === 'string')) {
+    throw conflict('Cannot update an unrecognized direct-download plugin manifest.');
+  }
+  if (install) {
+    if (!manifest.rules.includes(pluginRule)) plan.set(file, jsonText({ ...manifest, rules: [...manifest.rules, pluginRule] }));
+  } else if (src === jsonText(pluginManifest)) plan.set(file, null);
+  else if (manifest.rules.includes(pluginRule)) plan.set(file, jsonText({ ...manifest, rules: manifest.rules.filter(r => r !== pluginRule) }));
+}
 const pythonFor = (db: SwitchDb) => detectPython(db.state('subagent').pythonPath);
-function rule(db: SwitchDb, config: DirectDownloadConfig) {
-  return renderDirectDownloadRule(config, directDownloadPaths(), effectiveDownloadRoute(config, db.state('directBypass')));
+function rule(db: SwitchDb, config: DirectDownloadConfig, python: ReturnType<typeof detectPython>) {
+  return renderDirectDownloadRule(config, directDownloadPaths(), effectiveDownloadRoute(config, db.state('directBypass')), python.meetsMinimum ? python.executable : null);
 }
 export function getDirectDownloadStatus(db: SwitchDb): DirectDownloadStatus {
-  const config = db.state('directDownload'), f = directDownloadPaths();
-  return { config, python: pythonFor(db), runtimeDir: f.dir, scriptPath: f.script, cmdPath: f.cmd,
-    scriptInstalled: runtimeKeys.every(key => managedBytes(f[key]) !== null), liveTargets: liveTargets(targetFiles()), previewMarkdown: rule(db, config), updatedAt: now() };
+  const config = db.state('directDownload'), f = directDownloadPaths(), python = pythonFor(db);
+  return { config, python, runtimeDir: f.dir, scriptPath: f.script, cmdPath: f.cmd,
+    scriptInstalled: runtimeKeys.every(key => managedBytes(f[key]) !== null), liveTargets: liveTargets(targetFiles()), previewMarkdown: rule(db, config, python), updatedAt: now() };
 }
 function launcher(exe: string) {
   if (/["\x00-\x1f\x7f]/.test(exe)) throw bad('Unsafe interpreter path for the Windows launcher.');
@@ -56,10 +74,11 @@ function installPlan(db: SwitchDb, req: ApplyDirectDownloadRequest, preview: boo
   if (!preview && (!python.meetsMinimum || !python.executable)) throw bad('Python 3.10 or later is required to deploy the downloader.');
   const files = targetFiles(), live = liveTargets(files), f = directDownloadPaths(), plan: Plan = new Map();
   const config = { ...db.state('directDownload'), ...settings, enabled: true, targets: perTarget(id => targets.includes(id) || live[id].injected) };
-  const block = rule(db, config);
+  const block = rule(db, config, python);
   // Interface and path strings also appear in the block. Verify the delimiters before any commit.
   if (directDownloadBlock(block) !== block) throw bad('Invalid generated rule markers.');
   for (const id of targets) {
+    if (id === 'antigravity') { stripLegacyDownloadRule(plan); registerPlugin(plan, f.antigravityPluginManifest, true); }
     const after = editDirectDownloadBlock(files[id].src ?? '', block);
     if (id === 'windsurf' && after.length > 12000) throw conflict('Windsurf global rules would exceed 12,000 characters; shorten the instructions or the existing file.');
     plan.set(files[id].path, after);
@@ -97,9 +116,12 @@ export function applyDirectDownload(db: SwitchDb, req: ApplyDirectDownloadReques
 export function removeDirectDownload(db: SwitchDb, req: RemoveDirectDownloadRequest) {
   const files = targetFiles(), live = liveTargets(files), f = directDownloadPaths(), plan: Plan = new Map();
   for (const id of req.targets) {
-    if (!live[id].injected) continue;
-    const rest = editDirectDownloadBlock(files[id].src!, null);
-    plan.set(files[id].path, id === 'cline' && !rest.trim() ? null : rest);
+    if (id === 'antigravity') stripLegacyDownloadRule(plan);
+    const src = files[id].src;
+    if (src === null || !directDownloadBlock(src)) continue;
+    const rest = editDirectDownloadBlock(src, null), empty = !rest.trim();
+    if (id === 'antigravity' && empty) registerPlugin(plan, f.antigravityPluginManifest, false);
+    plan.set(files[id].path, (id === 'cline' || id === 'antigravity') && empty ? null : rest);
   }
   const targets = perTarget(id => !req.targets.includes(id) && live[id].injected), enabled = Object.values(targets).some(Boolean);
   if (!enabled && req.removeScripts !== false) for (const key of runtimeKeys) plan.set(f[key], null);

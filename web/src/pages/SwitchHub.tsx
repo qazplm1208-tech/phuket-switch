@@ -121,7 +121,7 @@ function ProviderCard({ p }: { p: ProviderView }) {
                 )
                   return;
                 await api.deleteProvider(p.id);
-                if (p.id === s.fast.ultraFastProviderId) s.fastResource.reload();
+                if (p.id === s.fast.ultraFastProviderId || p.id === s.fast.astraOnlyProviderId) s.fastResource.reload();
                 s.refreshProviders();
                 notify('已删除供应商');
               })

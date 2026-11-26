@@ -70,11 +70,14 @@ export default function ProviderFormModal({
   const defaultUrl = defaultBaseUrlForApp(app, chosen);
   const [urlOverride, setUrl] = useState<string | undefined>(p?.baseUrl);
   const url = urlOverride ?? defaultUrl;
+  const urlOrigin = URL.parse(url)?.origin;
+  const originalOrigin = p && URL.parse(p.baseUrl)?.origin;
+  const originChanged = !!p && !!urlOrigin && urlOrigin !== originalOrigin;
   const groupKeys = (keys.data?.items ?? []).filter(k => k.group_id === gid && k.status === 'active');
   const [keyChoice, setKeyChoice] = useState<string | undefined>(p ? 'keep' : undefined);
-  const keyMode = !logged || !chosen ? 'manual' : keyChoice ?? (groupKeys[0]
+  const keyMode = !logged || !chosen || (originChanged && (!keyChoice || keyChoice === 'keep')) ? 'manual' : keyChoice ?? (groupKeys[0]
     ? `key:${groupKeys[0].id}` : keys.data ? 'auto' : 'pending');
-  const requireSecret = keyMode === 'manual' && (!p || (logged && !!chosen));
+  const requireSecret = keyMode === 'manual' && (!p || originChanged || (logged && !!chosen));
   const keyHint = keyMode === 'pending' ? (keys.error ? '请选择密钥来源，或重试加载。' : '正在加载分组密钥…')
     : keyMode.startsWith('key:') ? '将使用账号中该分组的可用密钥，无需手动填写。'
     : keyMode === 'auto' ? (keys.data && !groupKeys.length ? '该分组暂无可用密钥，保存时将自动新建并绑定。' : '保存时将为该分组新建并绑定密钥。')
@@ -264,13 +267,19 @@ export default function ProviderFormModal({
         <div className="form-grid">
           <Field
             label={`端点地址 · ${protocolName(protocol)}`}
+            hint={originChanged ? '地址来源已更改，不能保留当前密钥。请填写新地址的 API 密钥，或选择对应的 PhuketAI 分组密钥。' : undefined}
           >
             <input
               className="mono"
               type="url"
               required
               value={url}
-              onChange={(e) => setUrl(e.target.value)}
+              onChange={(e) => {
+                const next = e.target.value;
+                const nextOrigin = URL.parse(next)?.origin;
+                if (p && nextOrigin !== urlOrigin) setKeyChoice(nextOrigin === originalOrigin ? 'keep' : 'manual');
+                setUrl(next);
+              }}
             />
           </Field>
           <div className="form-stack">
@@ -278,7 +287,7 @@ export default function ProviderFormModal({
               <Field label="API 密钥" hint={keyHint}>
                 <select value={keyMode} onChange={e => setKeyChoice(e.target.value)}>
                   {keyMode === 'pending' && <option value="pending" disabled>{keys.error ? '请选择密钥来源' : '正在加载…'}</option>}
-                  {p && <option value="keep">保留当前密钥 · {p.maskedKey || '••••'}</option>}
+                  {p && !originChanged && <option value="keep">保留当前密钥 · {p.maskedKey || '••••'}</option>}
                   {groupKeys.map(k => <option key={k.id} value={`key:${k.id}`}>使用已有密钥 · {k.name} ({k.key_display})</option>)}
                   <option value="auto">自动为该分组新建 API 密钥</option>
                   <option value="manual">手动填写 API 密钥…</option>
@@ -289,7 +298,7 @@ export default function ProviderFormModal({
             {keyMode === 'manual' && (
               <Field label={logged && chosen ? '手动填写 API 密钥' : 'API 密钥'}>
                 <input
-                  key={gid ?? 'custom'}
+                  key={JSON.stringify([gid, urlOrigin])}
                   className="mono"
                   type="password"
                   name="secret"

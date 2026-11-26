@@ -78,9 +78,9 @@ export default function RouteManager() {
     <div className="route-toolbar">
       <Choices label="来源客户端" items={filters} value={filter} change={setFilter} />
       <div className="actions">
-        <Btn kind="primary" icon={ListPlus} disabled={!ready} busy={pending === 'fill'} onClick={() => void run('fill', async () => {
+        <Btn kind="primary" icon={ListPlus} disabled={!ready || !proxy} busy={pending === 'fill'} onClick={() => void run('fill', async () => {
           try {
-            const result = await api.autoPopulateRoutes({ sourceClient: 'all', syncCodexCatalog: true });
+            const result = await api.autoPopulateRoutes({ sourceClient: 'all', syncCodexCatalog: codexTakeover });
             resource.replace(result.rules); setFilter('all'); notify(`新增 ${result.addedCount} 条路由`, systemNote(result.system));
           } catch (e) { resource.reload(); throw e; }
         })}>一键填充全部跨协议路由</Btn>

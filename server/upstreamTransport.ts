@@ -46,7 +46,7 @@ export function isLoopbackUrl(url: URL) {
 }
 export const connectAuthority = (url: URL) => `${url.hostname}:${portOf(url)}`;
 export type DirectPolicy = { kind: 'skip-proxy' } | { kind: 'bridge'; proxyUrl: URL; authorityGrant?: string };
-type PolicyResolver = (url: URL) => Promise<DirectPolicy | undefined>;
+type PolicyResolver = (url: URL, signal?: AbortSignal) => Promise<DirectPolicy | undefined>;
 const resolvers = new Set<PolicyResolver>();
 export function setDirectBypassResolver(resolver: PolicyResolver) {
   resolvers.add(resolver);
@@ -94,6 +94,20 @@ export function networkTags(error: unknown): string[] {
     if (Array.isArray(e.errors)) pending.push(...e.errors.slice(0, 12));
   }
   return tags;
+}
+const preDeliveryCodes = new Set(['EAI_AGAIN', 'ENOTFOUND', 'ECONNREFUSED', 'ENETUNREACH', 'EHOSTUNREACH', 'UND_ERR_CONNECT_TIMEOUT']);
+export function isPreDeliveryNetworkError(error: unknown): boolean {
+  // Every leaf of an AggregateError must confirm the request could not have been delivered.
+  let budget = 24;
+  function confirmed(e: unknown): boolean {
+    if (--budget < 0 || !isRecord(e)) return false;
+    const known = preDeliveryCodes.has(e.code);
+    if (e.code !== undefined && !known) return false;
+    if (e.cause != null && !confirmed(e.cause)) return false;
+    const children = Array.isArray(e.errors) && e.errors.length > 0;
+    return (!children || e.errors.every(confirmed)) && (known || e.cause != null || children);
+  }
+  return confirmed(error);
 }
 function tunnel(target: URL, proxy: URL, signal: AbortSignal, authorityGrant?: string) {
   return new Promise<Socket>((resolve, reject) => {
@@ -185,8 +199,10 @@ export async function adaptiveFetch(input: string | URL, init: RequestInit & { s
   if (!/^https?:$/.test(url.protocol) || url.username || url.password) throw new ApiError(502, 'UPSTREAM_URL', '上游服务地址无效。');
   for (let redirects = 0; ; redirects++) {
     let response: Response;
+    signal.throwIfAborted();
     const local = isLoopbackUrl(url), resolver = policyForRequest ?? [...resolvers].at(-1);
-    const policy = !local && resolver ? await resolver(url) : undefined;
+    const policy = !local && resolver ? await resolver(url, signal) : undefined;
+    signal.throwIfAborted();
     if (!policy && send !== fetch) return send(url, init);
     const bypass = bypassesProxy(url, [process.env.no_proxy, process.env.NO_PROXY].join(','));
     const loginProxy = !policy && !bypass && !retried && !redirects && init.method?.toUpperCase() === 'POST' && url.pathname === '/api/v1/auth/login' && typeof init.body === 'string' ? nativeEnvProxy(url) : undefined;
@@ -197,9 +213,7 @@ export async function adaptiveFetch(input: string | URL, init: RequestInit & { s
     else try { response = await send(url, { ...init, redirect: 'manual' }); }
     catch (e) {
       signal.throwIfAborted();
-      const tags = networkTags(e);
-      const beforeDelivery = tags.some(t => /^(?:EAI_AGAIN|ENOTFOUND|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH|UND_ERR_CONNECT_TIMEOUT)$/.test(t));
-      const mayReplay = /^(?:GET|HEAD)$/i.test(init.method ?? 'GET') || url.pathname === '/api/v1/auth/login' || beforeDelivery;
+      const mayReplay = /^(?:GET|HEAD)$/i.test(init.method ?? 'GET') || url.pathname === '/api/v1/auth/login' || isPreDeliveryNetworkError(e);
       if (retried || !mayReplay || (init.body != null && typeof init.body !== 'string')) throw e;
       const alternate = await alternateRoute(url);
       if (alternate === undefined) throw e;

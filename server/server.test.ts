@@ -18,7 +18,7 @@ import { CLAUDE_DESKTOP_PROFILE_ID, CLAUDE_DESKTOP_PROFILE_NAME, cliPaths } from
 import { maskApiKey, SwitchDb } from './db.js';
 import { isRecord, ApiError, redactRecognizable } from './common.js';
 import { fetchJson, networkError, checkStatus, responseError } from './httpClient.js';
-import { parseInternetSettings, parseWindowsProxyServer } from './upstreamTransport.js';
+import { isPreDeliveryNetworkError, parseInternetSettings, parseWindowsProxyServer } from './upstreamTransport.js';
 import { StreamMetrics } from './streamMetrics.js';
 import { IMAGE_PROMPT_END, IMAGE_PROMPT_START } from './imagePrompt.js';
 
@@ -113,7 +113,9 @@ test('routes validate and persist; auto-population is scoped, stable and preserv
   const a = await api('routes/auto-populate', 'POST', { sourceClient: 'claude' });
   assert.equal(a.addedCount, 5); assert.equal(a.rules.length, 7);
   assert.deepEqual(a.rules[0], rules[0]); assert.ok(a.rules.some((r: ModelRouteRule) => r.targetProviderId === x.id && r.sourceModel === 'grok-4'));
-  const both = await api('routes/auto-populate', 'POST', {}); assert.equal(both.addedCount, 2);
+  const both = await api('routes/auto-populate', 'POST', { syncCodexCatalog: false }); assert.equal(both.addedCount, 2);
+  assert.equal(both.system, undefined); assert.equal(fs.existsSync(cliPaths().catalog), false);
+  const proxy = await api('proxy/status'); assert.equal(proxy.running, false); assert.equal(proxy.takeover.codex, false);
   assert.ok(both.rules.some((r: ModelRouteRule) => r.sourceClient === 'codex' && r.targetProviderId === c.id && r.sourceModel === 'claude-opus'));
   await api('routes/auto-populate', 'POST', { sourceClient: 'all', syncCodexCatalog: true }, 409);
   const another = new SwitchDb(); try { assert.deepEqual(another.state('modelRoutes'), both.rules); } finally { another.close(); }
@@ -360,6 +362,29 @@ test('Codex catalog repairs native and routed entries to the 26-field ModelInfo 
   for (const model of models) assertCodexCatalogEntry(model);
   await api('proxy/takeover', 'POST', { appType: 'codex', enable: false });
 });
+test('backupBeforeSwitch skips optional snapshots but preserves rollback, takeover and restore undo', async t => {
+  const p = await create('codex'), f = cliPaths(), settings = await api('settings');
+  await api('settings', 'PUT', { ...settings, backupBeforeSwitch: false });
+  const before = 'model = "original" # untouched on failure\r\n'; file(f.codex, before);
+  const rename = fs.renameSync, fail = t.mock.method(fs, 'renameSync', (src: fs.PathLike, dest: fs.PathLike) => {
+    if (dest === f.catalog) throw new Error('simulated second write failure');
+    rename(src, dest);
+  });
+  try { await api(`providers/${p.id}/activate`, 'POST', { applyToSystem: true }, 500); } finally { fail.mock.restore(); }
+  assert.equal(read(f.codex), before); assert.equal(fs.existsSync(f.auth), false); assert.equal(fs.existsSync(f.catalog), false);
+  assert.equal(runtime.db.current('codex'), null); assert.deepEqual(await api('backups'), []);
+  const applied = (await activate(p.id, true)).system; assert.equal(applied.applied, true); assert.equal(applied.backupId, null);
+  assert.deepEqual(await api('backups'), []); const direct = read(f.codex);
+  const toggle = (enable: boolean) => api('proxy/takeover', 'POST', { appType: 'codex', enable });
+  await proxyPort(); const first = await toggle(true), off = await toggle(false);
+  assert.ok(first.system.backupId && off.system.backupId); assert.equal(read(f.codex), direct);
+  const on = await toggle(true);
+  const taken = read(f.codex); assert.notEqual(taken, direct); assert.ok(on.system.backupId);
+  const undo = await api(`backups/${on.system.backupId}/restore`, 'POST'); assert.ok(undo.backupId);
+  assert.equal(read(f.codex), direct); assert.equal((await api('proxy/status')).takeover.codex, false); assert.equal(runtime.db.state('proxyOriginalConfigs').codex, undefined);
+  await api(`backups/${undo.backupId}/restore`, 'POST'); assert.equal(read(f.codex), taken);
+});
+
 test('invalid TOML or companion JSON aborts all writes before backup or activation', async () => {
   const f = cliPaths(), p = await create('codex'); file(f.codex, '[broken\n');
   await api(`providers/${p.id}/activate`, 'POST', {}, 409); assert.equal(read(f.codex), '[broken\n');
@@ -377,6 +402,34 @@ test('Claude settings preserve unmanaged keys and model slots; takeover restorat
   const during = JSON.parse(read(f.claude)); assert.equal(during.env.ANTHROPIC_BASE_URL, `http://127.0.0.1:${port}`); assert.notEqual(during.env.ANTHROPIC_AUTH_TOKEN, rawKey);
   await api('proxy/takeover', 'POST', { appType: 'claude', enable: false }); assert.equal(read(f.claude), direct);
   await api(`backups/${applied.backupId}/restore`, 'POST'); assert.equal(read(f.claude), JSON.stringify(original));
+});
+
+test('disabling takeover uses the latest provider and keeps unrelated edits; explicit restore clears just that takeover', async () => {
+  const f = cliPaths(), old = await create('claude'), current = await create('claude', { baseUrl: 'https://new.invalid/v1', apiKey: 'new-key' });
+  const original = '{"user":"original bytes"}\r\n'; file(f.claude, original);
+  await activate(old.id); await proxyPort(); const toggle = (appType: AppType, enable: boolean) => api('proxy/takeover', 'POST', { appType, enable });
+  const { system } = await toggle('claude', true); await activate(current.id);
+  const live = JSON.parse(read(f.claude)); live.env.UNRELATED = 'keep'; live.user = 'changed'; file(f.claude, JSON.stringify(live));
+  await toggle('claude', false); const direct = JSON.parse(read(f.claude));
+  assert.equal(direct.user, 'changed'); assert.equal(direct.env.UNRELATED, 'keep'); assert.equal(direct.env.ANTHROPIC_BASE_URL, 'https://new.invalid'); assert.equal(direct.env.ANTHROPIC_AUTH_TOKEN, 'new-key');
+  const codex = await create('codex'); await activate(codex.id); await toggle('codex', true); await toggle('claude', true);
+  const codexBefore = runtime.db.state('proxyOriginalConfigs').codex; await api(`backups/${system.backupId}/restore`, 'POST');
+  assert.equal(read(f.claude), original); const after = await api('proxy/status'); assert.equal(after.takeover.claude, false); assert.equal(after.takeover.codex, true);
+  assert.deepEqual(runtime.db.state('proxyOriginalConfigs'), { codex: codexBefore });
+});
+
+test('explicit takeover backup restore reconciles state for every client with managed files', async () => {
+  await proxyPort();
+  for (const appType of ['codex', 'gemini', 'antigravity', 'claude-desktop', 'claude'] as const) {
+    const p = await create(appType); await activate(p.id, true);
+    const prior = (await api('overview')).liveCliStates.find((s: { appType: AppType }) => s.appType === appType);
+    const enabled = await api('proxy/takeover', 'POST', { appType, enable: true });
+    assert.ok(enabled.proxy.takeover[appType] && enabled.system.backupId);
+    await api(`backups/${enabled.system.backupId}/restore`, 'POST');
+    const overview = await api('overview'); assert.equal((await api('proxy/status')).takeover[appType], false);
+    assert.equal(runtime.db.state('proxyOriginalConfigs')[appType], undefined);
+    assert.equal(overview.liveCliStates.find((s: { appType: AppType }) => s.appType === appType).baseUrl, prior.baseUrl);
+  }
 });
 
 const desktopType = 'claude-desktop' as const;
@@ -459,8 +512,38 @@ test('Claude Desktop takeover isolates credentials and discovery, strips the pre
   const cliResponse = await fetch(root + '/v1/messages', { method: 'POST', headers, body: JSON.stringify({ model: cli.model }) }); await cliResponse.text();
   assert.equal(cliResponse.status, 200); assert.equal(calls.at(-1)!.app, 'cli'); assert.equal(calls.at(-1)!.headers['x-api-key'], 'cli-upstream-key');
   await api('proxy/stop', 'POST'); const stopped = await liveDesktop(); assert.match(stopped.warnings.join(' '), /已停止.*启动代理/); assert.equal(stopped.providerId, null);
+  file(f.profile, JSON.stringify({ ...profile, userSetting: 'edited during takeover' }));
   const off = await toggle(false); assert.ok(off.system.backupId); assert.equal(off.proxy.takeover[desktopType], false);
+  assert.equal(JSON.parse(read(f.profile)).userSetting, 'edited during takeover');
+  assert.equal(JSON.parse(read(f.profile)).inferenceGatewayApiKey, 'desktop-upstream-key'); assert.equal((await liveDesktop()).baseUrl, desktop.baseUrl);
+  await api(`backups/${enabled.system.backupId}/restore`, 'POST');
   assert.equal(read(f.meta), f.metaText); assert.equal(read(f.other), f.otherText); assert.equal(fs.existsSync(f.profile), false); assert.equal((await liveDesktop()).baseUrl, f.oldUrl);
+});
+
+test('POST replay requires positive pre-delivery evidence for every nested connection attempt', () => {
+  const refused = { code: 'ECONNREFUSED' }, dns = { code: 'ENOTFOUND' };
+  assert.ok(isPreDeliveryNetworkError(new TypeError('fetch failed', { cause: new AggregateError([refused, dns]) })));
+  for (const other of [{ code: 'ECONNRESET' }, { code: 'UND_ERR_SOCKET' }, { code: 'ETIMEDOUT' }, Error('unknown'), {}]) {
+    assert.equal(isPreDeliveryNetworkError(other), false); assert.equal(isPreDeliveryNetworkError(new AggregateError([refused, other])), false);
+  }
+});
+
+test('inference never fails over after an accepted POST drops; a safe GET or refused connection can fail over', async () => {
+  const accepted: string[] = [], alternate: string[] = [];
+  const first = await mock(async (req) => { await bodyOf(req); accepted.push(req.method!); req.socket.destroy(); });
+  const second = await mock(async (req, res) => { await bodyOf(req); alternate.push(req.method!); sendJson(res, { data: [{ id: 'alternate' }] }); });
+  const p = await create('codex', { baseUrl: first }); await activate(p.id);
+  const backup = await create('gpt-native', { baseUrl: second, inFailoverQueue: true, model: 'different' });
+  await proxyPort(); const proxy = await api('proxy/start', 'POST');
+  const post = () => fetch(proxy.baseUrl + '/v1/responses', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: p.model, input: 'fixture' }) });
+  const dropped = await post(); assert.equal(dropped.status, 502); await dropped.text();
+  assert.deepEqual(accepted, ['POST']); assert.deepEqual(alternate, []); assert.equal((await api('proxy/logs')).items[0].failoverCount, 0);
+  const get = await fetch(proxy.baseUrl + '/v1/models'); assert.ok((await responseJson(get)).data.some((v: { id: string }) => v.id === 'alternate'));
+  assert.deepEqual(accepted, ['POST', 'GET']); assert.deepEqual(alternate, ['GET']);
+  const unused = await listen(http.createServer()), refused = address(unused); await close(unused);
+  await api(`providers/${p.id}`, 'PUT', { baseUrl: refused, apiKey: 'explicit-key' });
+  const retried = await post(); assert.equal(retried.status, 200); await retried.text(); assert.deepEqual(alternate, ['GET', 'POST']);
+  const log = (await api('proxy/logs')).items[0]; assert.equal(log.providerId, backup.id); assert.equal(log.failoverCount, 1);
 });
 
 test('Claude Desktop retries its own queue before shared Anthropic failover and returns Anthropic proxy errors', async () => {
@@ -646,6 +729,22 @@ function assertProviderKey(view: { id: string; maskedKey?: string }, expected: s
   assert.equal(view.maskedKey, maskApiKey(expected));
   assert.ok(!Object.hasOwn(view, 'apiKey') && !JSON.stringify(view).includes(expected));
 }
+
+test('changing a provider origin requires an explicit credential; same-origin edits retain the saved key', async () => {
+  const p = await create('codex', accountProvider), route = `providers/${p.id}`;
+  const same = 'https://EXAMPLE.invalid:443/other/v2';
+  assertProviderKey(await api(route, 'PUT', { baseUrl: same }), rawKey);
+  const before = runtime.db.provider(p.id);
+  for (const baseUrl of ['http://example.invalid/other', 'https://example.invalid:8443', 'https://unrelated.invalid']) {
+    const denied = await api(route, 'PUT', { baseUrl, name: 'not committed' }, 400);
+    assert.ok(!JSON.stringify(denied).includes(rawKey)); assert.deepEqual(runtime.db.provider(p.id), before);
+  }
+  assertProviderKey(await api(route, 'PUT', { baseUrl: 'https://manual.invalid', apiKey: 'explicit-manual' }), 'explicit-manual');
+  const calls = await providerAccount();
+  assertProviderKey(await api(route, 'PUT', { baseUrl: accountProvider.baseUrl, phuketKeyId: 11 }), rawKey);
+  assertProviderKey(await api(route, 'PUT', { baseUrl: 'https://other.invalid', autoCreatePhuketKey: true }), issuedKey);
+  assert.deepEqual(calls, ['GET', 'POST']);
+});
 
 test('provider creation resolves only an active account key for the selected group', async () => {
   const request = { ...accountProvider, phuketKeyId: 11 };

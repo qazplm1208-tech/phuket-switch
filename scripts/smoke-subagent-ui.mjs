@@ -9,6 +9,7 @@ import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 const root = path.resolve(import.meta.dirname, '..'), secret = 'opaque-ui-only-credential-93', customBase = 'https://api.deepseek.com/v1';
+const fixtureProxyPort = 31847;
 async function host() {
   const scratch = path.join(root, '.desktop'); fs.mkdirSync(scratch, { recursive: true });
   const temp = fs.mkdtempSync(path.join(scratch, 'subagent-ui-')), home = path.join(temp, 'user');
@@ -29,6 +30,7 @@ async function host() {
   } });
   runtime.db.createProvider({ name: '测试供应商', appType: 'codex', protocol: 'openai-responses', baseUrl: 'https://catalog.invalid/v1', apiKey: 'fixture-provider-credential', model: 'provider-model', availableModels: ['provider-other'] });
   const server = http.createServer(createManagementApp(undefined, runtime));
+  runtime.db.setState('proxySettings', { ...runtime.db.state('proxySettings'), port: fixtureProxyPort });
   const requests = {}, tests = [];
   server.prependListener('request', req => { const route = req.url; if (!['/api/subagent/apply','/api/subagent/preview-diff','/api/subagent/test'].includes(route)) return;
     let body = ''; req.on('data', b => body += b); req.on('end', () => { const data = JSON.parse(body); if (route === '/api/subagent/test') tests.push(data); else requests[route] = data; }); });
@@ -65,7 +67,8 @@ async function renderer({ app, BrowserWindow, session }) {
     await w.loadURL(origin + '/subagent'); await wait("document.querySelectorAll('.subagent-harness').length === 9", 'nine targets');
     await js(`window.btn = (s, parent=document) => [...parent.querySelectorAll('button')].find(x=>x.textContent.trim()===s);
       window.field = name => [...document.querySelectorAll('.field')].find(l=>l.querySelector('span')?.textContent===name)?.querySelector('input,select,textarea');
-      window.setField = (name,v) => { const el=field(name); Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el),'value').set.call(el,v);el.dispatchEvent(new Event(el.tagName==='SELECT'?'change':'input',{bubbles:true})); };
+      window.setValue = (el,v) => { Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el),'value').set.call(el,v);el.dispatchEvent(new Event(el.tagName==='SELECT'?'change':'input',{bubbles:true})); };
+      window.setField = (name,v) => setValue(field(name),v);
       Object.defineProperty(navigator,'clipboard',{configurable:true,value:{writeText:async s=>{window.copied=s}}});void 0`);
   }
   const click = name => js(`btn(${JSON.stringify(name)}).click()`), set = (name,v) => js(`setField(${JSON.stringify(name)},${JSON.stringify(v)})`);
@@ -85,11 +88,15 @@ async function renderer({ app, BrowserWindow, session }) {
     await wait("!!field('物理网卡')?.querySelector('option[value=\"Fixture Ethernet\"]')", 'saved offline download adapter');
     await click('仅跳过系统代理'); await click('选择已检测客户端');
     await wait("!btn('写入脚本与规则').disabled", 'detected download targets');
+    const downloadTarget = name => `document.querySelector('.direct-download input[aria-label="选择 ${name}"]')`;
+    assert.ok(await js(`${downloadTarget('Codex')}.checked`));
+    if (!await js(`${downloadTarget('Claude Code')}.checked`)) await js(`${downloadTarget('Claude Code')}.click()`);
+    assert.equal(await js("document.querySelectorAll('.direct-download input:checked').length"), 2);
     await set('并行连接数（1–16）','17'); assert.ok(await js("btn('预览变更').disabled"));
     await set('并行连接数（1–16）','6'); await click('预览变更');
     await wait("document.querySelector('dialog[open] .diff-grid') && document.querySelector('.download-diff').textContent.includes('direct_download.py')", 'download file diffs');
     assert.equal(await js("fetch('/api/direct-download').then(r=>r.json()).then(s=>s.scriptInstalled)"), false);
-    await click('确认并写入'); await wait("!document.querySelector('dialog[open]') && document.querySelector('.direct-download').textContent.includes('已部署脚本') && !btn('移除规则与脚本').disabled", 'deployed downloader');
+    await click('确认并写入'); await wait("!document.querySelector('dialog[open]') && document.querySelector('.direct-download').textContent.includes('已部署脚本') && !btn('移除所选').disabled && !!btn('移除全部')", 'deployed downloader');
     const paths = await js("fetch('/api/direct-download').then(r=>r.json()).then(s=>[s.scriptPath,s.cmdPath])");
     for (const [i,label] of ['复制Python 脚本路径','复制Windows 启动器路径'].entries()) {
       await js(`document.querySelector('[aria-label="${label}"]').click()`); assert.equal(await js('window.copied'), paths[i]);
@@ -103,8 +110,17 @@ async function renderer({ app, BrowserWindow, session }) {
       w.setContentSize(width,700); await js(`document.documentElement.dataset.theme=${JSON.stringify(theme)}`); await delay(100);
       assert.ok(await js("[...document.querySelectorAll('.direct-download, .direct-download .setting-row')].every(el=>el.scrollWidth<=el.clientWidth+1)"), 'download panel overflow at '+width);
     }
-    await click('移除规则与脚本'); await wait("!!btn('确认移除')", 'download removal confirmation'); await click('确认移除');
-    await wait("!document.querySelector('dialog[open]') && document.querySelector('.direct-download .badge')?.textContent==='未部署' && btn('移除规则与脚本').disabled", 'download rules and scripts removed');
+    await js(`${downloadTarget('Codex')}.click()`); await js(`${downloadTarget('Cline')}.click()`);
+    await click('移除所选'); await wait("!!btn('确认移除')", 'selected download targets');
+    const selected = await js("document.querySelector('.dialog-copy').textContent");
+    assert.match(selected, /Claude Code/); assert.doesNotMatch(selected, /Codex|Cline/); await click('确认移除');
+    await wait("!document.querySelector('dialog[open]') && document.querySelectorAll('.direct-download .setting-row .badge.good').length===1 && !btn('移除全部').disabled", 'partial download removal');
+    assert.ok(await js("fetch('/api/direct-download').then(r=>r.json()).then(s=>s.scriptInstalled && s.liveTargets.codex.injected && !s.liveTargets['claude-code'].injected)"));
+    await js(`${downloadTarget('Codex')}.click()`); assert.ok(await js("btn('移除所选').disabled"));
+    await click('移除全部'); await wait("!!btn('确认移除')", 'all download targets');
+    const all = await js("document.querySelector('.dialog-copy').textContent");
+    assert.match(all, /Codex/); assert.doesNotMatch(all, /Claude Code|Cline/); await click('确认移除');
+    await wait("!document.querySelector('dialog[open]') && document.querySelector('.direct-download .badge')?.textContent==='未部署' && btn('移除所选').disabled && !btn('移除全部')", 'last download rule and shared scripts removed');
     assert.deepEqual(await js('window.downloadErrors'), []);
   }
   try {
@@ -112,6 +128,9 @@ async function renderer({ app, BrowserWindow, session }) {
     await click('验证子代理'); await wait("document.querySelector('.subagent-result')?.textContent.includes('astra_wait_worker')", 'handshake');
     assert.ok(await js("document.querySelector('.subagent-result').textContent.includes('1.5.0')"));
     assert.ok(await js("document.querySelector('.subagent-metrics').textContent.includes('已开启 · 88% 兜底') && document.querySelector('.subagent-compaction').textContent.includes('239,360')"));
+    const localPreset = `http://127.0.0.1:${fixtureProxyPort}`;
+    await wait(`field('接口 Base URL')?.placeholder===${JSON.stringify(localPreset)}`, 'configured local proxy port');
+    await click('本地代理'); assert.equal(await js("field('接口 Base URL').value"), localPreset);
     await click('已有供应商'); await wait("field('默认子代理模型').value==='provider-model'", 'provider defaults'); await click('provider-other');
     await probe();
     await set('接口 Base URL','https://catalog.invalid:443/relay/v3'); assert.ok(!await js("field('新地址 API 密钥')"));
@@ -165,7 +184,10 @@ async function renderer({ app, BrowserWindow, session }) {
       assert.ok(await js("document.querySelector('main').scrollWidth <= document.querySelector('main').clientWidth+1"), 'layout overflow at '+width);
     }
     await js("document.querySelector('[aria-label=\"移除 Cursor\"]').click()"); await wait("!!btn('确认移除')", 'confirm remove'); await click('取消'); assert.equal(await js("document.querySelectorAll('.subagent-harness .badge.good').length"), 2);
+    await js("document.querySelector('input[aria-label=\"选择 Windsurf\"]').click()");
     await js("document.querySelector('[aria-label=\"移除 Cursor\"]').click()"); await click('确认移除'); await wait("document.querySelectorAll('.subagent-harness .badge.good').length===1", 'single removal');
+    assert.deepEqual(await js("[...document.querySelectorAll('.subagent-harness input:checked')].map(el=>el.ariaLabel)"), ['选择 Windsurf']);
+    assert.ok(await js("field('默认子代理模型').value==='new-model' && field('接口 Base URL').value==='https://openrouter.ai/api/v1' && field('接口协议').value==='openai-chat' && field('新地址 API 密钥').value==='new-origin-only'"));
     await click('移除全部已部署'); await click('确认移除'); await wait("document.querySelectorAll('.subagent-harness .badge.good').length===0", 'all removed');
     await js("document.querySelector('.sidebar a[href=\"/proxy\"]').click()");
     await wait("document.querySelector('.direct-shortcut .badge')?.textContent==='未启用'", 'direct shortcut');
@@ -195,9 +217,20 @@ async function renderer({ app, BrowserWindow, session }) {
     await js("document.querySelector('.direct-shortcut [role=switch]').click()");
     await wait("document.querySelector('.direct-shortcut .badge')?.textContent==='未启用'", 'quick disable');
     await downloadPage();
+    await js("document.querySelector('.sidebar a[href=\"/\"]').click()");
+    await wait("!!document.querySelector('.provider button[aria-label=编辑]')", 'fixture provider');
+    await js("document.querySelector('.provider button[aria-label=编辑]').click()");
+    const providerUrl = url => js(`setValue(document.querySelector('dialog input[type=url]'),${JSON.stringify(url)})`);
+    await providerUrl('https://CATALOG.invalid:443/other'); assert.ok(await js("!field('API 密钥').required"));
+    await providerUrl('https://changed.invalid/v1'); await click('保存配置');
+    assert.ok(await js("field('API 密钥').validity.valueMissing && document.querySelector('dialog').textContent.includes('不能保留当前密钥')"));
+    await set('API 密钥','for-changed-origin'); await providerUrl('https://another.invalid/v1');
+    assert.ok(await js("field('API 密钥').validity.valueMissing")); await click('取消');
+    await click('跨协议路由'); await wait("btn('一键填充全部跨协议路由')?.disabled===false", 'route population available');
+    await click('一键填充全部跨协议路由'); await wait("!!document.querySelector('.route-table tbody tr')", 'populate routes without Codex takeover');
     await w.loadURL(origin+'/extensions#backups'); await wait("document.querySelector('.backup-list')?.textContent.includes('部署子代理插件与配置') && document.querySelector('.backup-list')?.textContent.includes('移除子代理配置')", 'backups');
-    assert.ok(await js("['部署 AI 直连下载脚本与规则','移除 AI 直连下载规则'].every(s=>document.querySelector('.backup-list').textContent.includes(s)) && [...document.querySelectorAll('.backup-list .badge')].filter(b=>b.textContent==='AI 直连下载').length===2"));
-    console.log('Renderer passed: inline origin keys, presets, endpoint preview, read-only discovery, redacted diff/apply, independent MCP storage, navigation, provider/group/manual sources, custom model, MCP handshake, chunk policy, refresh, selection, safe copies, removal, backups, direct download API/tab/diff/apply/loopback probe/removal, light/dark widths.');
+    assert.ok(await js("['部署 AI 直连下载脚本与规则','移除 AI 直连下载规则'].every(s=>document.querySelector('.backup-list').textContent.includes(s)) && [...document.querySelectorAll('.backup-list .badge')].filter(b=>b.textContent==='AI 直连下载').length===3"));
+    console.log('Renderer passed: provider and subagent origin-key guards, configured proxy preset, read-only discovery, redacted diff/apply, MCP handshake, chunk policy, draft-preserving removal, shared bypass settings, downloader apply/probe/selected and all removal, backups, route population without takeover, light/dark widths.');
   } finally { w.destroy(); }
 }
 if (process.versions.electron) { const electron = await import('electron'); renderer(electron).then(() => electron.app.exit(0), e => { console.error(e); electron.app.exit(1); }); }

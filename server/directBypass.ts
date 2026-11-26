@@ -42,6 +42,15 @@ function readStartup(child: Child) {
     child.once('error', fail); child.once('close', fail); child.stdout.on('data', onData);
   });
 }
+function waitFor<T>(job: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return job;
+  signal.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    signal.addEventListener('abort', abort, { once: true });
+    job.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+  });
+}
 async function stop(bridge: Bridge) {
   bridge.child.stdin.end();
   const force = setTimeout(() => bridge.child.kill(), 400);
@@ -54,14 +63,16 @@ export class DirectBypassManager {
   private selected: DirectBypassRouteInfo | null = null;
   private adapters: DirectBypassRouteInfo[] = [];
   private error: string | null = null;
-  private closing = false;
+  private readonly shutdown = new AbortController();
+  private pendingApply?: Promise<{ status: DirectBypassStatus; bridge?: Bridge }>;
   private unregister: () => void;
   constructor(private readonly db: SwitchDb, private readonly options: DirectBypassOptions = {}) {
-    this.unregister = setDirectBypassResolver(url => this.resolvePolicy(url));
+    this.unregister = setDirectBypassResolver((url, signal) => this.resolvePolicy(url, signal));
   }
   private exclusive<T>(task: () => Promise<T>): Promise<T> {
-    if (this.closing) return Promise.reject(unavailable('Direct transport has closed.'));
-    const job = this.queue.then(task);
+    const signal = this.shutdown.signal;
+    if (signal.aborted) return Promise.reject(signal.reason);
+    const job = this.queue.then(() => { signal.throwIfAborted(); return task(); });
     this.queue = job.then(() => {}, () => {});
     return job;
   }
@@ -80,7 +91,7 @@ export class DirectBypassManager {
         try {
           const cmd = this.command();
           const { stdout } = await run(cmd.exe, [...cmd.args, '--inspect-routes', ...argsFor(this.db.state('directBypass'))],
-            { cwd: cmd.cwd, env: childEnv(), windowsHide: true, timeout, maxBuffer: outputLimit, encoding: 'utf8' });
+            { cwd: cmd.cwd, env: childEnv(), windowsHide: true, timeout, signal: this.shutdown.signal, maxBuffer: outputLimit, encoding: 'utf8' });
           const data = inventory.parse(JSON.parse(stdout));
           this.selected = data.selected; this.adapters = data.adapters;
           if (this.bridge || !this.db.state('directBypass').enabled) this.error = null;
@@ -98,6 +109,7 @@ export class DirectBypassManager {
     const args = argsFor(config), signature = JSON.stringify([this.db.state('subagent').pythonPath, args]);
     if (this.bridge?.signature === signature) return;
     await this.stopBridge();
+    this.shutdown.signal.throwIfAborted();
     try {
       const cmd = this.command(), token = randomBytes(32).toString('hex'), scopeKey = randomBytes(32).toString('hex');
       const child = spawn(cmd.exe, [...cmd.args, '--serve', ...(this.options.systemRoute ? ['--system-route'] : []), ...args],
@@ -108,42 +120,48 @@ export class DirectBypassManager {
         resolve();
       }));
       try {
-        const { port, route } = await readStartup(child);
+        const { port, route } = await waitFor(readStartup(child), this.shutdown.signal);
         if (child.exitCode !== null || route.systemRoute !== !!this.options.systemRoute) throw unavailable();
         this.bridge = { child, closed, scopeKey, url: new URL(`http://bridge:${token}@127.0.0.1:${port}`), route, signature };
         this.error = null;
       } catch (err) { child.stdin.end(); child.kill(); await closed; throw err; }
     } catch (err) { const safe = safeError(err); this.error = safe.message; throw safe; }
   }
-  syncFromConfig() { return this.exclusive(async () => { await this.apply(this.db.state('directBypass')); return this.snapshot(); }); }
-  updateConfig(patch: UpdateDirectBypassRequest) {
-    return this.exclusive(async () => {
+  syncFromConfig() { return this.scheduleApply().then(({ status }) => { if (status.error) throw unavailable(status.error); return status; }); }
+  updateConfig(patch: UpdateDirectBypassRequest) { return this.scheduleApply(patch).then(({ status }) => status); }
+  private scheduleApply(patch?: UpdateDirectBypassRequest) {
+    if (this.shutdown.signal.aborted) return Promise.reject(this.shutdown.signal.reason);
+    // Readers share the latest queued config transition, including its startup failure.
+    if (!patch && this.pendingApply) return this.pendingApply;
+    const job = this.exclusive(async () => {
       const config = { ...this.db.state('directBypass'), ...patch };
-      this.db.setState('directBypass', config);
-      this.selected = null;
-      try { await this.apply(config); } catch { /* Preserve the requested policy and expose its startup error in status. */ }
-      return this.snapshot();
+      if (patch) { this.db.setState('directBypass', config); this.selected = null; }
+      try { await this.apply(config); } catch (err) { this.shutdown.signal.throwIfAborted(); this.error = safeError(err).message; }
+      return { status: this.snapshot(), bridge: this.bridge };
     });
+    this.pendingApply = job;
+    const clear = () => { if (this.pendingApply === job) this.pendingApply = undefined; };
+    void job.then(clear, clear);
+    return job;
   }
-  async resolvePolicy(url: URL): Promise<DirectPolicy | undefined> {
+  async resolvePolicy(url: URL, signal?: AbortSignal): Promise<DirectPolicy | undefined> {
+    const deadline = signal ? AbortSignal.any([signal, this.shutdown.signal]) : this.shutdown.signal;
+    deadline.throwIfAborted();
     if (isLoopbackUrl(url)) return;
-    return this.exclusive(async () => {
-      const config = this.db.state('directBypass');
-      if (!config.enabled) return;
-      if (config.mode === 'skip-proxy') return { kind: 'skip-proxy' } as const;
-      await this.apply(config);
-      const bridge = this.bridge;
-      if (!bridge) throw unavailable();
-      const authorityGrant = createHmac('sha256', bridge.scopeKey).update(connectAuthority(url)).digest('hex');
-      return { kind: 'bridge', proxyUrl: bridge.url, authorityGrant } as const;
-    });
+    const { status, bridge } = await waitFor(this.scheduleApply(), deadline);
+    deadline.throwIfAborted();
+    if (!status.config.enabled) return;
+    if (status.config.mode === 'skip-proxy') return { kind: 'skip-proxy' };
+    if (!bridge) throw unavailable(status.error ?? undefined);
+    const authorityGrant = createHmac('sha256', bridge.scopeKey).update(connectAuthority(url)).digest('hex');
+    return { kind: 'bridge', proxyUrl: bridge.url, authorityGrant };
   }
   async probe(req: DirectBypassProbeRequest): Promise<DirectBypassProbeResult> {
     const url = new URL(req.url ?? PHUKET_BASE_URL), signal = AbortSignal.timeout(10000), start = performance.now();
     const result: DirectBypassProbeResult = { testedAt: now(), ok: false, statusCode: null, mode: this.db.state('directBypass').mode, bypassUsed: false, route: null, error: null, latencyMs: 0 };
     try {
-      const res = await adaptiveFetch(url, { redirect: 'manual', signal }, fetch, async target => {
-        const policy = await this.resolvePolicy(target);
+      const res = await adaptiveFetch(url, { redirect: 'manual', signal }, fetch, async (target, deadline) => {
+        const policy = await this.resolvePolicy(target, deadline);
         result.bypassUsed = !!policy;
         if (policy?.kind === 'bridge') { result.mode = 'physical-nic'; result.route = this.bridge?.route ?? null; }
         if (policy?.kind === 'skip-proxy') result.mode = 'skip-proxy';
@@ -156,8 +174,9 @@ export class DirectBypassManager {
     result.latencyMs = elapsed(start); return result;
   }
   close(): Promise<void> {
-    if (!this.closing) {
-      this.closing = true; this.unregister(); this.queue = this.queue.then(() => this.stopBridge());
+    if (!this.shutdown.signal.aborted) {
+      this.shutdown.abort(unavailable('Direct transport has closed.'));
+      this.unregister(); this.queue = this.queue.then(() => this.stopBridge());
     }
     return this.queue;
   }

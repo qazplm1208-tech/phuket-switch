@@ -1,6 +1,6 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, net, session, shell } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, net, session, shell, Tray } from 'electron';
 import path from 'node:path';
-import { backendURL, ensureBackend, parseResolvedProxy, request, stopOwnedBackend } from './backend.mjs';
+import { ensureBackend, parseResolvedProxy, request, selectUiURL, stopOwnedBackend, webURL } from './backend.mjs';
 import { createTray } from './tray.mjs';
 import { createUpdater } from './updater.mjs';
 import { createWebLogin } from './web-login.mjs';
@@ -19,14 +19,6 @@ function prepareQuit() {
     cleanup = Promise.allSettled([webLogin.cancel(), stopOwnedBackend()]).then(() => { cleanupComplete = true; });
   }
   return cleanup;
-}
-
-function webURL(value) {
-  if (typeof value !== 'string' || !/^https?:\/\//i.test(value) || /[\\\x00-\x1f\x7f]/.test(value)) return null;
-  try {
-    const url = new URL(value);
-    return url.hostname && !url.username && !url.password ? url : null;
-  } catch { return null; }
 }
 
 function quit() { isQuitting = true; app.quit(); }
@@ -121,16 +113,16 @@ if (!app.requestSingleInstanceLock()) {
     }
   });
   app.whenReady().then(async () => {
-    const ui = webURL(process.env.PHUKET_DEV_URL || backendURL.origin);
-    if (!ui) throw new Error('PHUKET_DEV_URL must be an HTTP(S) URL.');
+    const ui = selectUiURL(app.isPackaged, process.env.PHUKET_DEV_URL);
     uiOrigin = ui.origin;
     await ensureBackend(() => isQuitting, await resolvePhuketProxy());
     if (isQuitting) return;
     Menu.setApplicationMenu(null);
-    updater = createUpdater({ app, net, request, notify, prepareQuit, currentVersion: app.getVersion(), owner: 'qazplm1208-tech', repo: 'phuket-switch' });
+    updater = createUpdater({ app, net, request, notify, prepareQuit, showInstallError: detail => dialog.showErrorBox('Phuket Switch', detail),
+      currentVersion: app.getVersion(), owner: 'qazplm1208-tech', repo: 'phuket-switch' });
     registerIPC();
     const win = createWindow();
-    tray = createTray({ iconPath, request, showWindow, quit, updater, notify: topic => notify('tray:changed', topic),
+    tray = createTray({ dialog, Menu, nativeImage, Tray, iconPath, request, showWindow, quit, updater, notify: topic => notify('tray:changed', topic),
       openUpdates: () => {
         showWindow(); notify('tray:changed', 'updates');
         if (['idle', 'not-available', 'error'].includes(updater.getState().status)) void updater.check();

@@ -1,4 +1,4 @@
-import { allowedGroupModels, defaultBaseUrlForApp, DEFAULT_PROXY_PORT, MODEL_SLUG, PHUKET_BASE_URL, PHUKET_GPT_BASE_URL, pickRecommendedModel } from '@shared/constants';
+import { allowedGroupModels, defaultBaseUrlForApp, MODEL_SLUG, PHUKET_BASE_URL, PHUKET_GPT_BASE_URL, pickRecommendedModel } from '@shared/constants';
 import { parseSubagentBase, subagentApiRoot } from '@shared/subagentEndpoint';
 import type { ApplySubagentRequest, PhuketApiKeyView, PhuketGroup, ProviderView, SubagentConfig, SubagentHarnessId, SubagentProtocol, SubagentStatus, SubagentTestRequest } from '@shared/types';
 
@@ -6,14 +6,14 @@ export const protocols: Record<SubagentProtocol, readonly [string, string]> = {
   'openai-responses': ['OpenAI Responses', '/v1/responses'], 'openai-chat': ['OpenAI Chat', '/v1/chat/completions'],
   'anthropic-messages': ['Anthropic Messages', '/v1/messages'], 'gemini-native': ['Gemini 原生', '/v1beta/models'],
 };
-export const endpointPresets: ReadonlyArray<{ label: string; baseUrl: string; protocol?: SubagentProtocol }> = [
+export const endpointPresets = (localProxyUrl: string): ReadonlyArray<{ label: string; baseUrl: string; protocol?: SubagentProtocol }> => [
   { label: 'PhuketAI', baseUrl: PHUKET_GPT_BASE_URL },
   { label: 'OpenAI', baseUrl: 'https://api.openai.com/v1', protocol: 'openai-responses' },
   { label: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', protocol: 'openai-chat' },
   { label: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1', protocol: 'openai-chat' },
   { label: 'Anthropic', baseUrl: 'https://api.anthropic.com', protocol: 'anthropic-messages' },
   { label: 'Gemini', baseUrl: 'https://generativelanguage.googleapis.com', protocol: 'gemini-native' },
-  { label: '本地代理', baseUrl: `http://127.0.0.1:${DEFAULT_PROXY_PORT}` },
+  { label: '本地代理', baseUrl: localProxyUrl },
 ];
 export const fallbacks: Record<SubagentProtocol, string[]> = {
   'openai-responses': ['gpt-6.2-astra', 'gpt-6.2-sol'], 'openai-chat': ['deepseek-reasoner', 'deepseek-chat', 'gpt-6.2-sol'],

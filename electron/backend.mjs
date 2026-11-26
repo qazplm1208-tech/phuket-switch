@@ -10,6 +10,17 @@ if (!/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535) throw new E
 export const backendURL = new URL(`http://127.0.0.1:${port}`);
 let ownedBackendChild = null, draining = null;
 
+export function webURL(value) {
+  if (typeof value !== 'string' || !/^https?:\/\//i.test(value) || /[\\\x00-\x1f\x7f]/.test(value)) return null;
+  const url = URL.parse(value);
+  return url?.hostname && !url.username && !url.password ? url : null;
+}
+export function selectUiURL(isPackaged, devUrl) {
+  if (isPackaged || !devUrl) return backendURL;
+  const url = webURL(devUrl);
+  if (!url || !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)) throw new Error('PHUKET_DEV_URL must be a loopback HTTP(S) URL.');
+  return url;
+}
 export function parseResolvedProxy(value) {
   for (const entry of value.split(';')) {
     if (/^DIRECT$/i.test(entry.trim())) break;

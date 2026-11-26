@@ -4,9 +4,9 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from email.message import Message
-from email.utils import collapse_rfc2231_value
+from email.utils import collapse_rfc2231_value, parsedate_to_datetime
 import hashlib
 import http.client
 import json
@@ -202,8 +202,8 @@ def open_http(url, *, route, resolver, timeout=20., method='GET', headers=None):
                     raise ValueError('Missing redirect location or too many redirects')
                 url = urljoin(url, location)
                 if origin(http_url(url)) != origin(u):
-                    for name in ('authorization', 'cookie', 'proxy-authorization', 'referer'):
-                        headers.pop(name, None)
+                    safe = {'user-agent', 'accept', 'accept-language', 'range', 'if-range'}
+                    headers = header_map({k: v for k, v in headers.items() if k in safe})
         finally:
             conn.close()
 
@@ -257,6 +257,19 @@ class HttpInfo:
     modified: str | None
     content_type: str | None
     filename: str
+
+    @property
+    def validator(self):
+        tag = self.etag
+        if tag and re.fullmatch(r'"[\x21\x23-\x7e\x80-\xff]*"', tag):
+            return tag  # If-Range requires a strong entity tag, never W/ or a bare token.
+        if self.modified:
+            try:
+                parsedate_to_datetime(self.modified)
+                return self.modified
+            except (ValueError, TypeError, OverflowError):
+                pass  # A placeholder such as 'unknown' is not an HTTP-date.
+        return None
 
     def identity(self):
         return {'url': self.url, 'finalUrl': self.final_url, 'totalSize': self.total,
@@ -321,8 +334,8 @@ def split_ranges(size, count):
 
 
 class HttpTransfer:
-    def __init__(self, info, dest, route, resolver, headers, timeout, retries, limiter, progress):
-        self.info, self.dest = info, dest
+    def __init__(self, info, dest, route, resolver, headers, timeout, retries, limiter, progress, expected_digest=False):
+        self.info, self.dest, self.expected_digest = info, dest, expected_digest
         self.part = confined(dest.parent, dest.name + '.part')
         self.meta = confined(dest.parent, dest.name + '.part.meta.json')
         self.net = dict(route=route, resolver=resolver, timeout=timeout)
@@ -375,10 +388,8 @@ class HttpTransfer:
         headers = self.headers.copy()
         if byte_range:
             headers['range'] = byte_range
-            tag = self.info.etag
-            validator = tag if tag and not tag.startswith('W/') else self.info.modified
-            if validator:
-                headers['if-range'] = validator
+            if self.info.validator:
+                headers['if-range'] = self.info.validator
         return headers
 
     def same_entity(self, r, final):
@@ -410,6 +421,8 @@ class HttpTransfer:
         return n
 
     def prepare(self, count, resume):
+        if not (self.info.validator or self.expected_digest):
+            count, resume = 1, False  # Never splice unvalidated representations, even in one process.
         self.cancel.clear()
         self.chunks = self.saved_chunks() if resume else None
         if self.chunks:
@@ -434,12 +447,24 @@ class HttpTransfer:
     def stream_chunk(self, idx):
         a, b, done = self.chunks[idx]
         multi = len(self.chunks) > 1
+        if done and not (self.info.validator or self.expected_digest):
+            self.checkpoint(idx, 0)  # Even an in-process retry needs a fresh whole response.
+            done = 0
         if b is not None and done == b-a+1:
             return
         wanted = f'bytes={a+done}-{b if multi else ""}' if multi or done else None
         with open_http(self.info.url, headers=self.request_headers(wanted), **self.net) as (r, final):
             if r.status not in (200, 206):
                 raise HttpError(r.status)
+            if wanted and r.status == 200:
+                if multi:
+                    raise RangeIgnored()  # Stop all writers before restarting as a single stream.
+                # If-Range failed (or Range was ignored). This entire body is the new entity.
+                self.info = replace(self.info, final_url=final, total=length_of(r), etag=r.getheader('ETag'),
+                                    modified=r.getheader('Last-Modified'))
+                self.chunks = split_ranges(self.info.total, 1)
+                self.checkpoint()
+                done = 0
             self.same_entity(r, final)
             if r.status == 206:
                 start, end, size = content_range(r)
@@ -447,15 +472,10 @@ class HttpTransfer:
                     raise ValueError('Response does not match the requested byte range')
                 limit = end-a+1
             else:
-                if multi:
-                    raise RangeIgnored()
                 size = length_of(r)
                 if self.info.total is not None and size not in (None, self.info.total):
                     raise ValueError('Content length changed during download')
                 limit = self.info.total if self.info.total is not None else size
-                if done:
-                    self.checkpoint(idx, 0)
-                    done = 0
             with regular_file(self.part, 'r+b') as stream:
                 if not multi:
                     stream.truncate(done)
@@ -510,44 +530,154 @@ class HttpTransfer:
                 raise
 
 
+def _windows_lock_api():
+    import ctypes
+    from ctypes import wintypes
+    api = ctypes.WinDLL('kernel32', use_last_error=True)
+    api.CreateMutexW.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
+    api.CreateMutexW.restype = wintypes.HANDLE
+    api.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    api.OpenProcess.restype = wintypes.HANDLE
+    api.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    api.WaitForSingleObject.restype = wintypes.DWORD
+    api.ReleaseMutex.argtypes = api.CloseHandle.argtypes = (wintypes.HANDLE,)
+    return api
+
+
+@contextmanager
+def _lock_directory(directory):
+    # Serialize the short PID-check/unlink/create transaction, not the download.
+    # Two concurrent stale-lock cleaners must never unlink a successor's live lock.
+    if os.name == 'nt':
+        import ctypes
+        st = directory.stat()
+        api = _windows_lock_api()
+        handle = api.CreateMutexW(None, False, f'Global\\PhuketDL-{st.st_dev:x}-{st.st_ino:x}')
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            if api.WaitForSingleObject(handle, 5000) not in (0, 0x80):  # Acquired or abandoned.
+                raise OSError('Could not acquire download directory lock')
+            try:
+                yield
+            finally:
+                api.ReleaseMutex(handle)
+        finally:
+            api.CloseHandle(handle)
+    else:
+        import fcntl
+        fd = os.open(directory, os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)
+
+
+def _pid_alive(pid):
+    if not 0 < pid <= 0xffffffff:
+        raise ValueError('Invalid download lock PID')
+    if os.name == 'nt':
+        # os.kill(pid, 0) is destructive on Windows. Poll a SYNCHRONIZE handle instead.
+        import ctypes
+        api = _windows_lock_api()
+        handle = api.OpenProcess(0x00100000, False, pid)
+        if not handle:
+            error = ctypes.get_last_error()
+            if error in (5, 87):
+                return error == 5  # Access denied means live; invalid PID means dead.
+            raise ctypes.WinError(error)
+        try:
+            result = api.WaitForSingleObject(handle, 0)
+            if result == 0xffffffff:
+                raise ctypes.WinError(ctypes.get_last_error())
+            return result != 0
+        finally:
+            api.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, OverflowError):
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+@contextmanager
+def download_lock(path):
+    with _lock_directory(path.parent):
+        try:
+            lock = regular_file(path, 'xb')  # O_CREAT | O_EXCL
+        except FileExistsError:
+            with regular_file(path, 'rb') as f:
+                raw = f.read(64).strip()
+            if raw and _pid_alive(int(raw)):
+                raise FileExistsError('Download already in progress for this destination') from None
+            # An empty lock means the guarded creator died before it could write its PID.
+            path.unlink()
+            lock = regular_file(path, 'xb')
+        try:
+            with lock:
+                lock.write(str(os.getpid()).encode('ascii'))
+        except BaseException:
+            path.unlink()
+            raise
+    try:
+        yield
+    finally:
+        with _lock_directory(path.parent):
+            path.unlink()
+
+
+def _publish_file(part, dest, overwrite):
+    no_links(dest)
+    if overwrite:
+        os.replace(part, dest)
+    elif os.name == 'nt':
+        os.rename(part, dest)  # Windows rename fails atomically if dest exists.
+    else:
+        os.link(part, dest)  # POSIX rename would clobber a concurrent creator.
+        part.unlink()
+
+
 def download_http(url, root, route, resolver, *, filename=None, headers=None, timeout=20., connections=4,
                   min_chunk_size=256*1024, resume=True, overwrite=False, retries=5, rate_limiter=None,
                   sha256=None, md5=None, extract=False, claims=None, progress=None, report_hash=True):
     info = probe_http(url, route, resolver, headers=headers, timeout=timeout)
     dest = confined(root, filename or info.filename)
-    t = HttpTransfer(info, dest, route, resolver, headers, timeout, retries, rate_limiter, progress)
-    paths = [dest, t.part, t.meta]
+    t = HttpTransfer(info, dest, route, resolver, headers, timeout, retries, rate_limiter, progress, bool(sha256 or md5))
+    lock_path = confined(dest.parent, dest.name + '.phuket-dl.lock')
+    paths = [dest, t.part, t.meta, lock_path]
     if extract:
         paths.append(extract_dest(dest))
     (claims or OutputClaims()).reserve(paths)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.exists() and not overwrite:
-        raise FileExistsError('Destination exists; use --overwrite to replace it')
-    count = connections if info.ranges and info.total and info.total >= min_chunk_size else 1
-    t.prepare(count, resume and not overwrite)
-    try:
-        t.transfer(connections)
-    except RangeIgnored:
-        t.prepare(1, False)
-        t.transfer(1)
-    length = t.part.stat().st_size
-    if info.total is not None and info.total != length:
-        raise ValueError('Incomplete file')
-    try:
-        hashes = checksums(t.part, sha256=sha256, md5=md5, report=report_hash)
-    except ValueError:
+    with download_lock(lock_path):
+        if dest.exists() and not overwrite:
+            raise FileExistsError('Destination exists; use --overwrite to replace it')
+        count = connections if info.ranges and info.total and info.total >= min_chunk_size else 1
+        t.prepare(count, resume and not overwrite)
+        try:
+            t.transfer(connections)
+        except RangeIgnored:
+            t.info = probe_http(url, route, resolver, headers=headers, timeout=timeout)
+            t.prepare(1, False)
+            t.transfer(1)
+        length = t.part.stat().st_size
+        if t.info.total is not None and t.info.total != length:
+            raise ValueError('Incomplete file')
+        try:
+            hashes = checksums(t.part, sha256=sha256, md5=md5, report=report_hash)
+        except ValueError:
+            t.meta.unlink(missing_ok=True)
+            t.part.unlink(missing_ok=True)
+            raise
+        _publish_file(t.part, dest, overwrite)
         t.meta.unlink(missing_ok=True)
-        t.part.unlink(missing_ok=True)
-        raise
-    no_links(dest)
-    if dest.exists() and not overwrite:
-        raise FileExistsError('Destination appeared during download')
-    os.replace(t.part, dest)
-    t.meta.unlink(missing_ok=True)
-    result = {'ok': True, 'path': str(dest), 'bytes': length, **hashes}
-    if extract:
-        result['extractedTo'] = str(extract_archive(dest))
-    return result
+        result = {'ok': True, 'path': str(dest), 'bytes': length, **hashes}
+        if extract:
+            result['extractedTo'] = str(extract_archive(dest))
+        return result
 
 
 _ARCHIVES = ('.tar.gz', '.tar.bz2', '.tar.xz', '.tgz', '.zip', '.tar')
@@ -745,7 +875,7 @@ def run(args):
                 return {'ok': True, **parse_torrent(s).summary()}
             return download_torrent(s, root, route, resolver, info_only=info_only, select=args.bt_select,
                                     no_dht=args.no_dht, bootstrap=nodes, max_peers=args.max_peers,
-                                    seed_time=args.seed_time, extract=args.extract, **common)
+                                    seed_time=args.seed_time, overwrite=args.overwrite, extract=args.extract, **common)
         if args.bt_info or args.bt_select:
             raise ValueError('BitTorrent options require a .torrent file or magnet URI')
         if info_only:

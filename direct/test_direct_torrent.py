@@ -318,7 +318,8 @@ class LiveTorrentTests(LocalCLI, unittest.TestCase):
         two.write_bytes(marker)
         # First byte of piece 1 is in unselected file 0. The selected slice must not be committed.
         self.peer.bad_pieces = {1}
-        self.get('--bt-select', '1', ok=False)
+        self.get('--overwrite', '--bt-select', '1', ok=False)
+        self.assertTrue(self.peer.requests)  # The corrupt data was rejected, not a preflight collision.
         self.assertEqual(two.read_bytes(), marker)
         self.assertFalse(one.exists() or three.exists())
         self.peer.requests.clear()
@@ -330,6 +331,25 @@ class LiveTorrentTests(LocalCLI, unittest.TestCase):
         self.assertFalse(one.exists() or three.exists())
         self.peer.requests.clear()
         self.assertEqual(self.get('--bt-select', '1')['reusedPieces'], 2)
+        self.assertFalse(self.peer.requests)
+
+    def test_unowned_or_mismatched_selected_files_require_overwrite(self):
+        one, two, three = self.paths()
+        two.parent.mkdir(parents=True)
+        two.write_bytes(b'keep unrelated file')
+        self.assertIn('overwrite', self.get(ok=False)['error'])
+        self.assertFalse(one.exists() or three.exists())
+        # A successful selection grants no rights over a different file in the same torrent.
+        self.get('--bt-select', '0')
+        self.assertIn('overwrite', self.get('--bt-select', '1', ok=False)['error'])
+        self.assertEqual(two.read_bytes(), b'keep unrelated file')
+        self.assert_content(self.get('--overwrite'))
+        marker = self.out/('.phuket-bt-'+DIGEST.hex())/'.phuket-bt-state.json'
+        import json
+        state = json.loads(marker.read_bytes()); state['info_hash'] = 'wrong'
+        marker.write_text(json.dumps(state), encoding='utf-8')
+        self.peer.requests.clear()
+        self.assertIn('overwrite', self.get(ok=False)['error'])
         self.assertFalse(self.peer.requests)
 
     def test_corrupt_piece_requeued_and_optional_outbound_seed(self):
@@ -348,6 +368,33 @@ class LiveTorrentTests(LocalCLI, unittest.TestCase):
         self.assertEqual(len(first.queries), 1)
         self.assertEqual(first.queries, leaf.queries)
         self.assertEqual(len(first.queries[0]), 20)
+
+    def test_tracker_magnet_uses_only_tracker_peers_until_metadata_is_known(self):
+        from unittest.mock import patch
+        private = bt.bencode({**INFO, b'private': 1})
+        digest = hashlib.sha1(private).hexdigest()
+        magnet = 'magnet:?'+urlencode(dict(xt='urn:btih:'+digest, tr=self.url))
+        tracker_peer = [('127.0.0.1', 1001)]
+        with patch.object(bt, 'tracker_peers', return_value=tracker_peer), patch.object(bt, 'dht_peers') as dht, \
+                patch.object(bt, 'fetch_metadata', return_value=private) as fetch, \
+                patch.object(bt, 'transfer_pieces', side_effect=OSError('fixture stop')) as pieces:
+            with self.assertRaisesRegex(OSError, 'fixture stop'):
+                bt.download_torrent(magnet, self.out, None, None)
+            self.assertEqual(fetch.call_args.args[0], tracker_peer)
+            self.assertEqual(pieces.call_args.args[2], tracker_peer)
+            dht.assert_not_called()
+        # Verified private metadata may be cached. A trackerless magnet still cannot use DHT for payload.
+        with patch.object(bt, 'dht_peers') as dht, self.assertRaisesRegex(ValueError, 'Private magnet'):
+            bt.download_torrent(magnet.split('&tr=')[0], self.out, None, None)
+        dht.assert_not_called()
+
+    def test_trackerless_public_magnet_still_uses_explicit_dht_bootstrap(self):
+        leaf = self.server(socketserver.UDPServer, DhtNode)
+        leaf.response, leaf.queries = {b'values': [addr(self.peer.server_address[1])]}, []
+        self.assert_content(self.cli('--dht-bootstrap', f'{HOST}:{leaf.server_address[1]}', '--retries', '0',
+                                     'magnet:?xt=urn:btih:'+DIGEST.hex()))
+        self.assertEqual(len(leaf.queries), 1)
+        self.assertFalse(self.tracker.announces)
 
     def test_http_tracker_dictionary_and_ipv6(self):
         self.tracker.dictionary = True

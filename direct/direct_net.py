@@ -227,6 +227,11 @@ def _tls_context():
     return ctx
 
 
+class RouteConnectError(OSError):
+    """All candidate connections failed before an HTTP request could be sent."""
+    route_connect_failed = True
+
+
 class DirectHTTPConnection(http.client.HTTPConnection):
     def __init__(self, host, port, *, route, resolver, timeout):
         super().__init__(host, port, timeout=timeout)
@@ -235,6 +240,7 @@ class DirectHTTPConnection(http.client.HTTPConnection):
     def connect(self):
         candidates = self.resolver(self.host, self.port)
         deadline = time.monotonic() + self.timeout
+        last_error = None
         for i, ip in enumerate(candidates):
             left = deadline - time.monotonic()
             if left <= 0:
@@ -243,9 +249,11 @@ class DirectHTTPConnection(http.client.HTTPConnection):
                 self.sock = self.route.connect(ip, self.port, min(left, max(1, left / (len(candidates) - i))))
                 self.sock.settimeout(self.timeout)
                 return
-            except OSError:
-                continue
-        raise OSError('Cannot connect to the configured API using the selected route.')
+            except OSError as exc:
+                last_error = exc
+        if last_error is not None:
+            raise RouteConnectError(last_error.errno, f'Selected route could not connect: {last_error}') from last_error
+        raise OSError('No reachable address for the configured API on the selected route.')
 
 
 class DirectHTTPSConnection(DirectHTTPConnection):
@@ -283,12 +291,19 @@ def direct_http_request(url, method="GET", headers=None, body=None, timeout=15.0
     target = quote(u.path or '/', safe="/:!$&'()*+,;=@%[]~")
     if u.query:
         target += '?' + quote(u.query, safe="/:!$&'()*+,;=@%[]~?")
+    connected = False
     try:
+        conn.connect()
+        connected = True
         conn.request(method, target, body=body, headers=headers)
         with conn.getresponse() as response:
             data = response.read(32 * 1024 * 1024 + 1)
             if len(data) > 32 * 1024 * 1024:
                 raise ValueError('Upstream response too large.')
             return response.status, dict(response.getheaders()), data
+    except OSError as exc:
+        if connected:
+            exc.route_request_started = True  # A POST may have already reached the upstream.
+        raise
     finally:
         conn.close()

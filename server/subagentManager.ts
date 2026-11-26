@@ -110,7 +110,7 @@ function planFor(db: SwitchDb, req: ApplySubagentRequest, c: StoredConfig, previ
   const python = detectPython(c.pythonPath);
   if (!preview && !python.meetsMinimum) throw bad(python.error!);
   const plan = installPlan(req.targets, c, python.executable ?? 'python', fs.readFileSync(bundledScript(), 'utf8'), db.state('directBypass'), db.state('directDownload'));
-  checkUserKeyDestinations(c, plan);
+  if (useUserEnv(c)) checkUserKeyDestinations(c.baseUrl, plan, !!c.apiKey);
   return plan;
 }
 export async function previewSubagent(db: SwitchDb, phuket: PhuketClient, req: ApplySubagentRequest): Promise<SubagentDiffPreview> {

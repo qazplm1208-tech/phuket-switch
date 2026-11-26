@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { adaptiveFetch } from './upstreamTransport.js';
+import { adaptiveFetch, isPreDeliveryNetworkError } from './upstreamTransport.js';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import express from 'express';
@@ -114,7 +114,8 @@ export class ProxyServer {
   }
   takeover(appType: AppType, enable: boolean, fast?: GptFastConfig): Promise<ProxyTakeoverResult> {
     return this.exclusive(async () => {
-      const status = this.getStatus(), originals = this.db.state('proxyOriginalConfigs');
+      const status = this.getStatus();
+      let undo: { providerId: string; backupId: string | null } | undefined;
       let system = notApplied() as ProxyTakeoverResult['system'];
       if (status.takeover[appType] === enable) {
         // A one-click menu refresh must use the existing proxy URL and preserve its original undo snapshot.
@@ -127,17 +128,19 @@ export class ProxyServer {
       if (enable) {
         const p = this.db.current(appType); if (!p) throw conflict('Select a current provider before enabling takeover.');
         await this.listen();
-        system = applyProvider(this.db, p, { fast, proxyRoot: this.getStatus().baseUrl!, takeover: true });
-        originals[appType] = { providerId: p.id, backupId: system.backupId };
+        system = applyProvider(this.db, p, { fast, proxyRoot: this.getStatus().baseUrl!, takeover: 'enable' });
+        undo = { providerId: p.id, backupId: system.backupId };
       } else {
-        const original = originals[appType];
-        const current = this.db.current(appType);
-        if (original?.backupId) system = current && current.id !== original.providerId
-          ? applyProvider(this.db, current) // A different provider was selected during takeover.
-          : restoreBackup(this.db, original.backupId, current);
-        delete originals[appType];
+        const original = this.db.state('proxyOriginalConfigs')[appType], current = this.db.current(appType);
+        if (current) system = applyProvider(this.db, current, { takeover: 'disable' });
+        else if (original?.backupId) system = restoreBackup(this.db, original.backupId);
       }
-      this.db.transaction(() => { this.db.setState('proxyOriginalConfigs', originals); this.db.setState('proxyTakeover', { ...status.takeover, [appType]: enable }); });
+      this.db.transaction(() => {
+        const originals = this.db.state('proxyOriginalConfigs');
+        if (undo) originals[appType] = undo; else delete originals[appType];
+        this.db.setState('proxyOriginalConfigs', originals);
+        this.db.setState('proxyTakeover', { ...this.db.state('proxyTakeover'), [appType]: enable });
+      });
       return { proxy: this.getStatus(), system };
     });
   }
@@ -197,7 +200,7 @@ export class ProxyServer {
       } else {
         const astraModels = astraDedicatedModels(astraDedicated);
         localNames.push(...[...active.flatMap(p => providerModelNames(p)), ...astraModels, ...rules.filter(r => r.enabled && r.sourceModel !== '*').map(r => r.sourceModel)].filter(m => !parseVirtualSpeedModel(m).forcedMode));
-        if (currentCodex && this.db.state('proxyTakeover').codex && globalFast.catalogSpeedVariants !== false && codexFast.catalogSpeedVariants !== false) {
+        if (currentCodex && this.db.state('proxyTakeover').codex && codexFast.catalogSpeedVariants !== false) {
           const normal = providerModelNames(currentCodex), routed = new Set(enabled.map(r => r.sourceModel));
           const menu = speedMenuModels([...(normal.length ? normal : fallbackCodexModels), ...astraModels], true, dedicated);
           localNames.push(...menu.filter(row => row.mode && !routed.has(row.baseModel)).map(row => row.slug));
@@ -267,8 +270,8 @@ export class ProxyServer {
           log.effectiveModel = modelOnPath ?? (body.model || baseModel); log.serviceTier = ['default','auto','priority','fast','ultrafast','flex'].includes(body.service_tier) ? body.service_tier as ServiceTier : undefined;
           let upstream: Response;
           try { upstream = await adaptiveFetch(url, { method: req.method, headers, body: req.method === 'GET' ? undefined : JSON.stringify(body), signal, redirect: 'error' }); }
-          catch {
-            if (!signal.aborted && i + 1 < list.length) break;
+          catch (err) {
+            if (!signal.aborted && i + 1 < list.length && (req.method === 'GET' || req.method === 'HEAD' || isPreDeliveryNetworkError(err))) break;
             if (discovery && localNames.length && !disconnected.signal.aborted) { log.statusCode = 200; res.json(modelList(localNames)); return; }
             throw new ApiError(502, 'UPSTREAM_ERROR', 'Unable to reach the provider.');
           }

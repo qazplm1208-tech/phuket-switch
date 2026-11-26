@@ -32,6 +32,38 @@ def emit(data):
     print(json.dumps(data, ensure_ascii=True, separators=(',', ':')), flush=True)
 
 
+IDLE_TIMEOUT = 300.
+WRITE_TIMEOUT = 60.
+DRAIN_TIMEOUT = 15.
+
+
+def _relay(client, upstream):
+    peers = {client: upstream, upstream: client}
+    drain_deadline = None
+    while peers:
+        wait = IDLE_TIMEOUT if drain_deadline is None else drain_deadline - time.monotonic()
+        if wait <= 0:
+            return
+        ready, _, _ = select.select(list(peers), [], [], wait)
+        if not ready:
+            return
+        for reader in ready:
+            data = reader.recv(65536)
+            if not data:
+                peers.pop(reader).shutdown(socket.SHUT_WR)
+                if drain_deadline is None:
+                    drain_deadline = time.monotonic() + DRAIN_TIMEOUT
+                continue
+            send_timeout = WRITE_TIMEOUT
+            if drain_deadline is not None:
+                send_timeout = min(send_timeout, drain_deadline - time.monotonic())
+                if send_timeout <= 0:
+                    return
+            writer = peers[reader]
+            writer.settimeout(send_timeout)
+            writer.sendall(data)
+
+
 def bridge_server(route, resolver, token, allowed, timeout):
     expected = b'Basic ' + base64.b64encode(('bridge:' + token).encode())
 
@@ -96,21 +128,15 @@ def bridge_server(route, resolver, token, allowed, timeout):
             except (OSError, ValueError):
                 return self.reject(502)
             with upstream:
-                self.wfile.write(b'HTTP/1.1 200 Connection Established\r\n\r\n')
-                self.connection.settimeout(None)
-                upstream.settimeout(None)
-                peers = {self.connection: upstream, upstream: self.connection}
+                if not self.server.track(upstream):
+                    return  # Shutdown raced with route discovery or connect.
                 try:
-                    while peers:
-                        ready, _, _ = select.select(list(peers), [], [])
-                        for reader in ready:
-                            data = reader.recv(65536)
-                            if data:
-                                peers[reader].sendall(data)
-                            else:
-                                peers.pop(reader).shutdown(socket.SHUT_WR)
+                    self.wfile.write(b'HTTP/1.1 200 Connection Established\r\n\r\n')
+                    _relay(self.connection, upstream)
                 except OSError:
-                    return  # A peer aborted; closing the other side also cancels its stream.
+                    pass  # Closing either end also cancels a blocked stream.
+                finally:
+                    self.server.untrack(upstream)
 
     class Server(ThreadingHTTPServer):
         daemon_threads = True
@@ -118,27 +144,42 @@ def bridge_server(route, resolver, token, allowed, timeout):
         def __init__(self, *args):
             self.clients = set()
             self.clients_lock = threading.Lock()
+            self.closing = False
             super().__init__(*args)
+
+        def track(self, sock):
+            with self.clients_lock:
+                if self.closing:
+                    return False
+                self.clients.add(sock)
+                return True
+
+        def untrack(self, sock):
+            with self.clients_lock:
+                self.clients.discard(sock)
 
         def get_request(self):
             sock, addr = super().get_request()
-            with self.clients_lock:
-                self.clients.add(sock)
+            if not self.track(sock):
+                sock.close()
+                raise OSError('Bridge is closing')
             return sock, addr
 
         def close_request(self, request):
-            with self.clients_lock:
-                self.clients.discard(request)
+            self.untrack(request)
             super().close_request(request)
 
         def server_close(self):
-            # A process exit alone resets active TCP streams on Windows. Signal EOF first.
+            # Shutdown wakes blocked readers and writers before releasing both handles.
             with self.clients_lock:
-                for sock in self.clients:
-                    try:
-                        sock.shutdown(socket.SHUT_RDWR)
-                    except OSError:
-                        pass
+                self.closing = True
+                active, self.clients = self.clients, set()
+            for sock in active:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                sock.close()
             super().server_close()
 
         def handle_error(self, request, client_address):

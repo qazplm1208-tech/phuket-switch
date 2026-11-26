@@ -5,7 +5,9 @@ import { googleCliPlan, readGoogleCliState, redactEnvFile } from './geminiConfig
 import type { AppType, ConfigDiffPreview, GptFastConfig, LiveCliState, ModelRouteRule, Provider, ProxyStatus, SystemApplyResult } from '../shared/types.js';
 import { apps, type SwitchDb } from './db.js';
 import { conflict, isRecord, normalizeV1Base, notApplied, now, own, redactRecognizable, secretField, stripV1, stripV1Beta } from './common.js';
-import { CLAUDE_DESKTOP_PROFILE_ID, CLAUDE_DESKTOP_PROFILE_NAME, cliPaths, commitFiles, desktopConfigText, jsonText, parseJson, restoreBackup as restoreFiles, textFile, type Plan } from './configFiles.js';
+import { CLAUDE_DESKTOP_PROFILE_ID, CLAUDE_DESKTOP_PROFILE_NAME, cliPaths, commitFiles, desktopConfigText, jsonText, parseJson, readBackupPlan, textFile, type Plan } from './configFiles.js';
+import { checkUserKeyDestinations, planTouchesMcp } from './subagentHarnesses.js';
+import { readAstraUserEnvKey } from './subagentEnvironment.js';
 import { astraDedicatedModels, codexConfigTier, effectiveSpeedMode, fallbackCodexModels as fallbackModels, fastModel, missingUltraFastMessage, parseVirtualSpeedModel, resolveAstraOnlyProvider, resolveUltraFastProvider, speedMenuModels } from './fastMode.js';
 import { parseToml, redactToml, replaceTomlSubtree, updateTomlFields } from './surgicalToml.js';
 
@@ -175,19 +177,38 @@ export const clearCodexCatalogRoutes = (db: SwitchDb) => writeCatalogRoutes(db, 
 function hasInteractiveAuth(doc: Record<string, any>) {
   return doc.auth_mode === 'chatgpt' || doc.auth_mode === 'personal_access_token' || isRecord(doc.tokens) || typeof doc.access_token === 'string';
 }
-export function restoreBackup(db: SwitchDb, id: string, directProvider?: Provider | null): SystemApplyResult {
-  const authPath = cliPaths().auth;
-  if (db.backups(id)[0]?.files.includes(authPath)) {
+export function restoreBackup(db: SwitchDb, id: string): SystemApplyResult {
+  const { plan, entry } = readBackupPlan(db, id), authPath = cliPaths().auth;
+  const sub = plan.subagent;
+  if (process.platform === 'win32' && (sub?.userKey !== undefined || planTouchesMcp(plan))) {
+    // A snapshot can restore a user key, or just restore an MCP entry that inherits the current one.
+    const writesKey = sub?.userKey !== undefined, key = writesKey ? sub.userKey : readAstraUserEnvKey();
+    if (key) {
+      const source = writesKey ? sub.config : db.state('subagent');
+      const bound = source.apiKey === key || (!source.apiKey && source.keySource === 'user-env');
+      checkUserKeyDestinations(bound ? source.baseUrl : null, plan, writesKey);
+    }
+  }
+  if (plan.has(authPath)) {
     const text = textFile(authPath);
     let auth: Record<string, any> | undefined;
     try { auth = parseJson(text); } catch { /* Malformed auth can still be repaired from a backup. */ }
-    if (auth && hasInteractiveAuth(auth)) {
-      // Desktop may have signed in *after* an API-key-only takeover snapshot was created.
-      if (directProvider?.appType === 'codex') return { ...applyProvider(db, directProvider), warnings: ['已保留当前 Codex 登录状态，并重新应用直连配置。'] };
-      throw conflict('备份包含 auth.json。为保留当前 Codex 登录状态，未恢复此备份。');
-    }
+    if (auth && hasInteractiveAuth(auth)) throw conflict('备份包含 auth.json。为保留当前 Codex 登录状态，未恢复此备份。');
   }
-  return restoreFiles(db, id);
+  const result = commitFiles(db, entry.appType, `Restore ${id}`, plan, { forceSnapshot: true });
+  const takeover = db.state('proxyTakeover'), originals = db.state('proxyOriginalConfigs'), settings = db.state('proxySettings');
+  const active = apps.filter(app => takeover[app] && app !== 'gpt-native');
+  if (active.length) {
+    let changed = false;
+    for (const live of getLiveCliStates(db.providers(), undefined, active)) {
+      const app = live.appType;
+      const original = originals[app]?.backupId === id;
+      if (!original && (!live.configPaths.some(file => plan.has(file)) || usesProxyEndpoint(app, live.baseUrl, settings))) continue;
+      takeover[app] = false; delete originals[app]; changed = true;
+    }
+    if (changed) db.transaction(() => { db.setState('proxyOriginalConfigs', originals); db.setState('proxyTakeover', takeover); });
+  }
+  return result;
 }
 export function providerPlan(p: Provider, fast: GptFastConfig, proxyRoot?: string, routes: ModelRouteRule[] = [], previousRouteSlugs: string[] = [], { ultraFastProvider, astraOnlyProvider }: DedicatedProviders = {}, includeRoutedModels = false, agyBindings: Record<string, string> = {}): Plan {
   const f = cliPaths();
@@ -225,10 +246,13 @@ function planForProvider(db: SwitchDb, p: Provider, fast: GptFastConfig, proxyRo
   const dedicated = p.appType === 'codex' ? dedicatedProviders(db, p, fast) : undefined;
   return providerPlan(p, fast, proxyRoot, db.state('modelRoutes'), db.state('codexCatalogRouteSlugs'), dedicated, db.state('codexIncludeRoutedModels'), p.appType === 'antigravity' ? db.state('antigravityModelBindings') : {});
 }
-export function applyProvider(db: SwitchDb, p: Provider, options: { fast?: GptFastConfig; proxyRoot?: string; takeover?: boolean } = {}): SystemApplyResult {
+export function applyProvider(db: SwitchDb, p: Provider, options: { fast?: GptFastConfig; proxyRoot?: string; takeover?: 'enable' | 'disable' } = {}): SystemApplyResult {
   const plan = planForProvider(db, p, options.fast ?? p.codexFastConfig ?? db.state('fastMode'), options.proxyRoot);
   if (!plan.size) return { ...notApplied(), warnings: [virtualWarning] };
-  const result = commitFiles(db, p.appType, options.takeover ? 'Enable proxy takeover' : 'Apply provider configuration', plan, options.takeover);
+  const reason = options.takeover === 'enable' ? 'Enable proxy takeover' : options.takeover === 'disable' ? 'Disable proxy takeover' : 'Apply provider configuration';
+  const result = commitFiles(db, p.appType, reason, plan, {
+    forceSnapshot: options.takeover !== undefined, createBackup: db.state('settings').backupBeforeSwitch,
+  });
   if (p.appType === 'codex') db.setState('codexCatalogRouteSlugs', options.proxyRoot && db.state('codexIncludeRoutedModels') ? routeSlugs(db.state('modelRoutes')) : []);
   return result;
 }
@@ -249,9 +273,15 @@ export function previewProviderDiff(db: SwitchDb, p: Provider, proxyRoot?: strin
   }
   return { appType: p.appType, providerId: p.id, files: [...plan].map(([file, after]) => ({ path: file, before: safe(file, textFile(file)), after: safe(file, after as string) })), warnings: plan.size ? [] : [virtualWarning] };
 }
-export function getLiveCliStates(providers: Provider[], proxy?: ProxyStatus): LiveCliState[] {
+function usesProxyEndpoint(app: AppType, baseUrl: string | null, settings: ProxyStatus['settings']) {
+  if (!baseUrl) return false;
+  const google = app === 'gemini' || app === 'antigravity';
+  const root = `http://${settings.host}:${settings.port}${google || app === 'claude-desktop' ? `/${app}` : ''}`;
+  return URL.parse((google ? stripV1Beta : stripV1)(baseUrl))?.href === new URL(root).href;
+}
+export function getLiveCliStates(providers: Provider[], proxy?: ProxyStatus, appTypes: readonly AppType[] = apps): LiveCliState[] {
   const f = cliPaths();
-  return apps.map(appType => {
+  return appTypes.map(appType => {
     const paths = { gemini: [f.geminiEnv, f.geminiSettings], antigravity: [f.antigravitySettings], claude: [f.claude], codex: [f.codex, f.auth], 'claude-desktop': [f.claudeDesktopMeta, f.claudeDesktopProfile], 'gpt-native': [] }[appType];
     const current = providers.find(p => p.appType === appType && p.isCurrent);
     const s: LiveCliState = { appType, detected: paths.some(file => fs.existsSync(file)), configPaths: paths, providerId: null, baseUrl: null, model: null, checkedAt: now(), warnings: [] };
@@ -283,7 +313,7 @@ export function getLiveCliStates(providers: Provider[], proxy?: ProxyStatus): Li
       if (s.baseUrl) {
         const desktop = appType === 'claude-desktop', google = appType === 'gemini' || appType === 'antigravity';
         const normalize = google ? stripV1Beta : stripV1;
-        const managed = proxy?.takeover[appType] && normalize(s.baseUrl) === `http://${proxy.settings.host}:${proxy.settings.port}${desktop || google ? `/${appType}` : ''}`;
+        const managed = proxy?.takeover[appType] && usesProxyEndpoint(appType, s.baseUrl, proxy.settings);
         const endpoint = desktop || google ? URL.parse(s.baseUrl) : null;
         const matches = providers.filter(p => p.appType === appType && normalize(p.baseUrl) === normalize(s.baseUrl!) && (!key || key === p.apiKey));
         if (managed && (!(desktop || google) || proxy.running)) s.providerId = current?.id ?? null;

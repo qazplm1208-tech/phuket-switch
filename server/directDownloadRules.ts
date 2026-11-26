@@ -22,7 +22,8 @@ function literal(s: string) {
   if (process.platform === 'win32') return '"'+s.replace(/["`$\u2018-\u201e]/g, c => '`'+c)+'"';
   return '"'+s.replace(/["`$\\]/g, c => '\\'+c)+'"';
 }
-export function renderDirectDownloadRule(config: DirectDownloadConfig, paths: { script: string }, effectiveBypass: DownloadRoute) {
+export function renderDirectDownloadRule(config: DirectDownloadConfig, paths: { script: string }, effectiveBypass: DownloadRoute, executable?: string | null) {
+  const python = executable ? (process.platform === 'win32' ? '& ' : '') + literal(executable) : 'python';
   const args = [...downloadRouteArgs(effectiveBypass), '-c', String(config.connections), '--retries', String(config.retries),
     ...(config.maxRate ? ['--max-rate', config.maxRate] : []), ...(config.resume ? [] : ['--no-resume'])];
   const flags = args.map(a => a.startsWith('--interface=') ? '--interface='+literal(a.slice('--interface='.length)) : a).join(' ');
@@ -32,7 +33,7 @@ export function renderDirectDownloadRule(config: DirectDownloadConfig, paths: { 
       : 'Use the system route without app proxies. OS routing, including VPN/TUN, still applies.', '',
     'Keep the configured flags. Replace URL and the output directory with the actual values:',
     '```'+(process.platform === 'win32' ? 'powershell' : 'sh'),
-    `python -u ${literal(paths.script)} ${flags} -d "downloads" --json "URL"`, '```', '',
+    `${python} -u ${literal(paths.script)} ${flags} -d "downloads" --json "URL"`, '```', '',
     '- Inspect first: `--info --json` (no payload file).',
     '- Resume is on by default; `--no-resume` restarts. `-c N` sets parallel HTTP connections.',
     '- Batch: `-i urls.txt -j 3 -d "downloads"` (one URL per line).',

@@ -75,18 +75,19 @@ function Editor({ status, replace, stale, loading, reload, groups, keys }: { sta
   function action(id: string, work: () => Promise<void>) { void run(id, async () => {
     setFailure(''); try { await work(); } catch (e) { if (alive.current) { const message = actionError(e); setFailure(message); notify('操作未完成', message, true); } }
   }); }
-  function accept(out: ApplySubagentResult, deploy: boolean) {
+  function accept(out: ApplySubagentResult, removed?: SubagentHarnessId[]) {
     s.overview.reload(); s.backups.reload(); if (!alive.current) return;
     replace(out.status); if (logged) keys.reload(); setResult(null); setPreview(null); setSnippet(null);
-    if (deploy) { clearSecret(); setEdited(null); }
-    notify(deploy ? '已部署子代理' : '已移除子代理配置', systemNote(out.system));
+    if (removed) setEdited(draft => draft && { ...draft, targets: draft.targets.filter(id => !removed.includes(id)) });
+    else { clearSecret(); setEdited(null); }
+    notify(removed ? '已移除子代理配置' : '已部署子代理', systemNote(out.system));
   }
-  function apply(request: ApplySubagentRequest) { action('apply', async () => accept(await api.applySubagent(request), true)); }
+  function apply(request: ApplySubagentRequest) { action('apply', async () => accept(await api.applySubagent(request))); }
   function remove(ids: SubagentHarnessId[]) {
     const names = status.harnesses.filter(h => ids.includes(h.id)).map(h => harnessName(h.id, h.name));
     action('remove', async () => {
       if (!(await confirm('移除子代理配置？', `将移除 ${names.join('、')} 的子代理配置及分工规则，并备份受影响的文件。`, '确认移除')) || !alive.current) return;
-      accept(await api.removeSubagent({ targets: ids, removeRules: true }), false);
+      accept(await api.removeSubagent({ targets: ids, removeRules: true }), ids);
     });
   }
   return <div className="subagent-view stack">

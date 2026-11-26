@@ -1,6 +1,6 @@
 # Phuket Switch
 
-**v1.1.2 · Windows x64**　[下载正式版](https://github.com/qazplm1208-tech/phuket-switch/releases/latest) · [更新日志](CHANGELOG.md) · [本地 API](shared/api-contract.md)
+**v1.1.3 · Windows x64**　[下载正式版](https://github.com/qazplm1208-tech/phuket-switch/releases/latest) · [更新日志](CHANGELOG.md) · [本地 API](shared/api-contract.md)
 
 Phuket Switch 是面向 [PhuketAI](https://ai.pukitcore.com) 的 Windows 桌面工作台。在本机管理供应商、切换客户端、接管代理、检查分组额度与渠道状态；也可为不同工具配置自己的兼容端点。桌面应用版本与内置 Astra MCP 服务版本分别维护。
 
@@ -10,8 +10,8 @@ Phuket Switch 是面向 [PhuketAI](https://ai.pukitcore.com) 的 Windows 桌面�
 
 | 发行包 | 首次使用 | 之后怎样更新 |
 | --- | --- | --- |
-| `Phuket.Switch.Setup.1.1.2.exe`（NSIS 安装版） | 运行安装向导，选择目录，使用开始菜单或桌面快捷方式启动 | 在「扩展与设置 → 偏好设置 → 软件更新」检查并下载。下载完成后可确认重启安装，也可留待下次正常退出时安装。 |
-| `Phuket.Switch.1.1.2.exe`（便携版） | 将单文件放到可写目录，直接运行，无需安装 | 同一面板会显示新版说明和下载入口。下载后退出旧程序，再手动替换；不会自动覆盖运行中的文件。 |
+| `Phuket.Switch.Setup.1.1.3.exe`（NSIS 安装版） | 运行安装向导，选择目录，使用开始菜单或桌面快捷方式启动 | 在「扩展与设置 → 偏好设置 → 软件更新」检查并下载。下载完成后可确认重启安装，也可留待下次正常退出时安装。 |
+| `Phuket.Switch.1.1.3.exe`（便携版） | 将单文件放到可写目录，直接运行，无需安装 | 同一面板会显示新版说明和下载入口。下载后退出旧程序，再手动替换；不会自动覆盖运行中的文件。 |
 
 桌面版自带 Electron 和后端。子代理、物理网卡直连和 AI 下载脚本需要 Python 3.10+；仅让桌面后端跳过系统代理不需要 Python。便携指程序免安装，业务数据默认仍在当前用户的 `~/.phuket-switch/`。首次运行可在「供应商」添加兼容端点，或先登录 PhuketAI 选择分组密钥；预览 Diff 后再决定是否写入客户端。关闭窗口会收起到托盘，**退出 Phuket Switch** 才会关闭自有后台。
 
@@ -74,4 +74,4 @@ node scripts/smoke-subagent-ui.mjs
 
 本地打包使用 `npm.cmd run dist:win`（`--publish never`，无需 `GH_TOKEN`）。`release/` 下应有两个 `.exe`、安装包的 `.blockmap` 和 `latest.yml`；`win-unpacked/resources/app-update.yml` 是内嵌更新源配置，不是需要单独上传的安装包。
 
-维护者发版时同步 `package.json`、锁文件、`shared/constants.ts` 中的版本与变更记录，验证后推送对应的稳定标签（如 `v1.1.2`）。[发布工作流](.github/workflows/release.yml) 检查标签、运行测试，并用 `npm run dist:win` 打包，再用 `gh release` 将四个文件发布到该标签的同一个 GitHub Release；也可对已有标签手动运行。不要把发布令牌写入应用或配置文件。
+维护者发版时同步 `package.json`、锁文件、`shared/constants.ts` 中的版本与变更记录，验证后推送对应的稳定标签（如 `v1.1.3`）。[发布工作流](.github/workflows/release.yml) 检查标签、运行测试，并用 `npm run dist:win` 打包，再用 `gh release` 将四个文件发布到该标签的同一个 GitHub Release；也可对已有标签手动运行。不要把发布令牌写入应用或配置文件。

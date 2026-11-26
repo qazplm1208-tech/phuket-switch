@@ -33,6 +33,7 @@ export default function SoftwareUpdates() {
           change={() => void run('save', () => s.saveSettings({ autoCheckUpdates: !auto }))} />
       </div>
     </div>
+    <small>软件更新检查与下载使用 Electron / 系统网络，不受后端「网络直连」设置影响。</small>
     {!desktop?.updater && <small>浏览器模式请前往 GitHub Releases 查看最新版本。</small>}
     {u?.status === 'not-available' && <p role="status">当前已是最新版本 <small>上次检查：{time(u.checkedAt, true)}</small></p>}
     {u?.status === 'available' && <div className="update-result">

@@ -7,6 +7,7 @@ import { api } from '../api/client';
 import { ms, num, systemNote } from '../lib/display';
 import { copyText, useAction, useFeedback } from '../lib/feedback';
 import { useResource } from '../lib/resource';
+import { useStudio } from '../lib/studio';
 import { DiffPane } from './DiffPreviewModal';
 import { Badge, Btn, Choices, Disclosure, Field, IconBtn, Modal, Notice, Section, Skeleton, Toggle } from './ui';
 
@@ -84,7 +85,7 @@ export default function DirectDownloadPanel() {
   const { notify, confirm } = useFeedback(), { pending, run } = useAction();
   const [draft, setDraft] = useState<Form | null>(null), form = draft ?? (status && savedForm(status));
   const physical = form?.mode === 'physical-nic';
-  const network = useResource(physical ? 'download-adapters' : null, api.directBypass);
+  const network = useStudio().directBypassResource;
   const [diff, setDiff] = useState<DirectDownloadDiffPreview | null>(null), [ruleDraft, setRuleDraft] = useState<string | null>(null);
   const [probeUrl, setProbeUrl] = useState(''), [result, setResult] = useState<DirectDownloadTestResult | null>(null);
   if (!status || !form) return r.error ? <Notice retry={r.reload}>{r.error}</Notice> : <Skeleton rows={3} />;
@@ -94,6 +95,7 @@ export default function DirectDownloadPanel() {
   const missing = [...new Set([status.config.interfaceName, form.interfaceName, network.data?.config.interfaceName])]
     .filter((name): name is string => !!name && !adapters.some(a => a.name === name));
   const injected = directDownloadTargets.filter(id => liveTargets[id].injected);
+  const selectedInjected = injected.filter(id => form.targets.includes(id));
   const numericIssue = !inRange(form.connections, 1, 16) ? '并行连接数须为 1 至 16 的整数。'
     : !inRange(form.retries, 0, 20) ? '重试次数须为 0 至 20 的整数。' : '';
   const canPreview = !busy && !numericIssue && form.targets.length > 0;
@@ -112,11 +114,11 @@ export default function DirectDownloadPanel() {
     const out = await api.applyDirectDownload(body);
     acceptStatus(out.status); notify('已写入脚本与规则', systemNote(out.system));
   });
-  const remove = () => void run('remove', async () => {
-    const names = injected.map(id => liveTargets[id].name).join('、');
-    if (!await confirm('移除规则与脚本？', `仅从 ${names} 移除下载器标记区块，保留其他规则。没有客户端再使用时会删除共享脚本，不影响已下载的文件。`, '确认移除')) return;
-    const out = await api.removeDirectDownload({ targets: injected, removeScripts: true });
-    acceptStatus(out.status); notify('已移除下载器规则与脚本', systemNote(out.system));
+  const remove = (targets: Form['targets'], action: 'remove' | 'remove-all') => void run(action, async () => {
+    const names = targets.map(id => liveTargets[id].name).join('、');
+    if (!await confirm('移除下载器规则？', `仅从 ${names} 移除下载器标记区块，保留其他规则。没有客户端再使用时会删除共享脚本，不影响已下载的文件。`, '确认移除')) return;
+    const out = await api.removeDirectDownload({ targets, removeScripts: true });
+    acceptStatus(out.status); notify(out.status.scriptInstalled ? '已移除下载器规则，保留共享脚本' : '已移除下载器规则与脚本', systemNote(out.system));
   });
   const test = () => void run('test', async () => {
     setResult(null); setResult(await api.testDirectDownload({ url: probeUrl.trim() || undefined }));
@@ -181,7 +183,8 @@ export default function DirectDownloadPanel() {
     <div className="actions">
       <Btn icon={FileDiff} disabled={!canPreview} busy={pending === 'preview'} onClick={preview}>预览变更</Btn>
       <Btn kind="primary" icon={Save} disabled={!canApply} busy={pending === 'apply'} onClick={apply}>写入脚本与规则</Btn>
-      <Btn kind="ghost" className="danger-hover" icon={Trash2} disabled={busy || !injected.length} busy={pending === 'remove'} onClick={remove}>移除规则与脚本</Btn>
+      <Btn icon={Trash2} disabled={busy || !selectedInjected.length} busy={pending === 'remove'} onClick={() => remove(selectedInjected, 'remove')}>移除所选</Btn>
+      {!!injected.length && <Btn kind="ghost" className="danger-hover" disabled={busy} busy={pending === 'remove-all'} onClick={() => remove(injected, 'remove-all')}>移除全部</Btn>}
     </div>
     <Disclosure title="AI 规则预览（可一键复制给 Cursor / Claude Desktop 等工具）">
       <div className="spread"><small>{ruleDraft ? '当前草稿' : draft ? '已保存的默认值；预览变更后显示当前草稿。' : '当前保存的默认值'}</small>

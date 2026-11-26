@@ -53,6 +53,10 @@ function useStudioState() {
   const providers = useResource('providers', (s) => api.providers(undefined, s));
   const fastResource = useResource('fast', api.fastMode);
   const proxyResource = useResource('proxy', api.proxy);
+  const directBypassResource = useResource(
+    path === '/proxy' || (path === '/extensions' && (tab === 'preferences' || tab === 'direct-download')) ? 'direct-bypass' : null,
+    api.directBypass,
+  );
   const sessionBase = auth.data ?? overview.data?.phuket ?? null;
   const identity = `${epoch}:${sessionBase?.authenticated ? (sessionBase.account?.id ?? 'account') : 'guest'}`;
   const account = useResource(sessionBase?.authenticated ? 'account:' + identity : null, api.account);
@@ -176,7 +180,7 @@ function useStudioState() {
     usage.reload();
   }
   function refreshAll() {
-    [overview, prefs, auth, account, providers, fastResource, proxyResource, usage].forEach((r) =>
+    [overview, prefs, auth, account, providers, fastResource, proxyResource, directBypassResource, usage].forEach((r) =>
       r.reload(),
     );
   }
@@ -200,6 +204,7 @@ function useStudioState() {
     usage,
     proxy,
     proxyResource,
+    directBypassResource,
     fast,
     fastResource,
     fastReady: !!storedFast,

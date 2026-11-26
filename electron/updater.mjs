@@ -47,11 +47,11 @@ const messages = {
 const timestamp = () => new Date().toISOString();
 const positive = n => Number.isFinite(n) && n > 0 ? n : 0;
 
-export function createUpdater({ app, net, request, notify, prepareQuit, currentVersion, owner, repo, nativeUpdater }) {
+export function createUpdater({ app, net, request, notify, prepareQuit, showInstallError, currentVersion, owner, repo, nativeUpdater }) {
   const mode = !app.isPackaged ? 'dev' : process.env.PORTABLE_EXECUTABLE_DIR ? 'portable' : 'nsis';
   const repoUrl = `https://github.com/${owner}/${repo}`;
   const initial = { mode, currentVersion, status: 'idle' };
-  let state = initial, checking = false, quiet = false, installing = false, timer;
+  let state = initial, checking = false, quiet = false, installing = false, installErrorReported = false, timer;
   // Access the CJS getter only in installed builds: it constructs a native updater immediately.
   const { autoUpdater } = mode === 'nsis' ? (nativeUpdater ? { autoUpdater: nativeUpdater } : pkg) : {};
   function publish(next) { state = { ...initial, ...next }; notify('updater:state', state); return state; }
@@ -65,6 +65,15 @@ export function createUpdater({ app, net, request, notify, prepareQuit, currentV
       releaseNotes: normalizeReleaseNotes(info.releaseNotes), releaseDate: info.releaseDate,
       releaseUrl: `${repoUrl}/releases/tag/v${version}`, checkedAt: timestamp() };
   }
+  function installFailed() {
+    if (installErrorReported) return;
+    installErrorReported = true;
+    // Cleanup already removed the tray and backend. Don't leave a hidden, unusable app.
+    autoUpdater.autoInstallOnAppQuit = false;
+    try { fail('install'); } finally {
+      try { showInstallError(messages.install); } finally { app.quit(); }
+    }
+  }
   if (autoUpdater) {
     autoUpdater.autoDownload = false;
     autoUpdater.autoInstallOnAppQuit = true;
@@ -77,7 +86,7 @@ export function createUpdater({ app, net, request, notify, prepareQuit, currentV
       percent: Math.min(100, Math.round(positive(p.percent))), transferred: positive(p.transferred), total: positive(p.total), bytesPerSecond: positive(p.bytesPerSecond),
     } }));
     autoUpdater.on('update-downloaded', info => publish({ ...nativeRelease(info), status: 'downloaded' }));
-    autoUpdater.on('error', () => fail(installing ? 'install' : checking ? 'check' : 'download'));
+    autoUpdater.on('error', () => installing ? installFailed() : fail(checking ? 'check' : 'download'));
   }
 
   async function check({ silent = false } = {}) {
@@ -109,9 +118,9 @@ export function createUpdater({ app, net, request, notify, prepareQuit, currentV
   async function install() {
     if (!autoUpdater || state.status !== 'downloaded' || installing) throw new Error('请先完成更新下载。');
     installing = true;
-    try { await prepareQuit(); autoUpdater.quitAndInstall(false, true); }
-    catch { fail('install'); }
-    finally { installing = false; }
+    // Native errors may arrive after quitAndInstall returns. Keep the install phase until exit.
+    try { await prepareQuit(); await autoUpdater.quitAndInstall(false, true); }
+    catch { installFailed(); }
     return state;
   }
   function cancelStartupCheck() { clearTimeout(timer); timer = undefined; }

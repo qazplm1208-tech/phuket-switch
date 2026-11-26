@@ -138,6 +138,43 @@ test('setup reuses the active group key, can mint or select a key, and persists 
   }
 });
 
+test('Only Astra setup changes only Astra fields; takeover catalog and discovery follow the current provider preset', async t => {
+  const { api, add, db, endpoint, inference } = await fixture(t);
+  const baseUrl = await endpoint((_req, res) => res.setHeader('content-type', 'application/json').end('{"data":[]}'));
+  const dedicated = add('Only astra', 155, { baseUrl, model: pro }), globalUltra = add('Global ultra', 153), localUltra = add('Local ultra', 154);
+  const normal = add('Normal', 49, { baseUrl, model: sol }); db.setCurrentProvider('codex', normal.id);
+  for (const localMenu of [false, true]) {
+    const global = { ...DEFAULT_GPT_FAST_CONFIG, catalogSpeedVariants: !localMenu, ultraFastProviderId: globalUltra.id };
+    const pref = { ...global, catalogSpeedVariants: localMenu, ultraFastProviderId: localUltra.id, respectClientServiceTier: false };
+    await api('/api/fast-mode', 'PUT', { config: global });
+    await api(`/api/providers/${normal.id}`, 'PUT', { codexFastConfig: pref });
+    const expectedGlobal = { ...db.state('fastMode'), astraOnlyProviderId: dedicated.id, routeAstraToOnlyAstra: true };
+    const setup = await api(setupRoute, 'POST', {});
+    assert.deepEqual(setup.fastMode, expectedGlobal); assert.deepEqual(db.state('settings').defaultGptFastConfig, expectedGlobal);
+    assert.deepEqual(db.current('codex')!.codexFastConfig, { ...pref, astraOnlyProviderId: dedicated.id, routeAstraToOnlyAstra: true });
+    const names = (await inference('/v1/models')).data.map((m: { id: string }) => m.id);
+    for (const menu of [catalog(), names]) { assert.ok(menu.includes(pro)); assert.equal(menu.includes(`${pro}--fast`), localMenu); }
+  }
+});
+
+test('every settings write rejects nonexistent or non-Responses bindings before mutating state or files', async t => {
+  const { api, add, db } = await fixture(t);
+  const p = add('Normal', 49), other = add('Claude', 123, { appType: 'claude', protocol: 'anthropic-messages' });
+  db.setCurrentProvider('codex', p.id);
+  const settings = db.state('settings'), before = db.providers(), fast = db.state('fastMode');
+  for (const id of [other.id, 'not-a-provider']) for (const field of ['ultraFastProviderId', 'astraOnlyProviderId']) {
+    const config = { ...fast, [field]: id };
+    await api('/api/fast-mode', 'PUT', { config, applyToCodex: true }, 400);
+    await api('/api/settings', 'PUT', { ...settings, theme: 'dark', defaultGptFastConfig: config }, 400);
+    await api(`/api/providers/${p.id}`, 'PUT', { name: 'not committed', codexFastConfig: config }, 400);
+    await api('/api/providers', 'POST', { appType: 'codex', protocol: 'openai-responses', baseUrl: p.baseUrl, name: 'new', autoCreatePhuketKey: true, phuketGroupId: 49, codexFastConfig: config }, 400);
+  }
+  assert.deepEqual(db.providers(), before); assert.deepEqual(db.state('fastMode'), fast); assert.deepEqual(db.state('settings'), settings);
+  assert.deepEqual(db.backups(), []); assert.equal(fs.existsSync(cliPaths().codex), false);
+  const valid = { ...fast, ultraFastProviderId: p.id, astraOnlyProviderId: null };
+  assert.equal((await api('/api/settings', 'PUT', { ...settings, defaultGptFastConfig: valid })).defaultGptFastConfig.ultraFastProviderId, p.id);
+});
+
 test('manual offline first setup selects a provider without writing Codex; subsequent offline setup reuses it', async t => {
   let calls = 0;
   const { api, db } = await fixture(t, async () => { calls++; throw Error('offline fixture'); });
@@ -191,7 +228,8 @@ test('live proxy and Codex catalog agree on Astra routing, UltraFast precedence,
   await api('/api/routes', 'PUT', { rules: [{ enabled: true, sourceClient: 'codex', sourceModel: pro, targetProviderId: normal.id, targetModel: terra }] });
   assert.equal((await run({ model: pro })).model, terra); assert.deepEqual(calls.splice(0), ['49']);
   await api(`/api/providers/${dedicated.id}`, 'DELETE', undefined, 204);
-  await api('/api/fast-mode', 'PUT', { config: { ...setup.fastMode, astraOnlyProviderId: 'deleted-id' } });
+  await api('/api/fast-mode', 'PUT', { config: { ...setup.fastMode, astraOnlyProviderId: 'deleted-id' } }, 400);
+  await api('/api/fast-mode', 'PUT', { config: { ...setup.fastMode, astraOnlyProviderId: null, routeAstraToOnlyAstra: true } });
   const missing = await run({ model: astra }, 503); assert.deepEqual(missing.error, { code: 'ASTRA_ONLY_PROVIDER_MISSING', message: missingAstraOnlyMessage });
   assert.deepEqual(calls, []); assert.equal((await run({ model: sol })).group, '49');
 });

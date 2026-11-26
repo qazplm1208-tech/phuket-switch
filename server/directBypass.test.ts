@@ -8,6 +8,7 @@ import { afterEach, beforeEach, test } from 'node:test';
 import { createManagementApp, createRuntime } from './app.js';
 import { subagentPaths } from './configFiles.js';
 import { SwitchDb } from './db.js';
+import { checkInference } from './diagnosticTransport.js';
 import { bundledDirectFile } from './directFiles.js';
 import { adaptiveFetch, isLoopbackUrl, setDirectBypassResolver } from './upstreamTransport.js';
 
@@ -147,6 +148,50 @@ test('configuration changes serialize; unavailable physical transport fails clos
   runtime.db.setState('subagent', config); assert.equal((await manager.syncFromConfig()).bridgeRunning, true);
   const [first, last] = await Promise.all([manager.updateConfig({ interfaceName: 'new' }), manager.updateConfig({ mode: 'skip-proxy' })]);
   assert.equal(first.bridgeRunning, true); assert.equal(last.bridgeRunning, false); assert.equal(last.config.interfaceName, 'new');
+});
+
+type BridgeCommandSource = { command(): { exe: string; args: string[]; cwd: string } };
+
+test('concurrent lazy policy resolution shares one startup result, including startup failure', async t => {
+  const manager = runtime.directBypass, url = new URL('https://fixture.invalid');
+  runtime.db.setState('directBypass', { ...runtime.db.state('directBypass'), enabled: true });
+  const launch = t.mock.method(manager as unknown as BridgeCommandSource, 'command', () => { throw Error('private startup detail'); });
+  await Promise.all(Array.from({ length: 12 }, () => assert.rejects(manager.resolvePolicy(url, deadline()), { code: 'DIRECT_BYPASS_UNAVAILABLE' })));
+  assert.equal(launch.mock.callCount(), 1); launch.mock.restore();
+  const policies = await Promise.all(Array.from({ length: 12 }, () => manager.resolvePolicy(url, deadline())));
+  const first = policies[0]; assert.ok(first?.kind === 'bridge');
+  assert.ok(policies.every(p => p?.kind === 'bridge' && p.proxyUrl.href === first.proxyUrl.href));
+});
+
+test('request deadline cancels one startup waiter; close interrupts a stalled bridge without sending or starting a second child', { timeout: 5000 }, async t => {
+  const manager = runtime.directBypass, url = new URL('https://fixture.invalid');
+  runtime.db.setState('directBypass', { ...runtime.db.state('directBypass'), enabled: true });
+  let started!: () => void, sends = 0; const launched = new Promise<void>(resolve => { started = resolve; });
+  const command = t.mock.method(manager as unknown as BridgeCommandSource, 'command', () => {
+    started(); return { exe: process.execPath, args: ['-e', 'process.stdin.resume()', '--'], cwd: root };
+  });
+  const fallback = async () => { sends++; return new Response(); };
+  const pending = adaptiveFetch(url, { signal: deadline() }, fallback); await launched;
+  const other = assert.rejects(adaptiveFetch(url, { signal: AbortSignal.timeout(50) }, fallback), { name: 'TimeoutError' }); await other;
+  const stopped = assert.rejects(pending, { code: 'DIRECT_BYPASS_UNAVAILABLE' });
+  await Promise.all([manager.close(), stopped]);
+  await assert.rejects(manager.resolvePolicy(url), { code: 'DIRECT_BYPASS_UNAVAILABLE' }); assert.equal(sends, 0); assert.equal(command.mock.callCount(), 1);
+});
+
+test('diagnostic inference uses the selected transport and never falls back from an unavailable physical route', async () => {
+  let hits = 0, unscoped = 0;
+  const target = await listen((req, res) => {
+    assert.equal(req.method, 'POST'); assert.equal(req.headers.authorization, 'Bearer diagnostic-fixture'); hits++;
+    res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ choices: [{ message: { content: 'OK' } }] }));
+  }, localAddress());
+  const check = () => checkInference(async () => { unscoped++; throw Error('unscoped fetch'); }, target.url+'/v1/chat/completions', 'fixture',
+    { Authorization: 'Bearer diagnostic-fixture' }, { model: 'fixture' }, ['diagnostic-fixture']);
+  for (const mode of ['skip-proxy', 'physical-nic'] as const) {
+    await runtime.directBypass.updateConfig({ enabled: true, mode }); assert.equal((await check()).previewText, 'OK');
+  }
+  runtime.db.setState('subagent', { ...runtime.db.state('subagent'), pythonPath: 'missing-interpreter' });
+  const denied = await check(); assert.equal(denied.ok, false); assert.equal(denied.error?.code, 'DIRECT_BYPASS_UNAVAILABLE');
+  assert.equal(hits, 2); assert.equal(unscoped, 0); assert.ok(!JSON.stringify(denied).includes('diagnostic-fixture'));
 });
 
 test('only explicit subagent Apply writes direct env and sibling files, and removal respects a shared runtime', async () => {

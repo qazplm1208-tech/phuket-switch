@@ -129,6 +129,9 @@ export class SwitchDb {
   providers(app?: AppType): Provider[] {
     return this.sql.prepare(`SELECT * FROM providers ${app ? 'WHERE appType=?' : ''} ORDER BY priority, createdAt, rowid`).all(...(app ? [app] : [])).map(decode);
   }
+  hasProvider(id: string, protocol: Provider['protocol']) {
+    return !!this.sql.prepare('SELECT 1 FROM providers WHERE id=? AND protocol=?').get(id, protocol);
+  }
   provider(id: string): Provider {
     const row = this.sql.prepare('SELECT * FROM providers WHERE id=?').get(id);
     if (!row) throw missing('Provider'); return decode(row);

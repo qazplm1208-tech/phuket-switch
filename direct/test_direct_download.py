@@ -90,6 +90,11 @@ class Origin(BaseHTTPRequestHandler):
         data = s.files[path]
         a, end = 0, len(data)
         rng = self.headers.get('Range') if not s.ignore_range else None
+        if rng and s.if_range_change:
+            # Representation changes after the HEAD probe. A failed If-Range sends the entire new body.
+            s.etag, data = '"v2"', s.if_range_change
+            s.files[path] = data
+            a, end, rng = 0, len(data), None
         if rng:
             m = re.fullmatch(r'bytes=(\d+)-(\d*)', rng)
             a, end = int(m[1]), int(m[2])+1 if m[2] else len(data)
@@ -98,8 +103,10 @@ class Origin(BaseHTTPRequestHandler):
                 return
         self.send_response(206 if rng else 200)
         self.send_header('Content-Length', str(end-a))
-        self.send_header('ETag', s.etag)
-        self.send_header('Last-Modified', MODIFIED)
+        if s.etag:
+            self.send_header('ETag', s.etag)
+        if s.modified:
+            self.send_header('Last-Modified', s.modified)
         self.send_header('Content-Type', 'application/octet-stream')
         if rng:
             self.send_header('Content-Range', f'bytes {a}-{end-1}/{len(data)}')
@@ -121,8 +128,8 @@ class HttpTests(LocalCLI, unittest.TestCase):
     def origin(self):
         s = ThreadingHTTPServer(('127.0.0.1', 0), Origin)
         s.files, s.redirects, s.log = {'/one.bin': DATA}, {}, []
-        s.etag, s.advertise, s.ignore_range, s.head_status = '"v1"', True, False, 200
-        s.disposition, s.hook, s.lock = '', None, threading.Lock()
+        s.etag, s.modified, s.advertise, s.ignore_range, s.head_status = '"v1"', MODIFIED, True, False, 200
+        s.disposition, s.hook, s.if_range_change, s.lock = '', None, None, threading.Lock()
         return s, f'http://127.0.0.1:{self.serve(s)}'
 
     def setUp(self):
@@ -168,6 +175,16 @@ class HttpTests(LocalCLI, unittest.TestCase):
         self.cli('-c', '1', self.url)
         self.assertEqual(self.ranges(), [None])
         self.assert_complete()
+
+    def test_if_range_entity_changes_after_probe(self):
+        changed = b'new representation' * 3000
+        self.seed_prefix(401)
+        self.s.if_range_change = changed
+        report = self.cli('-c', '1', self.url)
+        self.assertEqual(self.ranges(), ['bytes=401-'])
+        self.assertEqual((self.out/'one.bin').read_bytes(), changed)
+        self.assertEqual(report['bytes'], len(changed))
+        self.assertFalse(list(self.out.glob('*.part*')))
 
     def test_range_ignored_restarts_single_and_parallel(self):
         self.s.ignore_range = True
@@ -223,12 +240,60 @@ class HttpTests(LocalCLI, unittest.TestCase):
             child.kill()
             child.communicate(timeout=5)
             release.set()
+        lock = self.out/'one.bin.phuket-dl.lock'
+        self.assertEqual(int(lock.read_bytes()), child.pid)  # Dead writer; sidecar is resumable.
         self.assertFalse((self.out/'one.bin').exists())
         self.s.hook = None
         self.s.log.clear()
         self.cli('-c', '4', '--min-chunk-size', '1024', self.url)
         self.assertEqual(self.ranges(), [f'bytes={chunks[-1][0]}-{chunks[-1][1]}'])
         self.assert_complete()
+
+    def test_no_validator_restarts_without_splicing_even_on_short_read_retry(self):
+        self.s.etag, self.s.modified = 'W/"weak"', None
+        self.seed_prefix(100, etag=self.s.etag, prefix=b'X'*100)
+        sidecar = self.out/'one.bin.part.meta.json'
+        meta = json.loads(sidecar.read_bytes()); meta['lastModified'] = None
+        sidecar.write_text(json.dumps(meta), encoding='utf-8')
+        def short(handler, a, end, data):
+            self.s.hook = None
+            handler.wfile.write(b'Y'*77)
+            return True
+        self.s.hook = short
+        self.cli(self.url, '-c', '4', '--min-chunk-size', '1', '--retries', '1')
+        self.assertEqual(self.ranges(), [None, None])
+        self.assert_complete()
+
+    def test_expected_checksum_permits_ranges_without_a_usable_server_validator(self):
+        self.s.etag, self.s.modified = 'W/"weak"', 'unknown'
+        self.cli(self.url, '-c', '3', '--min-chunk-size', '1', '--sha256', hashlib.sha256(DATA).hexdigest())
+        self.assertCountEqual(self.ranges(), [f'bytes={a}-{b}' for a, b, _ in dl.split_ranges(len(DATA), 3)])
+        self.assertFalse(any('if-range' in h for _, _, h in self.s.log))
+        self.assert_complete()
+
+    def test_live_download_lock_and_destination_created_during_transfer(self):
+        entered, release = threading.Event(), threading.Event()
+        def pause(*args):
+            entered.set(); release.wait(8)
+            return False
+        self.s.hook = pause
+        child = subprocess.Popen(self.command('-c', '1', self.url), cwd=self.tmp, env=self.env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        lock = self.out/'one.bin.phuket-dl.lock'
+        try:
+            self.assertTrue(entered.wait(5))
+            self.assertEqual(int(lock.read_bytes()), child.pid)
+            self.assertIn('in progress', self.cli('-f', self.url, ok=False)['error'])
+            (self.out/'one.bin').write_bytes(b'mine')
+            release.set(); stdout, stderr = child.communicate(timeout=8)
+            self.assertFalse(json.loads(stdout)['ok']); self.assertEqual(stderr, b'')
+        finally:
+            release.set()
+            if child.poll() is None:
+                child.kill(); child.communicate(timeout=5)
+        self.assertFalse(lock.exists())
+        self.assertEqual((self.out/'one.bin').read_bytes(), b'mine')
+        self.assertEqual(self.ranges(), [None])
 
     def test_short_response_retries_at_confirmed_offset(self):
         def short(handler, a, end, data):
@@ -273,13 +338,19 @@ class HttpTests(LocalCLI, unittest.TestCase):
         other, base2 = self.origin()
         self.s.redirects['/start'] = (308, '/same-origin')
         self.s.redirects['/same-origin'] = (302, base2+'/one.bin')
-        self.cli('-c', '1', '-A', 'fixture-UA', '-e', self.base+'/ref', '-H', 'X-Test: demo',
-                 '-H', 'Authorization: test-value', '-H', 'Cookie: a=b', '-H', 'Proxy-Authorization: unused', self.base+'/start')
+        self.cli('-c', '2', '--min-chunk-size', '1', '-A', 'fixture-UA', '-e', self.base+'/ref',
+                 '-H', 'X-API-Key: secret', '-H', 'X-Auth-Token: secret2', '-H', 'Accept: text/plain',
+                 '-H', 'Accept-Language: en', '-H', 'X-Test: demo', '-H', 'Authorization: test-value',
+                 '-H', 'Cookie: a=b', '-H', 'Proxy-Authorization: unused', self.base+'/start')
         for method, path, h in self.s.log:
-            self.assertEqual((h['authorization'], h['cookie'], h['referer']), ('test-value', 'a=b', self.base+'/ref'))
+            self.assertEqual((h['authorization'], h['cookie'], h['referer'], h['x-api-key']),
+                             ('test-value', 'a=b', self.base+'/ref', 'secret'))
         for method, path, h in other.log:
-            self.assertEqual((h['x-test'], h['user-agent']), ('demo', 'fixture-UA'))
-            for key in ('authorization', 'proxy-authorization', 'cookie', 'referer'):
+            self.assertEqual((h['user-agent'], h['accept'], h['accept-language']), ('fixture-UA', 'text/plain', 'en'))
+            if method == 'GET':
+                self.assertTrue(h['range'].startswith('bytes='))
+                self.assertEqual(h['if-range'], self.s.etag)
+            for key in ('authorization', 'proxy-authorization', 'cookie', 'referer', 'x-api-key', 'x-auth-token', 'x-test'):
                 self.assertNotIn(key, h)
         self.assert_complete()
 

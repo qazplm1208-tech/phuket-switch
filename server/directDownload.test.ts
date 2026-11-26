@@ -58,7 +58,7 @@ test('defaults, target detection, summarized preview and validation have no pers
   const src = `User notes\r\n${IMAGE_PROMPT_START}\r\n${secret}\r\n${IMAGE_PROMPT_END}\r\n`;
   write(cliPaths().codexPrompt, src);
   const preview: DirectDownloadDiffPreview = await dd('/preview-diff', req);
-  assert.equal(preview.files.length, 12); assert.deepEqual(preview.warnings, []); assert.ok(!JSON.stringify(preview).includes(secret));
+  assert.equal(preview.files.length, 13); assert.deepEqual(preview.warnings, []); assert.ok(!JSON.stringify(preview).includes(secret));
   for (const k of ['script', 'torrent', 'dns', 'net'] as const) {
     const file = preview.files.find(v => v.path === f[k])!;
     const data = fs.readFileSync(bundledDirectFile(path.basename(f[k]) as 'direct_download.py'));
@@ -80,7 +80,7 @@ test('apply deploys five exact runtime files and preserves notes and other marke
   const before: DirectDownloadStatus = await dd(), f = directDownloadPaths();
   const original = `Personal $& notes\r\n${SUBAGENT_START}\r\nsub\r\n${SUBAGENT_END}\r\n${IMAGE_PROMPT_START}\r\nimg\r\n${IMAGE_PROMPT_END}\r\n`;
   for (const t of Object.values(before.liveTargets)) write(t.path, original);
-  const { status, system } = await dd('/apply', req); assert.equal(system.applied, true); assert.equal(system.changedPaths.length, 12);
+  const { status, system } = await dd('/apply', req); assert.equal(system.applied, true); assert.equal(system.changedPaths.length, 13);
   assert.equal(runtime.db.backups(system.backupId)[0].reason, 'Apply direct downloader'); assert.ok(status.scriptInstalled && status.config.enabled);
   assert.deepEqual(fs.readdirSync(f.dir).sort(), ['direct_dns.py','direct_download.py','direct_net.py','direct_torrent.py','phuket-dl.cmd']);
   for (const name of ['direct_download.py','direct_torrent.py','direct_net.py','direct_dns.py'] as const) assert.deepEqual(fs.readFileSync(path.join(f.dir,name)), fs.readFileSync(bundledDirectFile(name)));
@@ -94,6 +94,37 @@ test('apply deploys five exact runtime files and preserves notes and other marke
   const refreshed = await dd('/apply', { targets: ['codex'], enableTorrent: false, mode: 'skip-proxy' });
   assert.ok(!refreshed.status.previewMarkdown.includes('magnet:')); assert.ok(!read(cliPaths().codexPrompt).includes('--bt-info'));
   assert.ok(read(cliPaths().claudePrompt).includes('--bt-info')); assert.ok(read(cliPaths().codexPrompt).includes('--system-route'));
+});
+
+test('Antigravity downloader is registered standalone; subagent rule toggles and removal cannot unlink it', async () => {
+  const f = directDownloadPaths(), sub = subagentPaths(), targets = ['antigravity'];
+  const { status } = await dd('/apply', { targets });
+  const manifest = read(f.antigravityPluginManifest), rules = read(f.antigravityRules), m = JSON.parse(manifest);
+  assert.equal(m.name, 'phuket-direct-download'); assert.deepEqual(m.rules, ['./rules/AGENTS.md']);
+  assert.equal(path.resolve(path.dirname(f.antigravityPluginManifest), m.rules[0]), status.liveTargets.antigravity.path);
+  assert.ok(rules.includes(`${process.platform === 'win32' ? '& ' : ''}"${status.python.executable}" -u "${f.script}"`));
+  assert.equal(fs.existsSync(sub.pluginManifest), false); assert.equal(fs.existsSync(sub.pluginRules), false);
+  for (const writeRules of [true, false]) await api('subagent/apply', { targets, keyStorage: 'mcp-env', apiKey: 'fixture', writeRules });
+  await api('subagent/remove', { targets }); assert.equal(fs.existsSync(sub.pluginManifest), false);
+  assert.equal(read(f.antigravityPluginManifest), manifest); assert.equal(read(f.antigravityRules), rules);
+  await api('subagent/apply', { targets, keyStorage: 'mcp-env', apiKey: 'fixture' });
+  const other = [sub.pluginManifest, sub.pluginRules, sub.pluginMcp, sub.pluginSkill].map(read);
+  await dd('/remove', { targets }); assert.equal(fs.existsSync(f.antigravityPluginManifest), false); assert.equal(fs.existsSync(f.antigravityRules), false);
+  assert.deepEqual([sub.pluginManifest, sub.pluginRules, sub.pluginMcp, sub.pluginSkill].map(read), other);
+});
+
+test('legacy Antigravity download rule migrates only on explicit selection and is restorable', async () => {
+  const sub = subagentPaths(), f = directDownloadPaths(), notes = `personal notes\r\n${SUBAGENT_START}\r\nkeep\r\n${SUBAGENT_END}\r\n`;
+  const legacy = notes + `\r\n${start}\r\nlegacy command\r\n${end}\r\n`, manifest = '{"name":"gpt-astra-subagent","rules":["./rules/AGENTS.md"],"other":true}';
+  write(sub.pluginRules, legacy); write(sub.pluginManifest, manifest);
+  assert.equal((await dd()).liveTargets.antigravity.injected, true);
+  await dd('/apply', { targets: ['codex'] }); assert.equal(read(sub.pluginRules), legacy);
+  const params = { targets: ['antigravity'] }, preview = await dd('/preview-diff', params);
+  assert.ok(preview.files.some((v: { path: string }) => v.path === sub.pluginRules)); assert.equal(read(sub.pluginRules), legacy);
+  const { system } = await dd('/apply', params);
+  assert.equal(directDownloadBlock(read(sub.pluginRules)), null); assert.ok(read(sub.pluginRules).startsWith(notes)); assert.equal(read(sub.pluginManifest), manifest);
+  await api(`backups/${system.backupId}/restore`, {}); assert.equal(read(sub.pluginRules), legacy); assert.equal(fs.existsSync(f.antigravityPluginManifest), false);
+  await dd('/remove', params); assert.equal(directDownloadBlock(read(sub.pluginRules)), null); assert.ok(read(sub.pluginRules).startsWith(notes)); assert.equal(read(sub.pluginManifest), manifest);
 });
 
 test('applying Codex and Claude presets preserves all active managed instructions', async () => {

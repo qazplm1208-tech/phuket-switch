@@ -11,6 +11,7 @@ import fnmatch
 import hashlib
 import http.client
 import ipaddress
+import json
 import os
 from pathlib import Path
 import re
@@ -356,7 +357,7 @@ def dht_peers(digest, bootstrap, route, resolver, timeout=3., limit=32):
     return sorted(peers)[:MAX_PEERS]
 
 
-def discover(tiers, digest, peer_id, left, route, resolver, timeout, bootstrap, max_peers):
+def tracker_peers(tiers, digest, peer_id, left, route, resolver, timeout):
     peers, tried = {}, set()
     for tier in tiers:
         for url in tier:
@@ -376,8 +377,6 @@ def discover(tiers, digest, peer_id, left, route, resolver, timeout, bootstrap, 
                 continue
         if len(peers) >= MAX_PEERS:
             break
-    if bootstrap and len(peers) < min(max_peers, 4):
-        peers.update(dict.fromkeys(dht_peers(digest, bootstrap, route, resolver, timeout, max_peers)))
     return list(peers)[:MAX_PEERS]
 
 
@@ -592,14 +591,31 @@ class PieceStore:
                 yield n, first-f.offset, first-start, last-first
             n += 1
 
-    def prepare(self):
-        for n in self.selected:
+    def prepare(self, overwrite=False):
+        state_path = confined(self.cache, '.phuket-bt-state.json')
+        digest = self.meta.info_hash.hex()
+        owned = set()
+        try:
+            with regular_file(state_path, 'rb') as f:
+                state = json.load(f)
+            if (isinstance(state, dict) and state.get('info_hash') == digest and isinstance(state.get('files'), list)
+                    and all(isinstance(p, str) for p in state['files'])):
+                owned.update(state['files'])
+        except (FileNotFoundError, ValueError):
+            pass  # Missing or invalid state never grants permission to overwrite.
+        selected = {n: '/'.join(self.meta.files[n].parts) for n in self.selected}
+        for n, name in selected.items():
+            if not overwrite and name not in owned and self.paths[n].exists():
+                raise FileExistsError(f'Destination exists: {name}; use --overwrite to replace it')
+        for n, name in selected.items():
             path = self.paths[n]
             no_links(path.parent).mkdir(parents=True, exist_ok=True)
-            if not path.exists():
-                regular_file(path, 'xb').close()
+            if (overwrite or name in owned) and path.exists():
+                regular_file(path, 'r+b').close()  # Reject hard links before any piece writes.
             else:
-                regular_file(path, 'r+b').close()  # Check for hard links before any transfer.
+                regular_file(path, 'xb').close()  # Also rejects a file created since preflight.
+        self.cache.mkdir(parents=True, exist_ok=True)
+        atomic_write(state_path, json.dumps({'info_hash': digest, 'files': sorted(owned | set(selected.values()))}).encode())
 
     def read(self, i):
         result = bytearray(self.meta.size(i))
@@ -768,7 +784,7 @@ def seed(store, addresses, peer_id, route, resolver, timeout, max_peers, seconds
 
 
 def download_torrent(source, root, route, resolver, *, info_only=False, select=None, no_dht=False, bootstrap=None,
-                     max_peers=24, seed_time=0., timeout=20., retries=5, resume=True, rate_limiter=None,
+                     max_peers=24, seed_time=0., timeout=20., retries=5, resume=True, overwrite=False, rate_limiter=None,
                      claims=None, report_hash=True, sha256=None, md5=None, progress=None, extract=False):
     peer_id = b'-PS1100-' + secrets.token_bytes(12)
     bootstrap = [] if no_dht else BOOTSTRAP if bootstrap is None else bootstrap
@@ -778,7 +794,8 @@ def download_torrent(source, root, route, resolver, *, info_only=False, select=N
     cache = confined(root, '.phuket-bt-'+parsed.info_hash.hex())
     if not info_only:
         claims.reserve([cache])
-    addresses, raw = [], None
+    tracker_addresses = dht_addresses = None  # None: discovery has not been attempted.
+    raw = None
     if is_magnet:
         tiers = [(url,) for url in parsed.trackers]
         metadata_path = confined(cache, 'info')
@@ -788,9 +805,18 @@ def download_torrent(source, root, route, resolver, *, info_only=False, select=N
             if len(cached) <= MAX_META and hashlib.sha1(cached).digest() == parsed.info_hash:
                 raw = cached
         if raw is None:
-            addresses = discover(tiers, parsed.info_hash, peer_id, 1, route, resolver, timeout, bootstrap, max_peers)
-            raw = fetch_metadata(addresses, parsed.info_hash, peer_id, route, resolver, timeout, max_peers, rate_limiter)
+            if tiers:
+                # Until verified metadata says public, a tracker-supplied magnet may be private.
+                # If its trackers can't supply metadata, don't disclose the hash to public DHT.
+                tracker_addresses = tracker_peers(tiers, parsed.info_hash, peer_id, 1, route, resolver, timeout)
+                sources = tracker_addresses
+            else:
+                dht_addresses = dht_peers(parsed.info_hash, bootstrap, route, resolver, timeout, max_peers) if bootstrap else []
+                sources = dht_addresses
+            raw = fetch_metadata(sources, parsed.info_hash, peer_id, route, resolver, timeout, max_peers, rate_limiter)
         meta = from_info(raw, tiers)
+        if meta.private and not tiers and not info_only:
+            raise ValueError('Private magnet requires a supplied tracker; cannot use DHT peers')
     else:
         meta = parsed
     if info_only:
@@ -802,16 +828,22 @@ def download_torrent(source, root, route, resolver, *, info_only=False, select=N
     claims.reserve(store.paths[n] for n in selected)
     if extract:
         claims.reserve(extract_dest(store.paths[n]) for n in selected)
-    store.prepare()
+    store.prepare(overwrite)
     if is_magnet:
         cache.mkdir(exist_ok=True)
         atomic_write(metadata_path, raw)
-    verified = store.verified() if resume else set()
+    verified = store.verified() if resume and not overwrite else set()
     missing = store.wanted - verified
-    if (missing or seed_time) and not addresses:
-        left = meta.total - sum(meta.size(i) for i in verified)
-        addresses = discover(meta.tiers, meta.info_hash, peer_id, left, route, resolver, timeout,
-                             [] if meta.private else bootstrap, max_peers)
+    addresses = []
+    if missing or seed_time:
+        if tracker_addresses is None:
+            left = meta.total - sum(meta.size(i) for i in verified)
+            tracker_addresses = tracker_peers(meta.tiers, meta.info_hash, peer_id, left, route, resolver, timeout)
+        addresses = tracker_addresses
+        if not meta.private and bootstrap:
+            if dht_addresses is None and len(tracker_addresses) < min(max_peers, 4):
+                dht_addresses = dht_peers(meta.info_hash, bootstrap, route, resolver, timeout, max_peers)
+            addresses = list(dict.fromkeys(tracker_addresses + (dht_addresses or [])))[:MAX_PEERS]
     if missing:
         transfer_pieces(store, missing, addresses, peer_id, route, resolver, timeout, max_peers, retries, rate_limiter, progress)
     files = []

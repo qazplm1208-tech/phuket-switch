@@ -1,12 +1,10 @@
-import { dialog, Menu, nativeImage, Tray } from 'electron';
-
 const speeds = [
   ['standard', 'default', '速度：标准（普通分组）'],
   ['fast', 'priority', '⚡ 速度：Fast（普通分组加速）'],
   ['ultrafast', 'ultrafast', '⚡⚡ 速度：UltraFast（Pro500 ultrafast）'],
 ];
 
-export function createTray({ iconPath, request, showWindow, quit, notify, updater, openUpdates }) {
+export function createTray({ dialog, Menu, nativeImage, Tray, iconPath, request, showWindow, quit, notify, updater, openUpdates }) {
   const tray = new Tray(nativeImage.createFromPath(iconPath).resize({ width: 16, height: 16 }));
   tray.setToolTip('Phuket Switch');
   tray.on('click', showWindow);
@@ -40,10 +38,9 @@ export function createTray({ iconPath, request, showWindow, quit, notify, update
       ...speeds.map(([speedMode, serviceTier, label]) => ({
         label, type: 'radio', enabled: !!fast && !!proxy, checked: mode === speedMode,
         click: () => change('fast-mode', async () => {
-          // Both the preset and takeover state may have changed while the menu was open.
-          const [current, proxy] = await Promise.all([request('/fast-mode'), request('/proxy/status')]);
+          const current = await request('/fast-mode');
           const next = { ...current, speedMode, enabled: speedMode !== 'standard', serviceTier };
-          await request('/fast-mode', { method: 'PUT', body: { config: next, applyToCodex: !proxy?.takeover?.codex } });
+          await request('/fast-mode', { method: 'PUT', body: { config: next, applyToCodex: true } });
         }),
       })),
       { type: 'separator' },

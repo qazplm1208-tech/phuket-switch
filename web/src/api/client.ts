@@ -32,7 +32,8 @@ async function send<R extends Route>(
   const timer = AbortSignal.timeout(
     path.startsWith('/api/lab/')
       ? 600_000
-      : path === '/api/phuket/login' || path.endsWith('/connection') || path.endsWith('/test') || path.endsWith('/probe-local')
+      : path === '/api/fast-mode/setup-ultrafast' || path === '/api/fast-mode/setup-astra-only' ||
+        path === '/api/phuket/login' || path.endsWith('/connection') || path.endsWith('/test') || path.endsWith('/probe-local')
         ? 180_000
         : 45_000,
   );

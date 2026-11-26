@@ -44,7 +44,9 @@ export default function FastModeBar() {
   const showOptions = expanded || (s.fastReady && unbound);
   const codexTakeoverOn = !!s.proxy?.takeover.codex;
   const menuEnabled = codexTakeoverOn && cfg.catalogSpeedVariants !== false;
-  const menuReady = menuEnabled && !!bound;
+  const menuConfigured = menuEnabled && !!bound;
+  const proxyRunning = !!s.proxy?.running;
+  const menuReady = menuConfigured && proxyRunning;
   const directUltra = mode === 'ultrafast' && !codexTakeoverOn;
   const syncHint = !current ? '先启用一个 Codex 供应商'
     : directUltra && !bound && !autoMatch ? '先绑定或配置 UltraFast 通道' : undefined;
@@ -70,8 +72,8 @@ export default function FastModeBar() {
       {others.map(m => <option key={m} value={m}>{m}</option>)}
     </>;
   }
-  const disabled = !s.fastReady || s.fastBusy || !!pending;
-  async function write(next: GptFastConfig, sync = false) {
+  const disabled = !s.fastReady || !s.proxy || s.fastBusy || !!pending;
+  async function write(next: GptFastConfig, sync = codexTakeoverOn) {
     try {
       if (
         sync &&
@@ -87,8 +89,8 @@ export default function FastModeBar() {
       return false;
     }
   }
-  function patch(p: Partial<GptFastConfig>, sync = false) {
-    void write({ ...cfg, ...p }, sync);
+  function patch(p: Partial<GptFastConfig>) {
+    void write({ ...cfg, ...p });
   }
   function enableCodexMenu() {
     void run('menu', async () => {
@@ -112,16 +114,18 @@ export default function FastModeBar() {
         // A takeover may have succeeded even if the catalog write failed.
         s.refreshAll();
       }
-      notify('已开启 Codex 免登录直选');
+      notify('已配置 Codex 免登录直选');
     });
   }
   function setupUltraFast() {
     void run('setup', async () => {
-      const { fastMode } = await api.setupUltraFast({ applyToCodex: false });
-      s.fastResource.replace(fastMode);
-      s.refreshProviders();
-      s.prefs.reload();
-      notify('已自动绑定 Pro500 ultrafast 通道');
+      try {
+        const { fastMode } = await api.setupUltraFast({ applyToCodex: codexTakeoverOn });
+        s.fastResource.replace(fastMode);
+        notify('已自动绑定 Pro500 ultrafast 通道');
+      } finally {
+        s.refreshAll();
+      }
     });
   }
   function setupAstraOnly() {
@@ -183,6 +187,8 @@ export default function FastModeBar() {
             <span className="codex-menu-ready" role="status"><Check size={14} />免登录 Codex 菜单直选已开启</span>
             <span className="codex-menu-note">在 Codex 模型菜单直接选「⚡ Fast」走普通分组、「⚡⚡ UltraFast」自动走 Pro500 ultrafast，无需登录 ChatGPT、无需补丁</span>
           </>
+        ) : menuConfigured && pending !== 'menu' ? (
+          <span className="codex-menu-note" role="status">免登录 Codex 菜单直选已配置，等待启动代理。</span>
         ) : (
           <>
             <Btn className="codex-menu-enable" icon={ListPlus} busy={pending === 'menu'}
@@ -192,7 +198,7 @@ export default function FastModeBar() {
             <span className="codex-menu-note">
               {!menuProvider && s.providers.data ? '请先添加 Codex 供应商。'
                 : !current && menuProvider ? `将启用「${menuProvider.name}」作为 Codex 供应商。`
-                : menuEnabled && !bound ? 'Fast 直选已开启；UltraFast 待绑定专属通道。'
+                : menuEnabled && !bound ? `${proxyRunning ? 'Fast 直选已开启' : 'Fast 直选已配置，等待启动代理'}；UltraFast 待绑定专属通道。`
                 : '无需登录 ChatGPT，无需补丁。'}
             </span>
           </>
@@ -202,11 +208,11 @@ export default function FastModeBar() {
         <strong id="astra-route-title">仅 Astra 自动分流（Only astra · 0.08x）</strong>
         <label className="check">
           <input type="checkbox" checked={!!cfg.routeAstraToOnlyAstra} disabled={disabled}
-            onChange={e => patch({ routeAstraToOnlyAstra: e.target.checked }, codexTakeoverOn)} />
+            onChange={e => patch({ routeAstraToOnlyAstra: e.target.checked })} />
           自动将 Astra 请求发往仅 Astra 分组
         </label>
         <select aria-label="仅 Astra 供应商" value={cfg.astraOnlyProviderId ?? ''} disabled={disabled || !s.providers.data}
-          onChange={e => patch({ astraOnlyProviderId: e.target.value || null }, codexTakeoverOn)}>
+          onChange={e => patch({ astraOnlyProviderId: e.target.value || null })}>
           <option value="">自动匹配 Only astra 供应商</option>
           {cfg.astraOnlyProviderId && !astraSelection && <option value={cfg.astraOnlyProviderId} disabled>已绑定的供应商不可用</option>}
           {astraCandidates.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
@@ -219,6 +225,7 @@ export default function FastModeBar() {
         <span className="codex-menu-note" role="status">
           {!cfg.routeAstraToOnlyAstra ? '未启用 Astra 自动分流。'
             : !astraBound ? '未绑定：请选择供应商或一键配置 Only astra 分组。'
+            : codexTakeoverOn && !proxyRunning ? `已绑定 ${astraBound.name}，等待启动代理。`
             : codexTakeoverOn ? `已生效：Astra 模型（如 gpt-6.2-astra）自动发往 ${astraBound.name}，其他模型走当前分组，UltraFast 仍走 Pro500 ultrafast。`
             : `已绑定 ${astraBound.name}，开启本地代理 Codex 接管后自动按模型分流。`}
         </span>
@@ -230,7 +237,7 @@ export default function FastModeBar() {
               <div>
                 <label className="check catalog-speed-check">
                   <input type="checkbox" checked={cfg.catalogSpeedVariants !== false} aria-describedby="fast-catalog-guide"
-                    onChange={e => patch({ catalogSpeedVariants: e.target.checked }, codexTakeoverOn)} />
+                    onChange={e => patch({ catalogSpeedVariants: e.target.checked })} />
                   在 Codex 模型菜单生成 ⚡ Fast / ⚡⚡ UltraFast 直选项（免登录 ChatGPT · 代理模式）
                 </label>
                 <p className="fast-catalog-guide" id="fast-catalog-guide">无需登录 ChatGPT 账号、无需补丁（Codex 更新不失效）。开启本地代理的 Codex 接管后，可直接在 Codex 模型下拉框里选「⚡ Fast（普通分组）」或「⚡⚡ UltraFast（自动路由至 Pro500 ultrafast）」。</p>

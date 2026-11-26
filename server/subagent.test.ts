@@ -214,6 +214,38 @@ test('a partial Windows user-key rotation cannot expose the new credential to an
   }
 });
 
+test('Windows restore checks the snapshot key against planned and untouched entries before any writes', { skip: process.platform !== 'win32' }, async () => {
+  const f = subagentPaths(), from = { ...req, keyStorage: 'user-env', targets: ['cursor'] };
+  await api('subagent/apply', from); process.env.ASTRA_API_KEY = secret;
+  const next = { ...from, baseUrl: 'https://rotated.invalid/v1', apiKey: previous };
+  const rotation = await api('subagent/apply', next); process.env.ASTRA_API_KEY = previous;
+  const before = runtime.db.state('subagent'), cursor = read(f.cursorMcp), rules = read(f.runtime);
+  const count = runtime.db.backups().length, restore = `backups/${rotation.system.backupId}/restore`;
+  // The standalone Cline file is not the selected VS Code profile, but it also inherits the registry key.
+  fs.mkdirSync(path.dirname(f.clineVsMcp), { recursive: true });
+  const mcp = (url: string, key?: string) => JSON.stringify({ mcpServers: { [name]: { env: { ASTRA_BASE_URL: url, ASTRA_API_KEY: key } } } });
+  write(f.clineMcp, mcp(next.baseUrl));
+  const denied = await api(restore, {}, 409); noSecrets(denied, secret, previous);
+  assert.equal(read(f.cursorMcp), cursor); assert.equal(read(f.runtime), rules); assert.equal(read(f.clineMcp), mcp(next.baseUrl));
+  assert.deepEqual(runtime.db.state('subagent'), before); assert.equal(runtime.db.backups().length, count); assert.equal(readAstraUserEnvKey(), previous);
+  write(f.clineMcp, mcp(next.baseUrl, 'explicit-per-harness')); await api(restore, {});
+  assert.equal(doc(f.cursorMcp).mcpServers[name].env.ASTRA_BASE_URL, from.baseUrl); assert.equal(runtime.db.state('subagent').apiKey, secret);
+});
+
+test('restoring a keyless file cannot reuse an unrelated current or unattributed snapshot Windows key', { skip: process.platform !== 'win32' }, async () => {
+  const f = subagentPaths();
+  await api('subagent/apply', { ...req, keyStorage: 'user-env', targets: ['cursor'] });
+  process.env.ASTRA_API_KEY = previous; // External rotation: this is not the key paired with the saved origin.
+  for (const keyStorage of ['user-env', 'mcp-env']) {
+    const rotation = await api('subagent/apply', { ...req, baseUrl: 'https://new.invalid', apiKey: 'next-key', keyStorage, targets: ['cursor'] });
+    const before = read(f.cursorMcp), count = runtime.db.backups().length;
+    if (keyStorage === 'mcp-env') process.env.ASTRA_API_KEY = 'next-key';
+    await api(`backups/${rotation.system.backupId}/restore`, {}, 409);
+    assert.equal(read(f.cursorMcp), before); assert.equal(runtime.db.state('subagent').apiKey, 'next-key'); assert.equal(runtime.db.backups().length, count);
+    await api('subagent/apply', { ...req, keyStorage: 'user-env', targets: ['cursor'] });
+  }
+});
+
 test('applying a prompt preset preserves live subagent rules alongside image rules for Claude and Codex', async () => {
   const f = subagentPaths(); await api('subagent/apply', { ...req, targets: ['claude-code','codex'] });
   const img = runtime.db.state('imagePrompt'); runtime.db.setState('imagePrompt', { ...img, apiKey: previous, enabled: true, targets: { claude: true, codex: true } });

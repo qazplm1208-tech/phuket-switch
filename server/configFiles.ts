@@ -44,9 +44,11 @@ export function subagentPaths() {
   };
 }
 export function directDownloadPaths() {
-  const dir = path.join(getUserHome(), '.phuket-switch', 'direct-download'), at = (name: string) => path.join(dir, name);
+  const home = getUserHome(), dir = path.join(home, '.phuket-switch', 'direct-download'), at = (name: string) => path.join(dir, name);
+  const plugin = path.join(home, '.gemini', 'config', 'plugins', 'phuket-direct-download');
   return { dir, script: at('direct_download.py'), torrent: at('direct_torrent.py'), net: at('direct_net.py'), dns: at('direct_dns.py'),
-    cmd: at('phuket-dl.cmd'), clineRules: path.join(getUserHome(), '.cline', 'rules', 'phuket-direct-download.md') };
+    antigravityPluginManifest: path.join(plugin, 'plugin.json'), antigravityRules: path.join(plugin, 'rules', 'AGENTS.md'),
+    cmd: at('phuket-dl.cmd'), clineRules: path.join(home, '.cline', 'rules', 'phuket-direct-download.md') };
 }
 function checkUnlinkedPath(file: string) {
   assertNotCcSwitch(file);
@@ -58,9 +60,9 @@ function checkUnlinkedPath(file: string) {
   }
 }
 function checkTarget(file: string) {
-  const { script, torrent, net, dns, cmd, clineRules } = directDownloadPaths();
+  const { dir: _dir, ...downloadFiles } = directDownloadPaths();
   if (!Object.values(cliPaths()).includes(file) && !Object.values(subagentPaths()).includes(file) &&
-      ![script, torrent, net, dns, cmd, clineRules].includes(file)) throw conflict('Path is not a managed CLI configuration.');
+      !Object.values(downloadFiles).includes(file)) throw conflict('Path is not a managed CLI configuration.');
   checkUnlinkedPath(file);
 }
 export function managedBytes(file: string) { checkTarget(file); return bytes(file); }
@@ -110,7 +112,7 @@ function snapshot(db: SwitchDb, appType: AppType, reason: string, originals: Ori
   } catch (e) { fs.rmSync(dir, { recursive: true, force: true }); throw e; }
   return id;
 }
-export function commitFiles(db: SwitchDb, app: AppType, reason: string, plan: Plan, forceSnapshot = false): SystemApplyResult {
+export function commitFiles(db: SwitchDb, app: AppType, reason: string, plan: Plan, { forceSnapshot = false, createBackup = true } = {}): SystemApplyResult {
   const agy = app === 'antigravity' ? plan.antigravity : undefined;
   const previous = agy ? { bindings: db.state('antigravityModelBindings'), env: readAgyEnv() } : undefined;
   const envChanged = !!(previous?.env && agy?.env && (previous.env.GEMINI_API_KEY !== agy.env.GEMINI_API_KEY || previous.env.GOOGLE_GEMINI_BASE_URL !== agy.env.GOOGLE_GEMINI_BASE_URL));
@@ -130,7 +132,8 @@ export function commitFiles(db: SwitchDb, app: AppType, reason: string, plan: Pl
   const previousDownload = plan.directDownload ? { config: db.state('directDownload') } : undefined;
   const downloadChanged = plan.directDownload && JSON.stringify(previousDownload?.config) !== JSON.stringify(plan.directDownload.config);
   if (!originals.length && !keyChanged && !stateChanged && !downloadChanged) return { ...notApplied(), ...note };
-  const backupId = snapshot(db, app, reason, originals, previous, previousSub, previousDownload), written = new Set<string>();
+  const backupId = forceSnapshot || createBackup ? snapshot(db, app, reason, originals, previous, previousSub, previousDownload) : null;
+  const written = new Set<string>();
   let writingEnv = false;
   try {
     for (const f of changes) { atomicWrite(f.file, f.content); written.add(f.file); }
@@ -147,7 +150,7 @@ export function commitFiles(db: SwitchDb, app: AppType, reason: string, plan: Pl
   }
   return { applied: true, backupId, changedPaths: changes.map(c => c.file), ...note };
 }
-export function restoreBackup(db: SwitchDb, id: string) {
+export function readBackupPlan(db: SwitchDb, id: string) {
   const entry = db.backups(id)[0]; if (!entry) throw missing('Backup');
   if (!/^[\w-]+$/.test(entry.id)) throw conflict('Invalid backup ID.');
   const dir = path.join(getDataDir(), 'backups', entry.id);
@@ -175,5 +178,5 @@ export function restoreBackup(db: SwitchDb, id: string) {
     if (!parsed.success) throw conflict('Incomplete direct downloader backup.');
     plan.directDownload = { config: parsed.data };
   }
-  return commitFiles(db, entry.appType, `Restore ${id}`, plan, true);
+  return { entry, plan };
 }
