@@ -309,7 +309,7 @@ export function createManagementApp(webRoot = defaultWebRoot, runtime = createRu
   route('PUT /api/routes', 200, v.updateModelRoutes, ({ rules }) => db.transaction(() => {
     const providers = new Map(db.providers().map(p => [p.id, p.protocol]));
     if (rules.some(r => !providers.has(r.targetProviderId))) throw bad('Unknown target provider.');
-    if (rules.some(r => providers.get(r.targetProviderId) === 'gemini-native')) throw bad('Gemini 原生供应商不支持跨协议翻译，请使用原生客户端或添加 Codex Responses 供应商。');
+    if (rules.some(r => providers.get(r.targetProviderId) === 'gemini-native')) throw bad('Gemini 原生供应商不支持跨协议翻译，请使用原生客户端，或选择兼容 Anthropic Messages 或 OpenAI Responses 的供应商。');
     const saved = rules.map(r => ({ ...r, id: r.id ?? randomUUID() }));
     if (new Set(saved.map(r => r.id)).size !== saved.length) throw bad('Duplicate route ID.');
     db.setState('modelRoutes', saved);

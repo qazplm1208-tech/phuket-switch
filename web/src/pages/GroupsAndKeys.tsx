@@ -86,7 +86,7 @@ function GroupCard({
         {imagePrompt ? (
           <Badge tone="blue">系统提示词 · OpenAI 兼容</Badge>
         ) : (
-          <Badge>{g.adapterCategory === 'antigravity' ? '反重力 · 多协议' : g.protocol === 'gemini-native' ? 'Gemini 原生' : g.protocol === 'anthropic-messages' ? 'Anthropic' : 'GPT 原生'}</Badge>
+          <Badge>{g.adapterCategory === 'antigravity' ? '反重力 · 多协议' : g.adapterCategory === 'gemini' ? 'Gemini · 多协议' : g.protocol === 'anthropic-messages' ? 'Anthropic' : 'GPT 原生'}</Badge>
         )}
         {ultraFast && <Badge tone="amber">UltraFast 专属</Badge>}
         {isOnlyAstraGroup(g) && <Badge tone="blue">仅 Astra</Badge>}

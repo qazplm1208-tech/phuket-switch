@@ -61,9 +61,12 @@ export default function ProviderFormModal({
   // undefined follows the catalog default; null is an explicit custom source.
   const [source, setSource] = useState<number | null | undefined>(group?.id ?? p?.phuketGroupId);
   const allowed = s.session?.account?.allowed_groups;
-  const gid = source === undefined && logged && !p && !group
-    ? groups.find(g => g.supportedAppTypes.includes(app) && canCreateGroupKey(g, allowed))?.id
-    : source;
+  let gid = source;
+  if (source === undefined && logged && !p && !group) {
+    const eligible = groups.filter(g => g.supportedAppTypes.includes(app) && canCreateGroupKey(g, allowed));
+    const nativeApp = app === 'claude-desktop' ? 'claude' : app;
+    gid = (eligible.find(g => groupApp(g) === nativeApp) ?? eligible[0])?.id;
+  }
   const chosen = groups.find((g) => g.id === gid);
   const [nameOverride, setName] = useState(p?.name);
   const name = nameOverride ?? chosen?.name ?? '';

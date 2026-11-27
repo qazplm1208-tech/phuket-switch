@@ -11,7 +11,7 @@ import { DatabaseSync } from 'node:sqlite';
 import TOML from '@iarna/toml';
 import { effectiveSpeedMode, hybridBase, parseVirtualSpeedModel, resolveRequestSpeedMode } from './fastMode.js';
 import { account as accountView, metadata } from './phuketViews.js';
-import { APP_VERSION, buildAllFastModelMap, classifyPhuketGroup, defaultBaseUrlForApp, protocolForApp, canCreateGroupKey, isSpeedVariantCandidateModel, isUltraFastGroup, pickRecommendedModel, sortModelsNewestFirst, DEFAULT_GPT_FAST_CONFIG, DEFAULT_PROXY_SETTINGS, FALLBACK_PHUKET_GROUPS, PHUKET_GPT_BASE_URL } from '../shared/constants.js';
+import { APP_VERSION, buildAllFastModelMap, buildSuggestedClaudeMap, classifyPhuketGroup, defaultBaseUrlForApp, protocolForApp, canCreateGroupKey, isSpeedVariantCandidateModel, isUltraFastGroup, pickRecommendedModel, sortModelsNewestFirst, DEFAULT_GPT_FAST_CONFIG, DEFAULT_PROXY_SETTINGS, FALLBACK_PHUKET_GROUPS, PHUKET_GPT_BASE_URL } from '../shared/constants.js';
 import type { AppType, CreateProviderRequest, GptFastConfig, ModelRouteInput, ModelRouteRule, SpeedMode } from '../shared/types.js';
 import { createManagementApp, createRuntime } from './app.js';
 import { CLAUDE_DESKTOP_PROFILE_ID, CLAUDE_DESKTOP_PROFILE_NAME, cliPaths } from './configFiles.js';
@@ -582,7 +582,7 @@ test('Phuket public and exclusive catalogs merge by numeric ID without granting 
   assert.equal(by(201).adapterCategory, 'domestic'); assert.equal(by(34).adapterCategory, 'grok'); assert.equal(by(107).protocol, 'anthropic-messages');
   assert.equal(by(32).adapterCategory, 'image_prompt'); assert.equal(by(32).protocol, null); assert.deepEqual(by(32).supportedAppTypes, []); assert.equal(canCreateGroupKey(by(32)), true);
   assert.equal(by(129).adapterCategory, 'media_coming_soon'); assert.equal(by(129).protocol, null); assert.deepEqual(by(129).supportedAppTypes, []);
-  for (const id of [124, 132]) { assert.equal(by(id).adapterCategory, 'gemini'); assert.equal(by(id).protocol, 'gemini-native'); assert.deepEqual(by(id).supportedAppTypes, ['gemini','antigravity','codex']); }
+  for (const id of [124, 132]) { assert.equal(by(id).adapterCategory, 'gemini'); assert.equal(by(id).protocol, 'gemini-native'); assert.deepEqual(by(id).supportedAppTypes, ['gemini', 'antigravity', 'claude', 'claude-desktop', 'codex']); }
   upstream = () => { throw new Error('offline'); }; assert.deepEqual((await api('phuket/groups')).groups, FALLBACK_PHUKET_GROUPS);
 });
 
@@ -784,42 +784,100 @@ test('provider edits rotate or keep credentials without returning plaintext and 
   assert.ok(!list.includes(rawKey) && !list.includes(issuedKey));
 });
 
-test('Gemini and Antigravity imports choose the protocol and endpoint for each supported app', async () => {
-  const base = 'https://ai.pukitcore.com', ag = `${base}/antigravity`;
-  const google = { id: 124, name: '0.35 Gemini', platform: 'gemini' }, gravity = { id: 800, name: '反重力', platform: ' Antigravity ' };
-  const geminiGroup = classifyPhuketGroup(google), agyGroup = classifyPhuketGroup(gravity);
-  assert.deepEqual(geminiGroup, { adapterCategory: 'gemini', protocol: 'gemini-native', supportedAppTypes: ['gemini', 'antigravity', 'codex'] });
-  assert.deepEqual(classifyPhuketGroup({ ...google, id: 132 }), geminiGroup);
-  assert.deepEqual(agyGroup, { adapterCategory: 'antigravity', protocol: 'gemini-native', supportedAppTypes: ['antigravity', 'gemini', 'claude', 'claude-desktop', 'codex'] });
-  assert.deepEqual(classifyPhuketGroup({ ...gravity, name: '反重力 Gemini', platform: 'other' }), agyGroup);
-  assert.equal(classifyPhuketGroup({ ...gravity, name: 'Gemini Image' }).adapterCategory, 'image_prompt');
-  assert.equal(classifyPhuketGroup({ ...google, id: 129 }).adapterCategory, 'media_coming_soon');
-  const models = ['gemini-9-image', 'gemini-8-flash-lite', 'gemini-2.5-pro', 'gemini-3.8-flash', 'gemini-4-hydrogen'];
-  assert.equal(pickRecommendedModel(models, 'gemini-native'), 'gemini-4-hydrogen');
-  assert.equal(pickRecommendedModel(['gemini-2.5-flash', 'gemini-2.5-pro'], 'gemini-native'), 'gemini-2.5-pro');
-  assert.equal(pickRecommendedModel(['gemini-4-image'], 'gemini-native'), undefined);
+const geminiFixture = { id: 124, name: '0.35 Gemini', platform: 'gemini' };
+const gravityFixture = { id: 800, name: '反重力', platform: ' Antigravity ' };
+const flagship = 'gemini-4-hydrogen', flash = 'gemini-3.8-flash';
+const geminiModels = ['gemini-9-image', 'gemini-8-flash-lite', 'gemini-2.5-pro', flash, flagship];
+const geminiClaudeMap = { opus: flagship, sonnet: flagship, haiku: flash, defaultModel: flagship };
+async function geminiAccount() {
+  const groups = [geminiFixture, gravityFixture];
   upstream = u => {
     if (u.pathname.endsWith('auth/me')) return json({ data: { id: 1, email: 'gemini@example.test' } });
-    if (u.pathname.endsWith('/keys')) return json({ data: [google, gravity].map(g => ({ id: g.id, status: 'active', key: rawKey, group_id: g.id })) });
-    if (u.pathname.endsWith('/model-plaza')) return json({ data: { groups: [google, gravity].map(g => ({ ...g, models: models.map(name => ({ name })) })) } });
+    if (u.pathname.endsWith('/keys')) return json({ data: groups.map(g => ({ id: g.id, status: 'active', key: rawKey, group_id: g.id })) });
+    if (u.pathname.endsWith('/model-plaza')) return json({ data: { groups: groups.map(g => ({ ...g, models: [
+      ...geminiModels.map(name => ({ name })), { name: 'gemini-10-pro', operating_access: { allowed: false } },
+    ] })) } });
     return json({ data: [] });
   };
   await api('phuket/login', 'POST', { token: 'account-session' });
-  for (const [g, routing] of [[google, geminiGroup], [gravity, agyGroup]] as const) for (const app of routing.supportedAppTypes) {
+}
+
+test('Gemini chat recommendations and Claude aliases never select image models', () => {
+  const images = ['gpt-image-2.5', 'gemini-9-flash-image'];
+  for (const protocol of ['gemini-native', 'anthropic-messages', 'openai-responses'] as const) {
+    assert.equal(pickRecommendedModel(geminiModels, protocol), flagship);
+    assert.equal(pickRecommendedModel(['gemini-2.5-flash', 'gemini-2.5-pro'], protocol), 'gemini-2.5-pro');
+    assert.equal(pickRecommendedModel(images, protocol), undefined);
+  }
+  assert.deepEqual(buildSuggestedClaudeMap(images), {});
+  assert.deepEqual(buildSuggestedClaudeMap(geminiModels), geminiClaudeMap);
+  assert.deepEqual(buildSuggestedClaudeMap([flagship, ...images]), { ...geminiClaudeMap, haiku: flagship });
+  assert.deepEqual(buildSuggestedClaudeMap([flagship, 'gemini-8-flash-lite']), { ...geminiClaudeMap, haiku: 'gemini-8-flash-lite' });
+});
+
+test('Gemini and Antigravity imports choose the protocol and endpoint for each supported app', async () => {
+  const base = 'https://ai.pukitcore.com', ag = `${base}/antigravity`;
+  const geminiGroup = classifyPhuketGroup(geminiFixture), agyGroup = classifyPhuketGroup(gravityFixture);
+  assert.deepEqual(geminiGroup, { adapterCategory: 'gemini', protocol: 'gemini-native', supportedAppTypes: ['gemini', 'antigravity', 'claude', 'claude-desktop', 'codex'] });
+  assert.deepEqual(classifyPhuketGroup({ id: 132, name: '0.6 gemini', platform: 'other' }), geminiGroup);
+  assert.deepEqual(agyGroup, { adapterCategory: 'antigravity', protocol: 'gemini-native', supportedAppTypes: ['antigravity', 'gemini', 'claude', 'claude-desktop', 'codex'] });
+  assert.deepEqual(classifyPhuketGroup({ ...gravityFixture, name: '反重力 Gemini', platform: 'other' }), agyGroup);
+  assert.equal(classifyPhuketGroup({ ...gravityFixture, name: 'Gemini Image' }).adapterCategory, 'image_prompt');
+  assert.equal(classifyPhuketGroup({ ...geminiFixture, id: 129 }).adapterCategory, 'media_coming_soon');
+  await geminiAccount();
+  for (const [g, routing] of [[geminiFixture, geminiGroup], [gravityFixture, agyGroup]] as const) for (const app of routing.supportedAppTypes) {
     const expectedProtocol = app === 'codex' ? 'openai-responses' : app.startsWith('claude') ? 'anthropic-messages' : 'gemini-native';
-    const expectedUrl = app === 'codex' ? `${base}/v1` : g.id === gravity.id ? ag : base;
+    const expectedUrl = app === 'codex' ? `${base}/v1` : g === gravityFixture ? ag : base;
     assert.equal(protocolForApp(app), expectedProtocol); assert.equal(defaultBaseUrlForApp(app, { ...g, ...routing }), expectedUrl);
     const imported = await api(`phuket/keys/${g.id}/import-provider`, 'POST', { appType: app }, 201);
-    assert.equal(imported.protocol, expectedProtocol); assert.equal(imported.baseUrl, expectedUrl); assertProviderKey(imported, rawKey);
-    if (expectedProtocol === 'gemini-native') assert.equal(imported.model, 'gemini-4-hydrogen');
+    assert.equal(imported.appType, app); assert.equal(imported.phuketGroupId, g.id); assert.equal(imported.protocol, expectedProtocol);
+    assert.equal(imported.baseUrl, expectedUrl); assertProviderKey(imported, rawKey);
+    assert.deepEqual(imported.availableModels, geminiModels); assert.equal(imported.model, flagship);
+    assert.deepEqual(imported.claudeModelMap, expectedProtocol === 'anthropic-messages' ? geminiClaudeMap : undefined);
   }
-  assert.equal(defaultBaseUrlForApp('gpt-native', { ...gravity, ...agyGroup }), `${base}/v1`);
-  await api('phuket/keys/124/import-provider', 'POST', { appType: 'claude' }, 400);
+  assert.equal(defaultBaseUrlForApp('gpt-native', { ...gravityFixture, ...agyGroup }), `${base}/v1`);
+  await api('phuket/keys/124/import-provider', 'POST', { appType: 'gpt-native' }, 400);
   await api('providers', 'POST', { appType: 'gemini', protocol: 'openai-responses', baseUrl: base, apiKey: rawKey, name: 'Mismatch' }, 400);
-  const p = runtime.db.providers('gemini')[0];
-  await api('routes', 'PUT', { rules: [routed('claude', '*', p.id, models[2])] }, 400);
+  const p = await api('phuket/keys/124/import-provider', 'POST', {}, 201); assert.equal(p.appType, 'gemini');
+  await api('routes', 'PUT', { rules: [routed('claude', '*', p.id, flagship)] }, 400);
   const populated = await api('routes/auto-populate', 'POST', {});
   assert.ok(populated.rules.length); assert.ok(populated.rules.every((r: ModelRouteRule) => runtime.db.provider(r.targetProviderId).protocol !== 'gemini-native'));
+});
+
+test('activating Gemini-group Claude providers writes the Anthropic endpoint, key and Gemini model names', async () => {
+  await geminiAccount();
+  const f = cliPaths(), base = 'https://ai.pukitcore.com';
+  const cli = await api('phuket/keys/124/import-provider', 'POST', { appType: 'claude' }, 201);
+  const desktop = await api('phuket/keys/124/import-provider', 'POST', { appType: 'claude-desktop' }, 201);
+  await activate(cli.id, true);
+  assert.deepEqual(JSON.parse(read(f.claude)).env, { ANTHROPIC_BASE_URL: base, ANTHROPIC_AUTH_TOKEN: rawKey,
+    ANTHROPIC_MODEL: flagship, ANTHROPIC_DEFAULT_OPUS_MODEL: flagship, ANTHROPIC_DEFAULT_SONNET_MODEL: flagship, ANTHROPIC_DEFAULT_HAIKU_MODEL: flash });
+  await activate(desktop.id, true);
+  assert.equal(JSON.parse(read(f.claudeDesktopMeta)).appliedId, CLAUDE_DESKTOP_PROFILE_ID);
+  const profile = JSON.parse(read(f.claudeDesktopProfile));
+  assert.equal(profile.inferenceProvider, 'gateway'); assert.equal(profile.inferenceGatewayBaseUrl, base); assert.equal(profile.inferenceGatewayApiKey, rawKey);
+  assert.deepEqual(profile.inferenceModels.slice(0, 2).map((m: { name: string }) => m.name), [flagship, flash]);
+  assert.equal(fs.existsSync(f.geminiEnv), false); assert.equal(fs.existsSync(f.geminiSettings), false);
+});
+
+test('Gemini-group Claude clients forward Messages with Gemini model names, not native Gemini requests', async () => {
+  await geminiAccount();
+  const calls: unknown[] = [];
+  const relay = await mock(async (req, res) => {
+    calls.push({ path: req.url, body: await bodyOf(req), version: req.headers['anthropic-version'], key: req.headers['x-api-key'], googleKey: req.headers['x-goog-api-key'] });
+    sendJson(res, { type: 'message', content: [] });
+  });
+  for (const appType of ['claude', 'claude-desktop']) {
+    const p = await api('phuket/keys/124/import-provider', 'POST', { appType }, 201);
+    await api(`providers/${p.id}`, 'PUT', { baseUrl: relay, apiKey: `fixture-${appType}` });
+    await activate(p.id);
+  }
+  const post = await startRouted([]), messages = [{ role: 'user', content: 'fixture' }];
+  for (const [prefix, alias, selected, key] of [['', 'haiku', flash, 'fixture-claude'], ['/claude-desktop', 'sonnet', flagship, 'fixture-claude-desktop']]) {
+    const response = await post(`${prefix}/v1/messages`, { model: alias, messages, max_tokens: 16 });
+    assert.equal(response.status, 200); assert.deepEqual(await response.json(), { type: 'message', content: [] });
+    assert.deepEqual(calls.splice(0), [{ path: '/v1/messages', body: { model: selected, messages, max_tokens: 16 }, version: '2023-06-01', key, googleKey: undefined }]);
+  }
 });
 
 const nativeLive = async (app: AppType) => (await api('overview')).liveCliStates.find((x: { appType: AppType }) => x.appType === app);

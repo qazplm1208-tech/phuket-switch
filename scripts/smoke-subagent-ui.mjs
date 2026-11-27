@@ -16,15 +16,27 @@ async function host() {
   Object.assign(process.env, { PHUKET_SWITCH_USER_HOME: home, PHUKET_SWITCH_HOME: path.join(temp, 'db'), TMP: temp, TEMP: temp, ASTRA_API_KEY: 'fixture-env-token' });
   fs.mkdirSync(path.join(home, '.cursor'), { recursive: true });
   const { createRuntime, createManagementApp } = await import('../dist/server/app.js');
-  const group = { id: 124, name: '测试 Gemini 分组', platform: 'gemini', status: 'active', models: [{ name: 'gemini-2.5-pro' }, { name: 'gemini-other' }] };
+  // Gemini is deliberately first: native group defaults must not depend on catalog order.
+  const group = { id: 124, name: '测试 Gemini 分组', platform: 'gemini', status: 'active', models: ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-9-image', 'gemini-8-flash-lite', 'gemini-other'].map(name => ({ name })) };
+  const groups = [group, { id: 106, name: '受限 Claude', platform: 'anthropic', status: 'active', operating_access: { allowed: false } },
+    { id: 107, name: 'Claude', platform: 'anthropic', status: 'active' }, { id: 65, name: 'GPT', platform: 'openai', status: 'active' },
+    { id: 800, name: '反重力', platform: 'antigravity', status: 'active' }, { id: 127, name: 'DeepSeek', platform: 'deepseek', status: 'active' }];
   const exampleKey = { id: 18, name: '测试密钥', key: 'fixture-group-credential', status: 'active', group_id: 124 };
+  const keys = [exampleKey, { ...exampleKey, id: 19, status: 'inactive' }];
   const runtime = createRuntime({ directBypass: { systemRoute: true }, fetch: async (u, init) => {
     const url = new URL(String(u)); let value = {};
     if (url.hostname === 'catalog.invalid') { assert.equal(new Headers(init.headers).get('authorization'), 'Bearer fixture-provider-credential'); return Response.json({ data: [] }); }
     if (url.href === customBase + '/models') { assert.equal(new Headers(init.headers).get('authorization'), `Bearer ${secret}`); return Response.json({ data: [] }); }
     assert.equal(url.origin, 'https://ai.pukitcore.com');
-    if (url.pathname.endsWith('/model-plaza') || url.pathname.endsWith('/groups/available')) value = [group];
-    if (url.pathname.endsWith('/keys')) value = { items: [exampleKey, { ...exampleKey, id: 19, status: 'inactive' }], total: 2 };
+    if (url.pathname.endsWith('/model-plaza') || url.pathname.endsWith('/groups/available')) value = groups;
+    if (url.pathname.endsWith('/keys')) {
+      if (init.method === 'POST') {
+        const { name, group_id } = JSON.parse(init.body); assert.equal(group_id, group.id);
+        const id = 18 + keys.length;
+        value = { id, name, group_id, key: `fixture-issued-${id}`, status: 'active' };
+        keys.unshift({ ...value, key: '****' }); // Only the issue response contains the full new key.
+      } else value = { items: keys, total: keys.length };
+    }
     if (url.pathname.endsWith('/auth/me')) value = { id: 221, email: 'desktop@example.invalid' };
     return Response.json({ data: value });
   } });
@@ -50,6 +62,14 @@ async function host() {
     assert.ok(!Object.hasOwn(customTests[0], 'apiKey')); assert.ok(customTests.slice(1).every(t => t.apiKey === secret));
     for (const r of [applied, ...customTests]) for (const field of ['providerId','groupId','phuketKeyId','autoCreatePhuketKey','keepExistingKey']) assert.ok(!Object.hasOwn(r, field));
     assert.equal(runtime.db.state('subagent').keySource, 'manual');
+    const imported = runtime.db.providers().filter(p => p.phuketGroupId === group.id);
+    assert.equal(imported.length, 4);
+    for (const [name, app, key] of [['CLI form', 'claude', exampleKey.key], [exampleKey.name, 'claude', exampleKey.key],
+      ['Desktop form', 'claude-desktop', 'fixture-issued-20'], ['Desktop issued', 'claude-desktop', 'fixture-issued-21']]) {
+      const p = imported.find(p => p.name === name); assert.ok(p, name); assert.equal(p.appType, app); assert.equal(p.apiKey, key);
+      assert.equal(p.protocol, 'anthropic-messages'); assert.equal(p.baseUrl, 'https://ai.pukitcore.com'); assert.equal(p.model, 'gemini-2.5-pro');
+      assert.deepEqual(p.claudeModelMap, { opus: p.model, sonnet: p.model, defaultModel: p.model, haiku: 'gemini-2.5-flash' });
+    }
     assert.deepEqual(runtime.db.state('directBypass'), { enabled: false, mode: 'skip-proxy', interfaceName: 'Fixture Ethernet',
       dnsServers: ['192.0.2.53', '2001:db8::53'], applyToSubagent: false });
   } finally {
@@ -77,6 +97,38 @@ async function renderer({ app, BrowserWindow, session }) {
     await js("document.querySelector('.subagent-test-actions input').click()"); await click('验证子代理');
     await wait("document.querySelector('.subagent-result')?.textContent.includes('模型列表可访问')", 'model discovery');
   };
+  async function geminiGroupFlows() {
+    for (const [client, id] of [['Codex',65], ['Gemini',124], ['反重力',800], ['Grok · 国产',127], ['Claude Desktop',107], ['Claude',107]]) {
+      await click(client); await click('添加配置');
+      await wait(`field('配置来源')?.value==='${id}'`, `${client} native group`);
+      if (client !== 'Claude') await click('取消');
+    }
+    await set('配置来源', '124');
+    await wait("field('客户端')?.value==='claude' && field('API 密钥')?.value==='key:18'", 'Gemini group keeps Claude client and uses existing key');
+    assert.deepEqual(await js("[...field('客户端').options].map(o=>o.value)"), ['gemini','antigravity','claude','claude-desktop','codex']);
+    assert.equal(await js("field('端点地址 · Anthropic').value"), 'https://ai.pukitcore.com');
+    await set('Haiku', 'gemini-other'); await click('自动填充全部');
+    assert.deepEqual(await js("['默认模型','Opus','Sonnet','Haiku'].map(label=>field(label).value)"), ['gemini-2.5-pro','gemini-2.5-pro','gemini-2.5-pro','gemini-2.5-flash']);
+    await set('供应商名称', 'CLI form'); await click('保存配置');
+    await wait("document.querySelector('.provider-list')?.textContent.includes('CLI form')", 'saved CLI form');
+    await click('从分组添加'); await wait("!!btn('我的密钥')", 'group tabs'); await click('我的密钥');
+    const importKey = "document.querySelector('tbody tr button[aria-label=导入到供应商]')";
+    await wait(`${importKey}?.disabled===false`, 'import existing key'); await js(`${importKey}.click()`);
+    await wait("fetch('/api/providers?appType=claude').then(r=>r.json()).then(ps=>ps.some(p=>p.name==='测试密钥'))", 'existing key imported for Claude');
+
+    await click('Claude Desktop'); await click('从分组添加');
+    const card = "[...document.querySelectorAll('.group-card')].find(c=>c.querySelector('h3').textContent==='测试 Gemini 分组')";
+    await wait(`${card}?.textContent.includes('多协议')`, 'Gemini multi-protocol card');
+    await js(`btn('添加为供应商', ${card}).click()`);
+    await wait("field('配置来源')?.value==='124' && field('客户端')?.value==='claude-desktop' && field('API 密钥')?.value==='key:18'", 'Gemini card keeps Desktop selection');
+    await set('API 密钥', 'auto'); await set('供应商名称', 'Desktop form'); await click('保存配置');
+    await wait("document.querySelector('.provider-list')?.textContent.includes('Desktop form')", 'saved Desktop form with auto-created key');
+    await click('从分组添加'); await wait(`!!(${card})`, 'Gemini card reloaded');
+    await js(`btn('用此分组新建密钥', ${card}).click()`); await wait("field('绑定分组')?.value==='124'", 'new key for Gemini group');
+    await set('名称', 'Desktop issued'); await click('创建密钥');
+    await wait("!!document.querySelector('.issued')", 'one-time key available'); await click('导入到供应商');
+    await wait("btn('已导入')?.disabled===true", 'new key imported for Claude Desktop');
+  }
   async function downloadPage() {
     assert.equal(await js("fetch('/api/direct-download').then(r=>r.status)"), 200);
     await click('详细设置'); await wait("!!btn('前往配置')", 'download settings shortcut');
@@ -228,9 +280,10 @@ async function renderer({ app, BrowserWindow, session }) {
     assert.ok(await js("field('API 密钥').validity.valueMissing")); await click('取消');
     await click('跨协议路由'); await wait("btn('一键填充全部跨协议路由')?.disabled===false", 'route population available');
     await click('一键填充全部跨协议路由'); await wait("!!document.querySelector('.route-table tbody tr')", 'populate routes without Codex takeover');
+    await geminiGroupFlows();
     await w.loadURL(origin+'/extensions#backups'); await wait("document.querySelector('.backup-list')?.textContent.includes('部署子代理插件与配置') && document.querySelector('.backup-list')?.textContent.includes('移除子代理配置')", 'backups');
     assert.ok(await js("['部署 AI 直连下载脚本与规则','移除 AI 直连下载规则'].every(s=>document.querySelector('.backup-list').textContent.includes(s)) && [...document.querySelectorAll('.backup-list .badge')].filter(b=>b.textContent==='AI 直连下载').length===3"));
-    console.log('Renderer passed: provider and subagent origin-key guards, configured proxy preset, read-only discovery, redacted diff/apply, MCP handshake, chunk policy, draft-preserving removal, shared bypass settings, downloader apply/probe/selected and all removal, backups, route population without takeover, light/dark widths.');
+    console.log('Renderer passed: native group defaults, Gemini group Claude forms and key imports, provider and subagent origin-key guards, configured proxy preset, read-only discovery, redacted diff/apply, MCP handshake, chunk policy, draft-preserving removal, shared bypass settings, downloader apply/probe/selected and all removal, backups, route population without takeover, light/dark widths.');
   } finally { w.destroy(); }
 }
 if (process.versions.electron) { const electron = await import('electron'); renderer(electron).then(() => electron.app.exit(0), e => { console.error(e); electron.app.exit(1); }); }

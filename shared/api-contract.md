@@ -4,7 +4,7 @@
 
 The loopback management listener serves the UI and the `/api` endpoints below. The separate inference listener honors enabled model routes (exact client/model match before `*`) and otherwise uses the current provider. `/v1/messages` and `/v1/responses` support JSON and SSE. Cross-protocol token counting is a local estimate. Logs contain request metadata, not message contents.
 
-Gemini native inference accepts `/v1beta/models` and the model actions below. `/gemini` and `/antigravity` prefixes pin the client selection. Caller `key` query parameters are removed; only the selected provider's credentials are sent upstream. Model routes do not translate Gemini-native requests.
+Gemini native inference accepts `/v1beta/models` and the model actions below. `/gemini` and `/antigravity` prefixes pin the client selection. Caller `key` query parameters are removed; only the selected provider's credentials are sent upstream. Model routes do not translate Gemini-native requests. PhuketAI Gemini groups also support Claude Code and Claude Desktop via `anthropic-messages` at `https://ai.pukitcore.com` (upstream `/v1/messages`), and Codex via `openai-responses` at `https://ai.pukitcore.com/v1`. Routing uses the selected provider's protocol, not the group's native protocol.
 
 `PUT /api/routes` replaces the complete rule list and assigns IDs to new rules. Auto-populate preserves existing rules (including disabled ones). Catalog sync backs up changed files and updates only the Codex catalog; takeover is configured separately.
 

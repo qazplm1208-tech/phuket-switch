@@ -1,4 +1,16 @@
-# Phuket Switch v1.1.3 · 2026-11-26
+# Phuket Switch v1.1.4 · 2026-11-27
+
+- **Gemini 分组**：`0.6 gemini`、`0.35 Gemini` 等分组现可用于 Claude Code CLI 和 Claude Desktop，通过 PhuketAI 的 `/v1/messages` 调用 Gemini 模型；继续支持 Gemini CLI、Antigravity 和 Codex。
+- **模型推荐与映射**：仅有 Gemini 模型时，默认模型、Opus 和 Sonnet 优先选择非 Lite 的旗舰对话模型；Haiku 优先使用非 Lite 的 Flash，没有 Flash 时沿用 Sonnet。推荐和映射均排除生图模型。
+- **添加配置**：优先预选当前客户端的原生分组；仍可手动选择其他兼容分组并绑定或新建密钥。
+
+## 下载与更新
+
+Windows x64 安装版：**`Phuket.Switch.Setup.1.1.4.exe`**；便携版：**`Phuket.Switch.1.1.4.exe`**。安装版可在「扩展与设置 → 偏好设置 → 软件更新」检查更新；便携版请从[官方发布页](https://github.com/qazplm1208-tech/phuket-switch/releases)下载后手动替换。
+
+---
+
+## Phuket Switch v1.1.3 · 2026-11-26
 
 - **子代理可靠性**：流式响应意外中断时可重试，不执行未收全的工具调用。修复取消任务、多任务等待和会话续跑时的状态处理。
 - **物理网卡直连与下载**：区分 DNS 否定应答与临时故障，改善直连隧道关闭；续传前验证文件版本，避免拼接不同内容，并防止并发下载或种子任务覆盖已有文件。
@@ -7,7 +19,7 @@
 - **Electron 与更新**：限制桌面窗口加载来源；重启安装更新失败时提示并退出。更新检查与下载独立使用系统网络。
 - **界面与状态同步**：Codex 接管期间更改速度或通道会同步模型菜单；区分已配置与代理运行中，未接管也可填充跨协议路由。直连开关跨页同步，下载规则可按所选目标移除，子代理本地端口预设与移除后的草稿保持正确。
 
-## 下载与更新
+### 下载与更新
 
 Windows x64 安装版：**`Phuket.Switch.Setup.1.1.3.exe`**；便携版：**`Phuket.Switch.1.1.3.exe`**。安装版可在「扩展与设置 → 偏好设置 → 软件更新」检查更新；便携版请从[官方发布页](https://github.com/qazplm1208-tech/phuket-switch/releases)下载后手动替换。已部署子代理或直连下载器的用户请重新应用，以同步新版脚本。
 

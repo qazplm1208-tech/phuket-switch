@@ -1,7 +1,7 @@
 import type { PhuketApiKeyView, PhuketGroupMetadata } from './types.js';
 import type { AppType, ClaudeModelMap, GptFastConfig, PhuketGroup, ProtocolType, ProxySettings, SpeedMode } from './types.js';
 
-export const APP_VERSION = '1.1.3';
+export const APP_VERSION = '1.1.4';
 export const GITHUB_REPO_OWNER = 'qazplm1208-tech';
 export const GITHUB_REPO_NAME = 'phuket-switch';
 export const GITHUB_REPO_URL = `https://github.com/${GITHUB_REPO_OWNER}/${GITHUB_REPO_NAME}`;
@@ -118,31 +118,38 @@ export function sortModelsNewestFirst(models: string[]): string[] {
   }).map(m => m.name);
 }
 
+function sortedChatModels(models: string[]) {
+  return sortModelsNewestFirst(models).filter(m => !/image/i.test(m));
+}
+
+function recommendedGeminiChat(chat: string[]) {
+  const native = chat.filter(m => /^gemini-/i.test(m));
+  const flagship = native.filter(m => !/lite/i.test(m));
+  const version = (m: string) => /^gemini-([\d.]+)/i.exec(m)?.[1];
+  const newest = flagship.filter(m => version(m) === version(flagship[0] ?? ''));
+  return newest.find(m => /-hydrogen(?:-|$)|-pro(?:-|$)/i.test(m)) ?? flagship[0] ?? native[0] ?? chat[0];
+}
+
 export function pickRecommendedModel(models: string[], protocol: ProtocolType): string | undefined {
-  const sorted = sortModelsNewestFirst(models).filter(m => !/^gpt-image-/i.test(m));
-  if (protocol === 'gemini-native') {
-    const chat = sorted.filter(m => !/image/i.test(m));
-    const native = chat.filter(m => /^gemini-/i.test(m));
-    const flagship = native.filter(m => !/lite/i.test(m));
-    const version = (m: string) => /^gemini-([\d.]+)/i.exec(m)?.[1];
-    const newest = flagship.filter(m => version(m) === version(flagship[0] ?? ''));
-    return newest.find(m => /-hydrogen(?:-|$)|-pro(?:-|$)/i.test(m)) ?? flagship[0] ?? native[0] ?? chat[0];
-  }
-  if (protocol === 'anthropic-messages') {
-    return sorted.find(m => /sonnet/i.test(m)) ?? sorted.find(m => /opus/i.test(m)) ?? sorted[0];
-  }
+  if (protocol === 'anthropic-messages') return buildSuggestedClaudeMap(models).defaultModel;
+  const sorted = sortedChatModels(models);
+  if (protocol === 'gemini-native') return recommendedGeminiChat(sorted);
   const usable = sorted.filter(m => !/chat-latest|codex-auto-review/i.test(m));
   const base = usable.filter(m => !m.endsWith('-fast'));
-  return base.find(m => /^gpt-\d/i.test(m) && !/(?:mini|nano|codex|chat)/i.test(m))
-    ?? base[0] ?? usable[0] ?? sorted[0];
+  const pool = base.length ? base : usable.length ? usable : sorted;
+  const preferred = base.find(m => /^gpt-\d/i.test(m) && !/(?:mini|nano|codex|chat)/i.test(m)) ?? pool[0];
+  return preferred && /^gemini-/i.test(preferred) ? recommendedGeminiChat(pool) : preferred;
 }
 
 export function buildSuggestedClaudeMap(models: string[]): ClaudeModelMap {
-  const sorted = sortModelsNewestFirst(models);
+  const sorted = sortedChatModels(models);
   if (!sorted.length) return {};
+  const hasClaude = sorted.some(m => /^claude-|opus|sonnet|haiku/i.test(m));
   const opus = sorted.find(m => /opus/i.test(m));
-  const sonnet = sorted.find(m => /sonnet/i.test(m)) ?? opus ?? sorted[0];
-  return { opus: opus ?? sonnet, sonnet, haiku: sorted.find(m => /haiku/i.test(m)) ?? sonnet, defaultModel: sonnet };
+  const sonnet = sorted.find(m => /sonnet/i.test(m)) ?? opus ?? (hasClaude ? sorted[0] : recommendedGeminiChat(sorted));
+  const flash = hasClaude ? [] : sorted.filter(m => /^gemini-.*flash/i.test(m));
+  const haiku = sorted.find(m => /haiku/i.test(m)) ?? flash.find(m => !/lite/i.test(m)) ?? flash[0] ?? sonnet;
+  return { opus: opus ?? sonnet, sonnet, haiku, defaultModel: sonnet };
 }
 
 export function buildAllFastModelMap(models: string[], existing: Record<string, string> = {}): Record<string, string> {
@@ -169,7 +176,7 @@ export function classifyPhuketGroup({ id, name, platform }: GroupIdentity): Grou
     return { adapterCategory: 'media_coming_soon', protocol: null, supportedAppTypes: [] };
   }
   if (/antigravity|反重力/i.test(identity)) return { adapterCategory: 'antigravity', protocol: 'gemini-native', supportedAppTypes: ['antigravity', 'gemini', 'claude', 'claude-desktop', 'codex'] };
-  if (/gemini/i.test(identity)) return { adapterCategory: 'gemini', protocol: 'gemini-native', supportedAppTypes: ['gemini', 'antigravity', 'codex'] };
+  if (/gemini/i.test(identity)) return { adapterCategory: 'gemini', protocol: 'gemini-native', supportedAppTypes: ['gemini', 'antigravity', 'claude', 'claude-desktop', 'codex'] };
   if (/anthropic|claude/i.test(identity)) {
     return { adapterCategory: 'claude', protocol: 'anthropic-messages', supportedAppTypes: ['claude', 'claude-desktop'] };
   }
