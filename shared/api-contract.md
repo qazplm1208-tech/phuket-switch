@@ -18,7 +18,11 @@ Connection diagnostics return `groupId` and, on failure, `guidance` for the fail
 
 Provider creation requires exactly one credential source: `apiKey`, `phuketKeyId` (reuse an active account key), or `autoCreatePhuketKey: true` with `phuketGroupId`. The latter two require a Phuket session and resolve the secret server-side. Provider updates accept at most one source; omit all three to keep the current key. On update, the stored group is used unless a new group is supplied. Both routes return only the masked provider view.
 
-Subagent preview and apply accept `enableChunkCompaction` (default `true`), `compactTriggerPct` (integer 40–95, default 88), and `compactKeepRecentGroups` (integer 0–20, default 2). Disabling model-initiated compaction leaves automatic full compaction and manual session maintenance available.
+Subagent preview and apply accept `maxContextTokens` (integer 5,712–1,000,000; initial default 272,000), `enableChunkCompaction` (default `true`), `compactTriggerPct` (integer 40–95, default 88), and `compactKeepRecentGroups` (integer 0–20, default 2). Disabling model-initiated compaction leaves automatic full compaction and manual session maintenance available.
+
+`GET /api/subagent/usage` is read-only. It projects metadata from `sessions/*.json` and `workers/*.json` under `PLUGIN_DATA`, or `~/.gemini/antigravity/plugin_data/gpt-astra-subagent` by default. Missing data yields empty lists and zero totals; unreadable, malformed, linked or oversized (>16 MiB) snapshots are skipped. `totals` and `byModel` sum cumulative **session** counters, grouping by model and protocol. `cachedTokens` is a subset of input, `reasoningTokens` a subset of output, and `totalTokens` is input plus output. `cacheHitRatePct` is 100 times summed cached tokens divided by summed input (one decimal; zero if no input). Worker usage is informational and never added to those totals. Timestamps are ISO 8601 UTC. History, commands, paths of changed files, worker results, cache keys and credentials are not returned.
+
+Proxy logs may include `inputTokens`, `cachedTokens`, `outputTokens`, `totalTokens` and `cacheHitRatePct` from the upstream JSON or SSE usage report, even for translated requests. Missing measurements are null or absent, not inferred cache misses. Input includes Anthropic cache reads and writes; only cache reads are hits. No message text is stored.
 
 `AppSettings.autoCheckUpdates` is an optional boolean, defaulting to `true` for new and existing databases. A settings PUT that omits it preserves the saved preference. Only the desktop main process checks GitHub on startup; downloading and restarting are separate user actions.
 
@@ -40,6 +44,7 @@ Subagent preview and apply accept `enableChunkCompaction` (default `true`), `com
 | `POST /api/direct-download/remove` | `RemoveDirectDownloadRequest` | 200 | `ApplyDirectDownloadResult` |
 | `POST /api/direct-download/test` | `DirectDownloadTestRequest` | 200 | `DirectDownloadTestResult` |
 | `GET /api/subagent` | `NoBody` | 200 | `SubagentStatus` |
+| `GET /api/subagent/usage` | `NoBody` | 200 | `SubagentUsageResponse` |
 | `POST /api/subagent/preview-diff` | `ApplySubagentRequest` | 200 | `SubagentDiffPreview` |
 | `POST /api/subagent/apply` | `ApplySubagentRequest` | 200 | `ApplySubagentResult` |
 | `POST /api/subagent/remove` | `RemoveSubagentRequest` | 200 | `ApplySubagentResult` |

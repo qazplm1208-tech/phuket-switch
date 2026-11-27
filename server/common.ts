@@ -59,6 +59,7 @@ export function pick<T extends object>(value: unknown, fields: readonly (keyof T
   return Object.fromEntries(fields.filter(k => Object.hasOwn(record, k)).map(k => [k, record[k as string]])) as T;
 }
 export const asNumber = (value: unknown): number | null => (typeof value === 'number' || typeof value === 'string' && value.trim() !== '') && Number.isFinite(Number(value)) ? Number(value) : null;
+export const cacheHitRatePct = (cached: number, input: number) => input > 0 ? Math.round(1000 * Math.min(cached, input) / input) / 10 : 0;
 export const secretField = (name: string) => /key|token|authorization|auth_token|password|passwd|secret|credential|cookie/i.test(name);
 export const redactRecognizable = (text: string) => text.replace(/rt_[A-Za-z0-9_-]{16,}|AIza[A-Za-z0-9_-]{12,}|\bsk-[A-Za-z0-9_-]+|\bccs-[A-Za-z0-9_-]{8,}|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|\bBearer\s+[^\s,"'\\]+/gi, '[REDACTED]');
 export function loopbackRequest(req: IncomingMessage) {

@@ -7,7 +7,7 @@ const limit = (c: SubagentConfig) => c.maxContextTokens.toLocaleString('en-US');
 const modelPolicy = (c: SubagentConfig) => c.allowModelOverride
   ? 'A call may explicitly select a model. Omit model on continuation to keep the session model.'
   : 'Model overrides are disabled. Omit model when resuming, including sessions saved under a previous default.';
-const compactionPolicy = (c: SubagentConfig) => `Automatic full compaction at ${c.compactTriggerPct}% of ${limit(c)} tokens. Compact a completed phase with astra_compact_session(session_id=..., mode="chunk", label=..., summary=...).${c.enableChunkCompaction ? ` The subagent can also call compact_context in either mode; it keeps the latest ${c.compactKeepRecentGroups} groups raw by default.` : ' Model-initiated compaction is disabled.'}`;
+const compactionPolicy = (c: SubagentConfig) => `Auto full compaction at ${c.compactTriggerPct}% (initial cap ${limit(c)}). Compact finished phases with astra_compact_session(session_id=..., mode="chunk", label=..., summary=...).${c.enableChunkCompaction ? ` Check compact_context(action="status"); freely adjust the session cap up to 1,000,000 with compact_context(action="set_limit", max_context_tokens=...). Use chunk mode early; keep ${c.compactKeepRecentGroups} recent groups.` : ' Model-initiated compaction is disabled.'}`;
 const notes = (c: SubagentConfig) => c.customInstructions?.trim() ? `\n\n### Workspace instructions\n${c.customInstructions.trim()}` : '';
 
 function nativeSettings(c: SubagentConfig) {
@@ -37,9 +37,9 @@ Review final_response, files_changed, commands_run (including exit codes), and t
 
   // Put operational guidance before optional free text; reserve space for both markers even with CRLF.
   const wind = id === 'windsurf';
-  const brief = `Delegate coding to gpt-astra-subagent. Give astra_run_task an absolute cwd, files and tests. Review the diff, files_changed, commands_run and final_response.
-Reuse session_id via astra_list_sessions(cwd=...). Omit model to keep it. Defaults: ${c.model} (${c.protocol}), ${c.defaultMode}, reasoning_effort=${c.reasoningEffort}; overrides ${c.allowModelOverride ? 'allowed' : 'disabled'}.
-Workers run to completion: max_steps=0 is unlimited; set a positive cap only intentionally. Use astra_spawn_worker for disjoint files and sessions. Launch its watch_command in a background shell (run_in_background=true); end your turn immediately. Do not poll: the host wakes you with the complete JSON report. Only without a background shell use astra_wait_worker or astra_worker_status.
+  const brief = `Delegate to gpt-astra-subagent. Give astra_run_task an absolute cwd, files and tests. Review diff, files_changed, commands_run and final_response.
+Reuse session_id from astra_list_sessions(cwd=...). Omit model on resume. Defaults: ${c.model} (${c.protocol}), ${c.defaultMode}, reasoning_effort=${c.reasoningEffort}; overrides ${c.allowModelOverride ? 'allowed' : 'disabled'}.
+max_steps=0 is unlimited. Give astra_spawn_worker disjoint files and sessions. Launch watch_command in a background shell (run_in_background=true); end your turn immediately. Do not poll; the host wakes you with the complete JSON report. Only without a background shell use astra_wait_worker or astra_worker_status.
 ${compactionPolicy(c)} Use readonly for inspections.`;
   const extra = wind ? '' : '\nFor an early full handoff use force=true. Keep allow_outside_cwd=false unless authorized. Edit permits trusted shell commands. Bulk maintenance with all_over_limit=true scans all saved sessions. Report failed verification; do not substitute another provider or disclose credentials.';
   const body = brief + extra;

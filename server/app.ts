@@ -16,6 +16,7 @@ import { runChatTest, runLocalProbe, runSpeedCompare } from './speedLab.js';
 import { applyPrompt, deleteMcp, listMcp, listSkills, upsertMcp } from './extensions.js';
 import { applyDirectDownload, getDirectDownloadStatus, previewDirectDownload, removeDirectDownload, testDirectDownload } from './directDownloadManager.js';
 import { applySubagent, getSubagentStatus, previewSubagent, removeSubagent, testSubagent } from './subagentManager.js';
+import { getSubagentUsage } from './subagentUsage.js';
 import { applyImagePrompt, getImagePromptStatus, removeImagePrompt } from './imagePrompt.js';
 import { detectCcSwitch, importCcSwitch } from './ccSwitchImport.js';
 import { diagnosticKey, runConnectionCheck } from './diagnostics.js';
@@ -77,6 +78,7 @@ export function createManagementApp(webRoot = defaultWebRoot, runtime = createRu
   route('POST /api/direct-download/remove', 200, v.removeDirectDownload, req => removeDirectDownload(db, req));
   route('POST /api/direct-download/test', 200, v.testDirectDownload, req => testDirectDownload(db, req));
   route('GET /api/subagent', 200, null, () => getSubagentStatus(db));
+  route('GET /api/subagent/usage', 200, null, () => getSubagentUsage(db));
   route('POST /api/subagent/preview-diff', 200, v.applySubagent, req => previewSubagent(db, phuket, req));
   route('POST /api/subagent/apply', 200, v.applySubagent, req => applySubagent(db, phuket, req));
   route('POST /api/subagent/remove', 200, v.removeSubagent, req => removeSubagent(db, req));

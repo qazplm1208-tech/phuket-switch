@@ -657,6 +657,10 @@ export interface ProxyRequestLog {
   fastFallback?: boolean;
   providerName?: string;
   ttftMs?: number | null;
+  inputTokens?: number | null;
+  cachedTokens?: number | null;
+  outputTokens?: number | null;
+  cacheHitRatePct?: number | null;
   totalTokens?: number | null;
   error?: string;
 }
@@ -793,6 +797,23 @@ export interface SubagentHarnessState {
   snippet: string; rulesSnippet: string; notes: string[];
 }
 export interface SubagentStatus { config: SubagentConfig; python: SubagentPythonInfo; userEnvHasKey: boolean; runtimeScriptPath: string; harnesses: SubagentHarnessState[]; updatedAt: string }
+export interface SubagentTokenUsage {
+  inputTokens: number; cachedTokens: number; outputTokens: number; reasoningTokens: number; totalTokens: number; cacheHitRatePct: number;
+}
+export interface SubagentSessionUsage extends SubagentTokenUsage {
+  sessionId: string; cwd: string; mode: SubagentMode | null; reasoningEffort: SubagentReasoningEffort | null; model: string; protocol: SubagentProtocol | null;
+  turns: number; lastInputTokens: number; maxContextTokens: number; compactions: number; chunkCompactions: number; filesChangedCount: number; updatedAt: string | null;
+}
+export interface SubagentWorkerUsage {
+  workerId: string; workerName: string; sessionId: string; status: 'running' | 'completed' | 'failed' | 'unknown'; model: string; protocol: SubagentProtocol | null;
+  stepsUsed: number; elapsedSeconds: number | null; startedAt: string | null; finishedAt: string | null; usage: SubagentTokenUsage | null;
+}
+export interface SubagentUsageTotals extends SubagentTokenUsage { sessionCount: number; turns: number }
+export interface SubagentUsageByModel extends SubagentUsageTotals { model: string; protocol: SubagentProtocol | null }
+/** Session counters are cumulative. Workers are metadata only, never added to totals. */
+export interface SubagentUsageResponse {
+  totals: SubagentUsageTotals; byModel: SubagentUsageByModel[]; sessions: SubagentSessionUsage[]; workers: SubagentWorkerUsage[]; updatedAt: string;
+}
 export interface ApplySubagentRequest extends Partial<Pick<SubagentConfig, 'protocol' | 'baseUrl' | 'model' | 'reasoningEffort' | 'defaultMode' | 'maxContextTokens' | 'enableChunkCompaction' | 'compactTriggerPct' | 'compactKeepRecentGroups' | 'allowModelOverride' | 'keyStorage' | 'writeRules' | 'pythonPath' | 'customInstructions'>> {
   providerId?: string; groupId?: number; phuketKeyId?: number; autoCreatePhuketKey?: boolean; apiKey?: string; keepExistingKey?: boolean; targets: SubagentHarnessId[];
 }
@@ -923,6 +944,7 @@ export interface ApiContract {
   'POST /api/direct-download/remove': Route<RemoveDirectDownloadRequest, ApplyDirectDownloadResult>;
   'POST /api/direct-download/test': Route<DirectDownloadTestRequest, DirectDownloadTestResult>;
   'GET /api/subagent': Route<NoBody, SubagentStatus>;
+  'GET /api/subagent/usage': Route<NoBody, SubagentUsageResponse>;
   'POST /api/subagent/preview-diff': Route<ApplySubagentRequest, SubagentDiffPreview>;
   'POST /api/subagent/apply': Route<ApplySubagentRequest, ApplySubagentResult>;
   'POST /api/subagent/remove': Route<RemoveSubagentRequest, ApplySubagentResult>;

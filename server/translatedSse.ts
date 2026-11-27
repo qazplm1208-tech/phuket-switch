@@ -1,12 +1,11 @@
 import { once } from 'node:events';
 import type { ServerResponse } from 'node:http';
 import { elapsed, isRecord, upstreamError } from './common.js';
-import { StreamMetrics } from './streamMetrics.js';
+import type { StreamMetrics } from './streamMetrics.js';
 
 export type Wire = Record<string, any>;
 export type StreamBody = NonNullable<Response['body']>;
-export type OnMetrics = (metrics: { ttftMs: number | null; totalTokens: number | null; failed: boolean }) => void;
-export interface StreamOptions { start?: number; signal?: AbortSignal }
+export interface StreamOptions { metrics: StreamMetrics; start: number; signal?: AbortSignal }
 
 // Decode by line, not by network chunk. Bound a single unfinished event, not the stream.
 async function* frames(body: StreamBody): AsyncGenerator<Wire> {
@@ -50,8 +49,7 @@ async function* frames(body: StreamBody): AsyncGenerator<Wire> {
 }
 
 const terminal = new Set(['message_stop', 'response.completed', 'response.incomplete', 'response.failed', 'error']);
-export async function translateSse(body: StreamBody, res: ServerResponse, convert: (v: Wire) => Wire[], failure: () => Wire[], onMetrics: OnMetrics, { start = performance.now(), signal }: StreamOptions) {
-  const metrics = new StreamMetrics(start);
+export async function translateSse(body: StreamBody, res: ServerResponse, convert: (v: Wire) => Wire[], failure: () => Wire[], { metrics, start, signal }: StreamOptions) {
   const write = async (v: Wire) => {
     if (res.destroyed || signal?.aborted) throw upstreamError();
     if (!res.write(`event: ${v.type}\ndata: ${JSON.stringify(v)}\n\n`)) await once(res, 'drain', { signal });
@@ -65,10 +63,7 @@ export async function translateSse(body: StreamBody, res: ServerResponse, conver
       metrics.observe(v);
       for (const out of convert(v)) {
         await write(out);
-        if (terminal.has(out.type)) {
-          metrics.observe(out);
-          res.end(); return;
-        }
+        if (terminal.has(out.type)) { res.end(); return; }
       }
     }
     throw upstreamError(); // EOF is not a successful message_stop / response.completed.
@@ -77,7 +72,5 @@ export async function translateSse(body: StreamBody, res: ServerResponse, conver
     if (res.destroyed || signal?.aborted) throw e;
     for (const out of failure()) await write(out);
     res.end();
-  } finally {
-    onMetrics({ ttftMs: metrics.firstTokenMs ?? metrics.firstByteMs, totalTokens: metrics.totalTokens, failed: metrics.failed });
   }
 }

@@ -105,6 +105,7 @@ export const api = {
   redeemHistory: (q: Input<'GET /api/phuket/redeem/history'> = {}, s?: AbortSignal) => send('GET /api/phuket/redeem/history', q, {}, s),
   groups: (s?: AbortSignal) => send('GET /api/phuket/groups', undefined, {}, s),
   subagent: (s?: AbortSignal) => send('GET /api/subagent', undefined, {}, s),
+  subagentUsage: (signal?: AbortSignal) => send('GET /api/subagent/usage', undefined, {}, signal),
   previewSubagent: (body: Input<'POST /api/subagent/preview-diff'>) => send('POST /api/subagent/preview-diff', body),
   applySubagent: (body: Input<'POST /api/subagent/apply'>) => send('POST /api/subagent/apply', body),
   removeSubagent: (body: Input<'POST /api/subagent/remove'>) => send('POST /api/subagent/remove', body),

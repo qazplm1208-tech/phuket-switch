@@ -25,10 +25,10 @@ function useChartWidth() {
   }, []);
   return { ref, width };
 }
-export function TrendChart({ points }: { points: PhuketUsageTrendPoint[] }) {
+export function TrendChart({ points, label = '近七天消耗与请求趋势' }: { points: PhuketUsageTrendPoint[]; label?: string }) {
   const { ref, width } = useChartWidth();
   return (
-    <div className="chart" ref={ref} role="img" aria-label="近七天消耗与请求趋势">
+    <div className="chart" ref={ref} role="img" aria-label={label}>
       {width > 0 && (
         <AreaChart width={width} height={160} data={points} margin={margin}>
           <CartesianGrid stroke="var(--border)" strokeDasharray="2 4" vertical={false} />

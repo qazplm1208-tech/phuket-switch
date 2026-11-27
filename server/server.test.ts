@@ -224,7 +224,7 @@ test('Claude Code routes tools, images, instructions and JSON replies through GP
       { type: 'reasoning', summary: [{ type: 'summary_text', text: 'summary' }] },
       { type: 'message', content: [{ type: 'output_text', text: 'answer' }] },
       { type: 'function_call', id: 'fc_2', call_id: 'call_next', name: 'lookup', arguments: '{"n":2}' },
-    ], usage: { input_tokens: 9, output_tokens: 4 } });
+    ], usage: { input_tokens: 9, input_tokens_details: { cached_tokens: 6 }, output_tokens: 4 } });
   });
   const p = await create('codex', { baseUrl, codexFastConfig: { ...DEFAULT_GPT_FAST_CONFIG, strategy: 'hybrid' } });
   const post = await startRouted([routed('claude', '*', p.id, 'wrong-fallback'), routed('claude', 'custom-gpt', p.id, p.model)]);
@@ -251,6 +251,7 @@ test('Claude Code routes tools, images, instructions and JSON replies through GP
   assert.deepEqual(msg.usage, { input_tokens: 9, output_tokens: 4 }); assert.equal(msg.content[0].thinking, 'summary');
   assert.deepEqual(msg.content.slice(1), [{ type: 'text', text: 'answer' }, { type: 'tool_use', id: 'call_next', name: 'lookup', input: { n: 2 } }]);
   const log = (await api('proxy/logs')).items[0]; assert.equal(log.fastFallback, true); assert.equal(log.protocol, 'openai-responses'); assert.equal(log.translatedFrom, 'anthropic-messages'); assert.equal(log.totalTokens, 13);
+  assert.deepEqual([log.inputTokens, log.cachedTokens, log.outputTokens, log.cacheHitRatePct], [9, 6, 4, 66.7]);
 });
 
 test('Codex routes Responses JSON to Claude, merges adjacent roles, skips built-ins and fails over before headers', async () => {
@@ -282,6 +283,27 @@ test('Codex routes Responses JSON to Claude, merges adjacent roles, skips built-
   assert.match(output.id, /^resp_/); assert.equal(output.object, 'response'); assert.equal(output.model, 'alias'); assert.equal(output.status, 'completed'); assert.equal(output.output_text, 'answer');
   assert.deepEqual(output.output[0].summary, [{ type: 'summary_text', text: 'plan' }]); assert.equal(output.output[1].content[0].text, 'answer'); assert.equal(output.output[2].call_id, 'tool2'); assert.equal(output.output[2].arguments, '{"n":2}');
   assert.equal(output.usage.total_tokens, 10); const log = (await api('proxy/logs')).items[0]; assert.equal(log.appType, 'codex'); assert.equal(log.translatedFrom, 'openai-responses'); assert.equal(log.providerId, backup.id); assert.equal(log.failoverCount, 1);
+});
+
+test('translated SSE logs upstream cache reads and writes across frames without retaining output or inventing missing measurements', async () => {
+  let attempts = 0;
+  const baseUrl = await mock(async (req, res) => {
+    await bodyOf(req); const measured = ++attempts === 1;
+    const events = [
+      { type: 'message_start', message: { id: 'msg_fixture', content: [], usage: measured ? { input_tokens: 3, cache_read_input_tokens: 5, cache_creation_input_tokens: 2 } : undefined } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: 'private-stream-output' } },
+      { type: 'content_block_stop', index: 0 }, { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: measured ? { output_tokens: 4 } : undefined }, { type: 'message_stop' },
+    ];
+    res.writeHead(200, { 'content-type': 'text/event-stream' }).end(events.map(e => `data: ${JSON.stringify(e)}\n\n`).join(''));
+  });
+  const p = await create('claude', { baseUrl }), post = await startRouted([routed('codex', 'alias', p.id, 'source-model')]);
+  for (const expected of [[10, 5, 4, 14, 50], [null, null, null, null, null]]) {
+    const result = await post('/v1/responses', { model: 'alias', stream: true, input: 'private-stream-input' });
+    assert.equal(result.status, 200); assert.match(await result.text(), /event: response\.completed/);
+    const log = (await api('proxy/logs?limit=1')).items[0];
+    assert.deepEqual([log.inputTokens, log.cachedTokens, log.outputTokens, log.totalTokens, log.cacheHitRatePct], expected);
+    assert.doesNotMatch(JSON.stringify(log), /private-stream-|local-client|sk-941d/);
+  }
 });
 
 test('health, empty overview, SPA navigation, local host and JSON guards', async () => {
@@ -935,7 +957,7 @@ test('native Gemini and agy takeovers isolate endpoints and keys, stream immedia
     const body = await bodyOf(req); calls.push({ app, path: req.url!, headers: req.headers, body });
     if (req.url?.includes(':streamGenerateContent')) {
       res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write(chunk('first'));
-      await pending; res.end(chunk('last', { promptTokenCount: 9, candidatesTokenCount: 3, totalTokenCount: 14 })); return;
+      await pending; res.end(chunk('last', { promptTokenCount: 9, cachedContentTokenCount: 2, candidatesTokenCount: 3, thoughtsTokenCount: 2, totalTokenCount: 14 })); return;
     }
     if (req.url?.includes('denied')) return sendJson(res, { error: 'private upstream detail' }, 403);
     sendJson(res, req.method === 'GET' ? { models: [{ name: `models/${app}` }] } : req.url?.includes(':countTokens') ? { totalTokens: 7 } : { candidates: [{ content: { parts: [{ text: 'ok' }] } }], usageMetadata: { totalTokenCount: 8 } });
@@ -963,6 +985,7 @@ test('native Gemini and agy takeovers isolate endpoints and keys, stream immedia
   const reader = stream.body!.getReader(); try { assert.match(Buffer.from((await reader.read()).value!).toString(), /first/); } finally { release(); }
   let rest = ''; for (;;) { const { done, value } = await reader.read(); if (done) break; rest += Buffer.from(value).toString(); } assert.match(rest, /last/);
   const streamed = (await api('proxy/logs?limit=1')).items[0]; assert.equal(streamed.appType, 'antigravity'); assert.equal(streamed.providerId, agy.id); assert.equal(streamed.protocol, 'gemini-native'); assert.equal(streamed.model, agy.model); assert.equal(streamed.totalTokens, 14);
+  assert.deepEqual([streamed.inputTokens, streamed.cachedTokens, streamed.outputTokens, streamed.cacheHitRatePct], [9, 2, 5, 22.2]);
   assert.deepEqual(calls.map(c => [c.app, c.path]), [['agy','/antigravity/v1beta/models?pageSize=2'], ['gem', `/v1beta/models/${gem.model}:generateContent`], ['gem', `/v1beta/models/${gem.model}:countTokens`], ['agy', `/antigravity/v1beta/models/${agy.model}:streamGenerateContent?alt=sse`]]);
   for (const [i, call] of calls.entries()) { const key = call.app === 'agy' ? agyKey : gemKey; assert.equal(call.headers['x-goog-api-key'], key); assert.equal(call.headers.authorization, `Bearer ${key}`); if (i) assert.deepEqual(call.body, payload); }
   const denied = await send(`${prefix}/denied:generateContent`, payload); assert.equal(denied.status, 403); const failure = (await responseJson(denied)).error; assert.equal(failure.code, 403); assert.equal(failure.status, 'PERMISSION_DENIED'); assert.ok(!failure.message.includes('private upstream detail'));
@@ -1077,12 +1100,13 @@ test('local proxy uses separate protocols, retries only before headers, streams 
   const requests: { path: string; headers: http.IncomingHttpHeaders; body: any }[] = [];
   let release!: () => void; const gate = new Promise<void>(r => { release = r; });
   const firstEvent = 'event: response.output_text.delta\r\ndata: {"type":"response.output_text.delta","delta":"Hello"}\r\n\r\n';
-  const finalEvent = 'data: {"type":"response.completed","response":{"usage":{"total_tokens":17}}}\n\ndata: [DONE]\n\n';
+  const finalEvent = 'data: {"type":"response.completed","response":{"usage":{"input_tokens":12,"input_tokens_details":{"cached_tokens":9},"output_tokens":5,"total_tokens":17}}}\n\ndata: [DONE]\n\n';
   const url = await mock(async (req, res) => {
     const body = await bodyOf(req); requests.push({ path: req.url!, headers: req.headers, body });
+    if (req.url === '/v1/chat/completions') return sendJson(res, { usage: { prompt_tokens: 8, prompt_tokens_details: { cached_tokens: 2 }, completion_tokens: 3 } });
     if (req.url?.startsWith('/v1/messages')) {
       if (req.headers['x-api-key'] === 'first-claude-key') { res.writeHead(503).end('busy'); return; }
-      res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ content: [{ text: 'ok' }] })); return;
+      res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ content: [{ text: 'ok' }], usage: { input_tokens: 1, cache_creation_input_tokens: 3, cache_read_input_tokens: 4, output_tokens: 2 } })); return;
     }
     if (body.model === 'gpt-6-astra-fast') { res.writeHead(502).end('unsupported'); return; }
     if (req.url === '/v1/responses' && body.model === 'gpt-6-astra') { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write(firstEvent); await gate; res.end(finalEvent); return; }
@@ -1110,6 +1134,10 @@ test('local proxy uses separate protocols, retries only before headers, streams 
   await (await post('/v1/messages/count_tokens', { model: 'sonnet', messages: [] })).text(); assert.equal(requests.at(-1)!.path, '/v1/messages/count_tokens');
   const logs = await api('proxy/logs'); assert.equal(logs.total, 7); assert.equal(logs.items.at(-1).providerId, second.id); assert.equal(logs.items.at(-1).failoverCount, 1);
   const hybrid = logs.items.find((l: any) => l.fastFallback); assert.equal(hybrid.effectiveModel, 'gpt-6-astra'); assert.equal(hybrid.totalTokens, 17); assert.equal(typeof hybrid.ttftMs, 'number');
+  assert.deepEqual([hybrid.inputTokens, hybrid.cachedTokens, hybrid.outputTokens, hybrid.cacheHitRatePct], [12, 9, 5, 75]);
+  const message = logs.items.at(-1), chat = logs.items.find((l: { model: string }) => l.model === 'keep');
+  assert.deepEqual([message.inputTokens, message.cachedTokens, message.outputTokens, message.totalTokens, message.cacheHitRatePct], [8, 4, 2, 10, 50]);
+  assert.deepEqual([chat.inputTokens, chat.cachedTokens, chat.outputTokens, chat.totalTokens, chat.cacheHitRatePct], [8, 2, 3, 11, 25]);
   for (const secret of ['private prompt', rawKey, 'native-key','queued-claude-key','never-forward-caller']) assert.ok(!JSON.stringify(logs).includes(secret));
   assert.equal((await api(`proxy/logs?limit=1&cursor=${logs.items[0].id}`)).items[0].id, logs.items[1].id);
   assert.equal((await api('proxy/stop', 'POST')).running, false); await api('proxy/logs', 'DELETE', undefined, 204); assert.equal((await api('proxy/logs')).total, 0);

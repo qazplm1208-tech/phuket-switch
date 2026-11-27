@@ -8,6 +8,7 @@ import LoginModal from './components/LoginModal';
 import { Btn, Empty, Modal, Skeleton } from './components/ui';
 import SwitchHub from './pages/SwitchHub';
 const Groups = lazy(() => import('./pages/GroupsAndKeys'));
+const UsageView = lazy(() => import('./pages/UsageView'));
 const Monitors = lazy(() => import('./pages/ChannelMonitor'));
 const ProxyView = lazy(() => import('./pages/LocalProxyView'));
 const Lab = lazy(() => import('./pages/SpeedLabView'));
@@ -88,6 +89,8 @@ export default function App() {
               <SwitchHub key={s.client} />
             ) : s.path === '/groups' ? (
               <Groups key={s.identity} />
+            ) : s.path === '/usage' ? (
+              <UsageView key={s.identity} />
             ) : s.path === '/monitor' ? (
               <Monitors />
             ) : s.path === '/proxy' ? (

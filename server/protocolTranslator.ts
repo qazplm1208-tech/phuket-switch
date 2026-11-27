@@ -1,7 +1,7 @@
 import type { ServerResponse } from 'node:http';
 import { upstreamError } from './common.js';
 import { finishResponse, messageUsage, outputText, records, responseItem, responseShell, stopReason, summaryText, wireId } from './protocolJson.js';
-import { translateSse, type OnMetrics, type StreamBody, type StreamOptions, type Wire } from './translatedSse.js';
+import { translateSse, type StreamBody, type StreamOptions, type Wire } from './translatedSse.js';
 export { anthropicToResponsesRequest, responsesToAnthropicRequest, anthropicToResponsesResponse, responsesToAnthropicResponse } from './protocolJson.js';
 
 interface Segment {
@@ -9,7 +9,7 @@ interface Segment {
 }
 const anthropicFailure = () => [{ type: 'error', error: { type: 'api_error', message: 'Provider stream failed.' } }];
 
-export function streamResponsesToAnthropicSse(body: StreamBody, res: ServerResponse, model: string, onMetrics: OnMetrics, options: StreamOptions = {}) {
+export function streamResponsesToAnthropicSse(body: StreamBody, res: ServerResponse, model: string, options: StreamOptions) {
   const segments = new Map<string, Segment>(), pending: Segment[] = [], indices = new Map<string, number>();
   let started = false, hasTool = false;
   function segment(output: number, part: number, block: Wire) {
@@ -83,11 +83,11 @@ export function streamResponsesToAnthropicSse(body: StreamBody, res: ServerRespo
     }
     drain(events); return events;
   }
-  return translateSse(body, res, convert, anthropicFailure, onMetrics, options);
+  return translateSse(body, res, convert, anthropicFailure, options);
 }
 
 interface OutputBlock { index: number; item: Wire; value: string; closed: boolean }
-export function streamAnthropicToResponsesSse(body: StreamBody, res: ServerResponse, model: string, onMetrics: OnMetrics, options: StreamOptions = {}) {
+export function streamAnthropicToResponsesSse(body: StreamBody, res: ServerResponse, model: string, options: StreamOptions) {
   const blocks = new Map<number, OutputBlock>();
   let shell: Wire, usage: Wire = {}, reason = '', sequence = 0;
   const event = (type: string, fields: Wire) => ({ type, sequence_number: sequence++, ...fields });
@@ -158,5 +158,5 @@ export function streamAnthropicToResponsesSse(body: StreamBody, res: ServerRespo
     }
     return events;
   }
-  return translateSse(body, res, convert, failure, onMetrics, options);
+  return translateSse(body, res, convert, failure, options);
 }

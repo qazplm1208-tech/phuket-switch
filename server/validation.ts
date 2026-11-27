@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { isIP } from 'node:net';
 import { directBypassModes, directDownloadModes, directDownloadTargets, paymentStatuses, subagentHarnessIds, subagentProtocols } from '../shared/types.js';
 import { apps } from './db.js';
-import { MODEL_SLUG } from '../shared/constants.js';
+import { MODEL_SLUG, MAX_SUBAGENT_CONTEXT_TOKENS, MIN_SUBAGENT_CONTEXT_TOKENS } from '../shared/constants.js';
 import { httpBase, normalizeLoginEmail, normalizeLoginPassword, normalizeLoginToken } from './common.js';
 
 export const appType = z.enum(apps), target = z.enum(['claude','codex']);
@@ -77,7 +77,7 @@ export const applySubagent = z.strictObject({
   autoCreatePhuketKey: z.boolean().optional(), keepExistingKey: z.boolean().optional(),
   reasoningEffort: z.enum(['none','low','medium','high','xhigh','max']).optional(), defaultMode: z.enum(['edit','readonly']).optional(),
   enableChunkCompaction: z.boolean().optional(), compactTriggerPct: z.number().int().min(40).max(95).optional(), compactKeepRecentGroups: z.number().int().min(0).max(20).optional(),
-  maxContextTokens: z.int().min(5712).max(272000).optional(), allowModelOverride: z.boolean().optional(),
+  maxContextTokens: z.int().min(MIN_SUBAGENT_CONTEXT_TOKENS).max(MAX_SUBAGENT_CONTEXT_TOKENS).optional(), allowModelOverride: z.boolean().optional(),
   keyStorage: z.enum(['user-env','mcp-env']).optional(), writeRules: z.boolean().optional(),
   customInstructions: z.string().max(8192).refine(s => !s.includes('PHUKET_SWITCH_SUBAGENT_')).optional(),
 }).refine(r => sourceCount(r) + Number(!!r.providerId) <= 1 && (!r.autoCreatePhuketKey || !!r.groupId), { message: 'Choose one credential source; creating a key requires a group.' });

@@ -178,11 +178,12 @@ export function Section({ title, count, actions }: { title: string; count?: numb
     </div>
   );
 }
-export function Metric({ label, value }: { label: string; value: ReactNode }) {
+export function Metric({ label, value, detail }: { label: string; value: ReactNode; detail?: ReactNode }) {
   return (
     <div className="metric">
       <span>{label}</span>
       <strong>{value}</strong>
+      {detail != null && <small>{detail}</small>}
     </div>
   );
 }

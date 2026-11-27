@@ -1,4 +1,4 @@
-import { Activity, Bot, Cable, Gauge, KeyRound, Layers2, Settings2 } from 'lucide-react';
+import { Activity, BarChart3, Bot, Cable, Gauge, KeyRound, Layers2, Settings2 } from 'lucide-react';
 import type {
   AppType,
   ChannelMonitorStatus,
@@ -12,6 +12,7 @@ import type {
 export const NAV = [
   { path: '/', name: '供应商', icon: Layers2 },
   { path: '/groups', name: '分组与密钥', icon: KeyRound },
+  { path: '/usage', name: '用量', icon: BarChart3 },
   { path: '/monitor', name: '渠道状态', icon: Activity },
   { path: '/proxy', name: '本地代理', icon: Cable },
   { path: '/lab', name: '检测与测速', icon: Gauge },
@@ -89,11 +90,12 @@ export function systemNote(r?: SystemApplyResult | null) {
     .filter(Boolean)
     .join(' · ');
 }
-export function lastWeek() {
+export function recentDays(days: number) {
   const to = new Date(),
     from = new Date(to);
-  from.setDate(from.getDate() - 6);
+  from.setDate(from.getDate() - (days - 1));
   const day = (d: Date) =>
     `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
   return { from: day(from), to: day(to) };
 }
+export const lastWeek = () => recentDays(7);

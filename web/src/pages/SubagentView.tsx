@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { CheckCheck, FileDiff, PlugZap, RefreshCw, Terminal, Trash2 } from 'lucide-react';
+import { ArrowRight, CheckCheck, FileDiff, PlugZap, RefreshCw, Terminal, Trash2 } from 'lucide-react';
 import type { ApplySubagentRequest, ApplySubagentResult, SubagentDiffPreview, SubagentHarnessId, SubagentHarnessState, SubagentStatus, SubagentTestResult } from '@shared/types';
 import { api, ApiFailure } from '../api/client';
 import SubagentConfigPanel from '../components/SubagentConfigPanel';
@@ -93,10 +93,14 @@ function Editor({ status, replace, stale, loading, reload, groups, keys }: { sta
   return <div className="subagent-view stack">
     {stale && <Notice retry={refresh}>状态刷新失败，当前显示上次读取的结果。</Notice>}
     <section className="card padded subagent-panel" aria-label="运行环境与状态概览">
-      <Section title="运行环境与状态概览" actions={<IconBtn icon={RefreshCw} label="刷新子代理状态" className={loading ? 'subagent-refreshing' : ''} disabled={busy || loading} onClick={refresh} />} />
+      <Section title="运行环境与状态概览" actions={<>
+        <Btn kind="ghost" icon={ArrowRight} disabled={busy} onClick={() => s.navigate('/usage', 'subagent')}>查看用量</Btn>
+        <IconBtn icon={RefreshCw} label="刷新子代理状态" className={loading ? 'subagent-refreshing' : ''} disabled={busy || loading} onClick={refresh} />
+      </>} />
       <div className="subagent-runtime"><Terminal size={18} aria-hidden="true"/><Badge dot tone={pythonReady ? 'good' : 'amber'}>{pythonReady ? `Python ${status.python.version} · 就绪` : '需要 Python 3.10+'}</Badge><code>{status.python.executable || '未检测到解释器'}</code></div>
       {!pythonReady && <Notice>请安装 Python 3.10 或更高版本，或在高级选项中指定解释器路径。</Notice>}
       <div className="subagent-metrics"><Metric label="当前默认模型" value={<code>{c.model}</code>} /><Metric label="协议" value={protocols[c.protocol][0]}/><Metric label="推理强度" value={c.reasoningEffort}/>
+        <Metric label="上下文上限" value={c.maxContextTokens === 1_000_000 ? '1M' : c.maxContextTokens % 1000 === 0 ? `${c.maxContextTokens / 1000}K` : c.maxContextTokens.toLocaleString('zh-CN')} />
         <Metric label="分块压缩" value={c.enableChunkCompaction ? `已开启 · ${c.compactTriggerPct}% 兜底` : `仅自动压缩 · ${c.compactTriggerPct}%`}/>
         <Metric label="凭据来源" value={<>{sourceNames[c.keySource]}<small>{maskOnly(c.maskedKey) || (status.userEnvHasKey ? '环境变量已配置' : '未配置密钥')}</small></>}/><Metric label="已部署客户端" value={`${installed.length} / ${status.harnesses.length}`}/><Metric label="最近更新" value={c.updatedAt ? time(c.updatedAt, true) : '尚未部署'}/></div>
       <div className="subagent-test-actions"><Btn icon={PlugZap} busy={pending === 'test'} disabled={busy || !!endpointError} onClick={() => action('test', async () => {

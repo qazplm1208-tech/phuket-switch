@@ -1,9 +1,9 @@
 import fs from 'node:fs';
 import { createHash } from 'node:crypto';
-import { allowedGroupModels, canCreateGroupKey, defaultBaseUrlForApp, PHUKET_BASE_URL, pickRecommendedModel } from '../shared/constants.js';
+import { allowedGroupModels, canCreateGroupKey, defaultBaseUrlForApp, MAX_SUBAGENT_CONTEXT_TOKENS, MIN_SUBAGENT_CONTEXT_TOKENS, PHUKET_BASE_URL, pickRecommendedModel } from '../shared/constants.js';
 import { type ApplySubagentRequest, type ApplySubagentResult, type RemoveSubagentRequest, type SubagentDiffPreview, type SubagentStatus, type SubagentTestRequest, type SubagentTestResult } from '../shared/types.js';
 import { parseSubagentBase, subagentApiRoot } from '../shared/subagentEndpoint.js';
-import { ApiError, bad, conflict, elapsed, isRecord, now, redactRecognizable, secretField } from './common.js';
+import { ApiError, bad, conflict, elapsed, isRecord, now, secretField } from './common.js';
 import { commitFiles, jsonText, managedText, parseJson, subagentPaths, type Plan } from './configFiles.js';
 import { maskApiKey, type SwitchDb } from './db.js';
 import type { PhuketClient } from './phuketClient.js';
@@ -12,15 +12,9 @@ import { checkUserKeyDestinations, harnessStates, installPlan, uninstallPlan, us
 import { bundledScript, detectPython, handshake } from './subagentPython.js';
 import { redactToml } from './surgicalToml.js';
 import { adaptiveFetch, readBodyBytes } from './upstreamTransport.js';
+import { scrub, secrets } from './subagentRedaction.js';
 
 const mask = '[REDACTED]';
-function secrets(db: SwitchDb, extra = '') {
-  const session = db.state('phuketSession');
-  return [extra, db.state('subagent').apiKey, db.state('imagePrompt').apiKey, session?.token, session?.refreshToken, ...db.providers().map(p => p.apiKey)].filter((s): s is string => !!s).sort((a, b) => b.length - a.length);
-}
-function scrub(text: string, keys: string[]) {
-  return redactRecognizable(keys.reduce((s, key) => s.replaceAll(key, mask), text));
-}
 function publicStrings<T>(value: T, keys: string[]): T {
   if (typeof value === 'string') return scrub(value, keys) as T;
   if (Array.isArray(value)) return value.map(v => publicStrings(v, keys)) as T;
@@ -30,7 +24,7 @@ function publicStrings<T>(value: T, keys: string[]): T {
 function safeJson(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(safeJson);
   if (!isRecord(value)) return value;
-  const publicField = (k: string, v: unknown) => ['ASTRA_MAX_CONTEXT_TOKENS', 'ASTRA_KEY_STORAGE', 'keywords'].includes(k) || (k === 'ASTRA_COMPACT_TRIGGER_TOKENS' && typeof v === 'string' && /^\d{1,6}$/.test(v));
+  const publicField = (k: string, v: unknown) => ['ASTRA_KEY_STORAGE', 'keywords'].includes(k) || (['ASTRA_MAX_CONTEXT_TOKENS', 'ASTRA_COMPACT_TRIGGER_TOKENS'].includes(k) && typeof v === 'string' && /^\d{1,7}$/.test(v));
   return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, (secretField(k) && !publicField(k, v)) || /headers/i.test(k) ? mask : safeJson(v)]));
 }
 function safeFile(file: string, text: string | null, keys: string[]) {
@@ -101,7 +95,7 @@ async function resolveConfig(db: SwitchDb, phuket: PhuketClient, req: ApplySubag
   } else if (preview) c.apiKey = mask;
   else throw bad('Choose a provider or supply an API key.');
   // Old saved configurations could exceed the Python runtime's hard context bounds.
-  c.maxContextTokens = Math.max(5712, Math.min(272000, c.maxContextTokens));
+  c.maxContextTokens = Math.max(MIN_SUBAGENT_CONTEXT_TOKENS, Math.min(MAX_SUBAGENT_CONTEXT_TOKENS, c.maxContextTokens));
   if (!parseSubagentBase(c.baseUrl) || (c.apiKey && !/^[\x21-\x7e]{1,16384}$/.test(c.apiKey))) throw bad('Invalid subagent connection settings.');
   c.maskedKey = maskApiKey(c.apiKey); for (const id of targets) c.targets[id] = true;
   return c;

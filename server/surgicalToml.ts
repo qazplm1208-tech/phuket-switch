@@ -96,7 +96,7 @@ export function redactToml(text: string) {
   for (const s of spans(text)) {
     if (s.header) continue;
     const value = text.slice(s.value, s.valueEnd);
-    if (same(s.path, ['mcp_servers', 'gpt-astra-subagent', 'env', 'ASTRA_COMPACT_TRIGGER_TOKENS']) && /^"\d{1,6}"$/.test(value)) continue;
+    if (same(s.path.slice(0, -1), ['mcp_servers', 'gpt-astra-subagent', 'env']) && ['ASTRA_MAX_CONTEXT_TOKENS', 'ASTRA_COMPACT_TRIGGER_TOKENS'].includes(s.path.at(-1)!) && /^"\d{1,7}"$/.test(value)) continue;
     // Inline tables may contain arbitrary credentials, so mask the entire value.
     if (s.path.some(secretField) || /[{}]/.test(value) || /(?:token|secret|api.key|password|bearer)/i.test(value)) edits.push({ start: s.value, end: s.valueEnd, text: '"[REDACTED]"' });
   }

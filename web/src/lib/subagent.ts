@@ -1,4 +1,4 @@
-import { allowedGroupModels, defaultBaseUrlForApp, MODEL_SLUG, PHUKET_BASE_URL, PHUKET_GPT_BASE_URL, pickRecommendedModel } from '@shared/constants';
+import { allowedGroupModels, defaultBaseUrlForApp, MAX_SUBAGENT_CONTEXT_TOKENS, MIN_SUBAGENT_CONTEXT_TOKENS, MODEL_SLUG, PHUKET_BASE_URL, PHUKET_GPT_BASE_URL, pickRecommendedModel } from '@shared/constants';
 import { parseSubagentBase, subagentApiRoot } from '@shared/subagentEndpoint';
 import type { ApplySubagentRequest, PhuketApiKeyView, PhuketGroup, ProviderView, SubagentConfig, SubagentHarnessId, SubagentProtocol, SubagentStatus, SubagentTestRequest } from '@shared/types';
 
@@ -87,13 +87,13 @@ function inRange(raw: string, min: number, max: number) {
   return raw.trim() !== '' && Number.isInteger(+raw) && +raw >= min && +raw <= max;
 }
 export function compactionIssue(d: Draft) {
-  if (!inRange(d.context, 5712, 272000)) return '上下文上限须为 5,712 至 272,000 之间的整数。';
+  if (!inRange(d.context, MIN_SUBAGENT_CONTEXT_TOKENS, MAX_SUBAGENT_CONTEXT_TOKENS)) return '上下文上限须为 5,712 至 1,000,000 之间的整数。';
   if (!inRange(d.compactTriggerPct, 40, 95)) return '自动兜底触发阈值须为 40 至 95 之间的整数。';
   if (!inRange(d.compactKeepRecentGroups, 0, 20)) return '分块保留最近交互组须为 0 至 20 之间的整数。';
   return '';
 }
 export function triggerTokenHint(d: Draft) {
-  if (!inRange(d.context, 5712, 272000) || !inRange(d.compactTriggerPct, 40, 95)) return '阈值范围：40% 至 95%。';
+  if (!inRange(d.context, MIN_SUBAGENT_CONTEXT_TOKENS, MAX_SUBAGENT_CONTEXT_TOKENS) || !inRange(d.compactTriggerPct, 40, 95)) return '阈值范围：40% 至 95%。';
   const requested = Math.round(+d.context * +d.compactTriggerPct / 100);
   return requested < 5584 ? '受运行时下限限制，达到 5,584 词元时自动兜底压缩。'
     : `达到 ${d.compactTriggerPct}%（约 ${requested.toLocaleString('zh-CN')} 词元）时自动兜底压缩。`;

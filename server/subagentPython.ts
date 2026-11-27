@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import { SUBAGENT_VERSION } from '../shared/constants.js';
 import type { SubagentProtocol, SubagentPythonInfo } from '../shared/types.js';
 import { conflict } from './common.js';
 
@@ -60,7 +61,7 @@ export async function handshake(executable: string, model: string, protocol: Sub
             const { id, result } = JSON.parse(line);
             if (id === 1 && !version && result.serverInfo?.name === 'gpt-astra-subagent' && result._meta?.model === model && result._meta?.api_format === protocol) {
               version = result.serverInfo.version; send({ method: 'notifications/initialized' }); send({ id: 2, method: 'tools/list', params: {} });
-            } else if (id === 2 && version === '1.5.0') {
+            } else if (id === 2 && version === SUBAGENT_VERSION) {
               const tools = result.tools.map((t: { name: string }) => t.name);
               if (tools.length !== toolNames.length || !toolNames.every(t => tools.includes(t))) return fail();
               resolve({ tools, version });

@@ -293,15 +293,13 @@ export class ProxyServer {
           if (translated) {
             if (isSse && upstream.body) {
               const stream = toClaude ? streamAnthropicToResponsesSse : streamResponsesToAnthropicSse;
-              await stream(upstream.body, res, model, m => {
-                metrics.firstTokenMs = m.ttftMs; metrics.totalTokens = m.totalTokens;
-                if (m.failed) { log.error = 'Provider stream failed.'; log.statusCode = 502; }
-              }, { start, signal });
+              await stream(upstream.body, res, model, { start, signal, metrics });
+              if (metrics.failed) { log.error = 'Provider stream failed.'; log.statusCode = 502; }
             } else {
               const value = await readJson(upstream);
               if (!isRecord(value)) throw new ApiError(502, 'UPSTREAM_ERROR', 'Expected a provider JSON response.');
               const result = toClaude ? anthropicToResponsesResponse(value, model) : responsesToAnthropicResponse(value, model);
-              metrics.firstByteMs = elapsed(start); metrics.observe(result); res.json(result);
+              metrics.firstByteMs = elapsed(start); metrics.observe(value); res.json(result);
             }
             return;
           }
@@ -333,7 +331,8 @@ export class ProxyServer {
       if (settings.logRequests) {
         const safe = (v: string) => all.reduce((text, p) => p.apiKey ? text.replaceAll(p.apiKey, '[REDACTED]') : text, redactRecognizable(v));
         log.model = safe(log.model); log.effectiveModel = safe(log.effectiveModel); if (log.providerName) log.providerName = safe(log.providerName);
-        this.db.addLog({ ...log, latencyMs: elapsed(start), ttftMs: metrics.firstTokenMs ?? metrics.firstByteMs, totalTokens: metrics.totalTokens });
+        this.db.addLog({ ...log, latencyMs: elapsed(start), ttftMs: metrics.firstTokenMs ?? metrics.firstByteMs,
+          inputTokens: metrics.inputTokens, cachedTokens: metrics.cachedTokens, outputTokens: metrics.outputTokens, totalTokens: metrics.totalTokens, cacheHitRatePct: metrics.cacheHitRatePct });
       }
     }
   }

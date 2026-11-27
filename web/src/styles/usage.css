@@ -1,0 +1,12 @@
+.usage-view [role='tabpanel'] { gap: 12px; }
+.usage-view section section { gap: 7px; margin-top: 6px; }
+.usage-view .section-head .actions { flex-wrap: wrap; }
+.usage-view .metric small { overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.usage-view td { white-space: nowrap; }
+.usage-view td code { display: block; max-width: 36ch; overflow: hidden; text-overflow: ellipsis; }
+.usage-view td progress { display: block; min-width: 6em; margin-top: 4px; }
+
+@media (min-width: 601px) and (max-width: 1100px) {
+  .usage-view .strip { grid-auto-flow: row; grid-template-columns: repeat(3, minmax(0, 1fr)); row-gap: 12px; }
+  .usage-view .strip .metric:nth-child(3n + 1) { border-left: none; }
+}

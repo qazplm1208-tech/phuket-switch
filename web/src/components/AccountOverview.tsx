@@ -1,10 +1,29 @@
 import { lazy, Suspense } from 'react';
-import { Activity, Layers2 } from 'lucide-react';
+import { Activity, ArrowRight, Layers2 } from 'lucide-react';
+import type { PhuketUsageTrendPoint } from '@shared/types';
 import { credits, num } from '../lib/display';
 import { useStudio } from '../lib/studio';
-import { Badge, Empty, Metric, Notice, Section, Skeleton } from './ui';
+import { Badge, Btn, Empty, Metric, Notice, Section, Skeleton } from './ui';
 import LoginGate from './LoginGate';
 const TrendChart = lazy(() => import('./Charts').then((m) => ({ default: m.TrendChart })));
+export function UsageTrend({ points, period }: { points?: PhuketUsageTrendPoint[]; period: string }) {
+  return (
+    <div>
+      <Section title={`${period}趋势`} />
+      {points?.length ? (
+        <div className="card padded">
+          <div className="inline chart-key">
+            <span><i className="dot blue" />消耗</span>
+            <span><i className="dot idle" />请求</span>
+          </div>
+          <Suspense fallback={<Skeleton />}>
+            <TrendChart points={points} label={`${period}消耗与请求趋势`} />
+          </Suspense>
+        </div>
+      ) : <Empty icon={Activity} title="暂无趋势数据" />}
+    </div>
+  );
+}
 export default function AccountOverview() {
   const s = useStudio(),
     a = s.session?.account,
@@ -45,28 +64,7 @@ export default function AccountOverview() {
       )}
       {logged && (
         <div className="chart-duo">
-          <div>
-            <Section title="近 7 天趋势" />
-            {d?.trend.length ? (
-              <div className="card padded">
-                <div className="inline chart-key">
-                  <span>
-                    <i className="dot blue" />
-                    消耗
-                  </span>
-                  <span>
-                    <i className="dot idle" />
-                    请求
-                  </span>
-                </div>
-                <Suspense fallback={<Skeleton />}>
-                  <TrendChart points={d.trend} />
-                </Suspense>
-              </div>
-            ) : (
-              <Empty icon={Activity} title="暂无趋势数据" />
-            )}
-          </div>
+          <UsageTrend points={d?.trend} period="近 7 天" />
           <div>
             <Section title="模型消耗" />
             {models.length ? (
@@ -90,6 +88,9 @@ export default function AccountOverview() {
       {!logged && !key && !s.usage.loading && !s.usage.error && (
         <p className="muted">当前没有可用的 API 密钥用量快照。</p>
       )}
+      <div className="actions end">
+        <Btn kind="ghost" icon={ArrowRight} onClick={() => s.navigate('/usage', 'phuket')}>查看完整用量与调用明细</Btn>
+      </div>
     </div>
   );
 }

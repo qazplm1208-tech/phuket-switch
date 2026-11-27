@@ -5,9 +5,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, test } from 'node:test';
 import type { AddressInfo } from 'node:net';
-import { subagentHarnessIds as ids, type SubagentStatus } from '../shared/types.js';
+import { subagentHarnessIds as ids, type SubagentStatus, type SubagentUsageResponse } from '../shared/types.js';
 import { createManagementApp, createRuntime } from './app.js';
 import { subagentPaths } from './configFiles.js';
+import { isRecord } from './common.js';
 import { account } from './phuketViews.js';
 import { IMAGE_PROMPT_END, IMAGE_PROMPT_START } from './imagePrompt.js';
 import { readAstraUserEnvKey, writeAstraUserEnvKey } from './subagentEnvironment.js';
@@ -16,7 +17,7 @@ import { SUBAGENT_END, SUBAGENT_START, subagentBlock } from './subagentRules.js'
 import { parseToml } from './surgicalToml.js';
 
 const name = 'gpt-astra-subagent', secret = 'opaque-unit-test-credential', previous = 'other-unrecognizable-secret';
-const envs = ['PHUKET_SWITCH_USER_HOME','PHUKET_SWITCH_HOME','APPDATA','LOCALAPPDATA','ASTRA_API_KEY'];
+const envs = ['PHUKET_SWITCH_USER_HOME','PHUKET_SWITCH_HOME','APPDATA','LOCALAPPDATA','ASTRA_API_KEY','PLUGIN_DATA'];
 let env: Record<string, string | undefined>, root: string, home: string, origin: string, runtime: ReturnType<typeof createRuntime>, server: http.Server;
 let upstream: typeof fetch;
 const read = (file: string) => fs.readFileSync(file, 'utf8'), doc = (file: string) => JSON.parse(read(file));
@@ -27,7 +28,7 @@ beforeEach(async () => {
   env = Object.fromEntries(envs.map(k => [k, process.env[k]]));
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'phuket-harness-')); home = path.join(root, 'home'); fs.mkdirSync(home);
   process.env.PHUKET_SWITCH_USER_HOME = home; process.env.PHUKET_SWITCH_HOME = path.join(root, 'db');
-  process.env.APPDATA = path.join(root, 'forbidden-roaming'); process.env.LOCALAPPDATA = path.join(root, 'forbidden-local'); delete process.env.ASTRA_API_KEY;
+  process.env.APPDATA = path.join(root, 'forbidden-roaming'); process.env.LOCALAPPDATA = path.join(root, 'forbidden-local'); delete process.env.ASTRA_API_KEY; delete process.env.PLUGIN_DATA;
   upstream = async () => { throw new Error('Unexpected upstream request'); };
   runtime = createRuntime({ fetch: (url, init) => upstream(url, init) });
   server = http.createServer(createManagementApp(root, runtime));
@@ -59,6 +60,58 @@ function seedFiles() {
   fs.mkdirSync(path.dirname(p.pluginManifest), { recursive: true });
   for (const [file, src] of before) write(file, src); return before;
 }
+
+test('usage is read-only, projects allowlisted metadata and aggregates cumulative sessions, not worker reports', async () => {
+  const data = path.join(home, '.gemini', 'antigravity', 'plugin_data', name);
+  const get = async (): Promise<SubagentUsageResponse> => api('subagent/usage');
+  const empty = await get(); assert.equal(empty.totals.sessionCount, 0); assert.equal(empty.totals.cacheHitRatePct, 0); assert.deepEqual(empty.workers, []); assert.ok(!fs.existsSync(data));
+  const config = { ...runtime.db.state('subagent'), maxContextTokens: 128000, apiKey: secret };
+  runtime.db.setState('subagent', config);
+  runtime.db.createProvider({ appType: 'codex', protocol: 'openai-responses', name: 'Saved', baseUrl: 'https://fixture.invalid', apiKey: previous });
+  const session = { cwd: `/project/${secret}`, mode: 'edit', reasoning_effort: 'high', model: 'sample', protocol: 'openai-responses', turns: 4, last_input_tokens: 81,
+    max_context_tokens: 1000000, compactions: 1, chunk_compactions: 2, updated_at: 1710000000, total_input_tokens: 90, total_cached_tokens: 45, total_output_tokens: 15, total_reasoning_tokens: 4,
+    files_changed: ['private-file-name'], input_history: [{ content: 'private-history' }], commands_run: [{ command: 'private-command' }], prompt_cache_key: 'private-cache-key' };
+  const snapshot = (dir: string, id: string, v: object) => write(path.join(data, dir, id + '.json'), JSON.stringify(v));
+  snapshot('sessions', 'first', { ...session, session_id: 'first' });
+  snapshot('sessions', 'legacy', { ...session, session_id: 'legacy', max_context_tokens: undefined, total_input_tokens: 10, total_cached_tokens: 0, total_output_tokens: 5, total_reasoning_tokens: 2, turns: 1, updated_at: 1710000001 });
+  snapshot('sessions', 'third', { ...session, session_id: 'third', protocol: 'openai-chat', total_input_tokens: 100, total_cached_tokens: 20, total_output_tokens: 20, total_reasoning_tokens: 1, turns: 2, updated_at: 1710000002 });
+  const turn = { input_tokens: 90, cached_tokens: 45, output_tokens: 15, reasoning_tokens: 4, cache_hit_rate_pct: 999 };
+  const w = { worker_id: 'done', worker_name: `review-${previous}`, session_id: 'first', status: 'completed', model: 'sample', api_format: 'openai-responses', steps_used: 2,
+    elapsed_s: 1.25, started_at: 1710000020, finished_at: 1710000021.25, error: 'private-error', result: { final_response: 'private-result', log_file: 'private-log-path', usage: turn } };
+  snapshot('workers', 'done', w);
+  snapshot('workers', 'live', { ...w, worker_id: 'live', started_at: 1710000022, finished_at: null, status: 'running', worker_name: 'sk-fixtureBearer', result: null, usage: { ...turn, input_tokens: 0 } });
+  snapshot('session_backups', 'unrelated', { ...session, session_id: 'unrelated' });
+  snapshot('sessions', 'copied', { ...session, session_id: 'first' }); // Backup with a .json suffix must not duplicate a session.
+  write(path.join(data, 'sessions', 'broken.json'), '{private-error');
+  write(path.join(data, 'sessions', 'large.json'), '{"session_id":"large"}'.padEnd(16 * 1024 * 1024 + 1));
+  const file = path.join(data, 'sessions', 'first.json'), before = fs.statSync(file).mtimeMs;
+  const report = await get();
+  noSecrets(report, secret, previous, 'sk-fixtureBearer', 'private-file-name', 'private-history', 'private-command', 'private-cache-key', 'private-error', 'private-result', 'private-log-path');
+  assert.deepEqual(report.totals, { sessionCount: 3, turns: 7, inputTokens: 200, cachedTokens: 65, outputTokens: 40, reasoningTokens: 7, totalTokens: 240, cacheHitRatePct: 32.5 });
+  assert.deepEqual(report.sessions.map(s => s.sessionId), ['third', 'legacy', 'first']);
+  const first = report.sessions[2]; assert.equal(first.cwd, '/project/[REDACTED]'); assert.equal(first.updatedAt, new Date(1710000000000).toISOString());
+  assert.deepEqual([first.lastInputTokens, first.maxContextTokens, first.compactions, first.chunkCompactions, first.filesChangedCount], [81, 1000000, 1, 2, 1]);
+  assert.equal(report.sessions[1].maxContextTokens, 128000); assert.equal(report.byModel.length, 2);
+  const group = report.byModel.find(r => r.protocol === 'openai-responses'); assert.ok(group);
+  assert.deepEqual([group.model, group.sessionCount, group.turns, group.inputTokens, group.cachedTokens, group.cacheHitRatePct], ['sample', 2, 5, 100, 45, 45]);
+  assert.deepEqual(report.workers.map(r => r.workerId), ['live', 'done']); assert.equal(report.workers[0].usage?.cacheHitRatePct, 0); assert.equal(report.workers[0].finishedAt, null);
+  assert.deepEqual(report.workers[1], { workerId: 'done', workerName: 'review-[REDACTED]', sessionId: 'first', status: 'completed', model: 'sample', protocol: 'openai-responses', stepsUsed: 2,
+    elapsedSeconds: 1.25, startedAt: new Date(1710000020000).toISOString(), finishedAt: new Date(1710000021250).toISOString(),
+    usage: { inputTokens: 90, cachedTokens: 45, outputTokens: 15, reasoningTokens: 4, totalTokens: 105, cacheHitRatePct: 50 } });
+  assert.equal(fs.statSync(file).mtimeMs, before); assert.deepEqual(runtime.db.state('subagent'), config); assert.equal(runtime.db.backups().length, 0);
+});
+
+test('usage honors PLUGIN_DATA, rejects query paths and does not follow snapshot junctions', async () => {
+  const data = path.join(root, 'isolated-plugin-data'), other = path.join(root, 'scratch-tree'); process.env.PLUGIN_DATA = data;
+  const empty = await api('subagent/usage'); assert.deepEqual(empty.sessions, []); assert.ok(!fs.existsSync(data));
+  await api('subagent/usage?path=other', undefined, 400);
+  write(path.join(other, 'sessions', 'ignored.json'), JSON.stringify({ session_id: 'ignored', total_input_tokens: 42 }));
+  fs.symlinkSync(other, data, process.platform === 'win32' ? 'junction' : 'dir'); assert.deepEqual((await api('subagent/usage')).sessions, []);
+  fs.unlinkSync(data); fs.mkdirSync(data); fs.symlinkSync(path.join(other, 'sessions'), path.join(data, 'sessions'), process.platform === 'win32' ? 'junction' : 'dir');
+  write(path.join(data, 'workers', 'new.json'), JSON.stringify({ worker_id: 'new', status: 'running' }));
+  const report: SubagentUsageResponse = await api('subagent/usage'); assert.equal(report.totals.sessionCount, 0); assert.deepEqual(report.sessions, []);
+  assert.equal(report.workers.length, 1); assert.equal(report.workers[0].workerId, 'new'); assert.equal(report.workers[0].usage, null);
+});
 
 test('all nine adapters detect isolated profiles; preview masks both sides and has no file or SQLite side effects', async () => {
   const f = subagentPaths(); for (const file of Object.values(f)) assert.ok(file.startsWith(home + path.sep));
@@ -107,7 +160,7 @@ test('install writes native shapes, private credentials, bounded Windsurf rules 
   assert.ok(subagentBlock(read(f.windsurfRules))!.length <= 1400); assert.equal(doc(f.desktop3pMcp).mcpServers[name].env.ASTRA_MODEL, req.model);
   assert.equal(fs.existsSync(f.clineMcp), false); assert.equal(read(f.pluginServer), read(bundledScript())); assert.equal(read(f.runtime), read(bundledScript()));
   const manifest = doc(f.pluginManifest);
-  assert.equal(manifest.version, '1.5.0'); assert.equal(manifest.name, name); assert.equal(manifest.mcpConfig, './mcp_config.json');
+  assert.equal(manifest.version, '1.6.0'); assert.equal(manifest.name, name); assert.equal(manifest.mcpConfig, './mcp_config.json');
   assert.deepEqual(manifest.rules, ['./rules/AGENTS.md']); assert.deepEqual(manifest.skills, ['./skills']); assert.ok(manifest.author && manifest.keywords.includes(req.protocol));
   assert.ok(manifest.displayName.includes(req.model) && manifest.description.includes(req.protocol));
   for (const text of [read(f.pluginRules), read(f.pluginSkill)]) {
@@ -262,7 +315,7 @@ test('saved provider inheritance, real MCP handshake and optional read-only upst
   const applied = await api('subagent/apply', { targets: ['gemini-cli'], providerId: p.id, keyStorage: 'mcp-env' });
   assert.equal(applied.status.config.providerId, p.id); assert.equal(applied.status.config.keySource, 'provider'); assert.equal(applied.status.config.protocol, p.protocol);
   let calls = 0; upstream = async (u, init) => { calls++; assert.equal(String(u), 'https://fixture.invalid/relay/v1beta/models'); assert.equal(new Headers(init?.headers).get('x-goog-api-key'), secret); return json({ models: [] }); };
-  const handshake = await api('subagent/test', {}); assert.equal(handshake.ok, true); assert.equal(calls, 0); assert.equal(handshake.serverVersion, '1.5.0'); assert.equal(handshake.toolsCount, 6); assert.equal(new Set(handshake.tools).size, 6);
+  const handshake = await api('subagent/test', {}); assert.equal(handshake.ok, true); assert.equal(calls, 0); assert.equal(handshake.serverVersion, '1.6.0'); assert.equal(handshake.toolsCount, 6); assert.equal(new Set(handshake.tools).size, 6);
   assert.equal(handshake.effectiveModel, p.model); assert.equal(handshake.effectiveProtocol, p.protocol); assert.ok(handshake.pythonExecutable && handshake.pythonVersion);
   const check = await api('subagent/test', { providerId: p.id, testUpstream: true }); assert.equal(check.upstreamOk, true); assert.equal(calls, 1);
   upstream = async () => json({ error: secret }, 403); const denied = await api('subagent/test', { testUpstream: true }); assert.equal(denied.ok, false); assert.equal(denied.upstreamOk, false); noSecrets(denied, secret);
@@ -340,16 +393,28 @@ test('Phuket credentials reject mismatches, use the chosen key, and preview neve
 });
 
 test('compact template length limits include CRLF, longest model name and optional custom guidance', async () => {
-  const status: SubagentStatus = (await api('subagent/apply', { ...req, model: 'a'.repeat(256), protocol: 'anthropic-messages', maxContextTokens: 272000, targets: ['windsurf'], customInstructions: 'more notes\r\n'.repeat(400) })).status;
+  const config = { ...req, model: 'a'.repeat(256), protocol: 'anthropic-messages', maxContextTokens: 1_000_000, targets: ['windsurf', 'codex'], customInstructions: 'more notes\r\n'.repeat(400) };
+  const preview = await api('subagent/preview-diff', config), f = subagentPaths(); noSecrets(preview, secret);
+  const after = (file: string) => preview.files.find((v: { path: string }) => v.path === file).after;
+  const codexEnv = (src: string) => {
+    const servers: unknown = parseToml(src).mcp_servers;
+    assert.ok(isRecord(servers) && isRecord(servers[name]) && isRecord(servers[name].env));
+    return servers[name].env;
+  };
+  for (const env of [codexEnv(after(f.codexMcp)), JSON.parse(after(f.windsurfMcp)).mcpServers[name].env]) {
+    assert.equal(env.ASTRA_MAX_CONTEXT_TOKENS, '1000000'); assert.equal(env.ASTRA_COMPACT_TRIGGER_TOKENS, '750000'); assert.equal(env.ASTRA_API_KEY, '[REDACTED]');
+  }
+  const status: SubagentStatus = (await api('subagent/apply', config)).status;
+  assert.equal(status.config.maxContextTokens, 1_000_000); assert.equal(codexEnv(read(f.codexMcp)).ASTRA_MAX_CONTEXT_TOKENS, '1000000');
   for (const h of status.harnesses.filter(h => h.id !== 'antigravity')) {
     assert.ok(h.rulesSnippet.replace(/\r?\n/g, '\r\n').length <= (h.id === 'windsurf' ? 1400 : 1800), h.name);
     if (h.id === 'cursor') assert.ok(subagentBlock(h.rulesSnippet)!.replace(/\r?\n/g, '\r\n').length <= 1740);
-    assert.match(h.rulesSnippet, /compact_context/); assert.match(h.rulesSnippet, /watch_command/);
+    assert.match(h.rulesSnippet, /compact_context\(action="set_limit", max_context_tokens=/); assert.match(h.rulesSnippet, /1,000,000/); assert.match(h.rulesSnippet, /watch_command/);
   }
 });
 
 test('invalid payloads, malformed JSON and symlinks fail without partial writes or backups', async () => {
-  for (const patch of [{ targets: ['other'] }, { targets: [] }, { protocol: 'shell' }, { baseUrl: 'https://secret@x' }, { apiKey: 'one\ntwo' }, { defaultMode: 'other' }, { maxContextTokens: -5 }, { enableChunkCompaction: 'false' }, { compactTriggerPct: 39 }, { compactTriggerPct: 96 }, { compactTriggerPct: 75.5 }, { compactKeepRecentGroups: -1 }, { compactKeepRecentGroups: 21 }, { compactKeepRecentGroups: 2.5 }, { customInstructions: SUBAGENT_END }, { unexpected: 1 }]) {
+  for (const patch of [{ targets: ['other'] }, { targets: [] }, { protocol: 'shell' }, { baseUrl: 'https://secret@x' }, { apiKey: 'one\ntwo' }, { defaultMode: 'other' }, { maxContextTokens: -5 }, { maxContextTokens: 1_000_001 }, { maxContextTokens: 9999.5 }, { enableChunkCompaction: 'false' }, { compactTriggerPct: 39 }, { compactTriggerPct: 96 }, { compactTriggerPct: 75.5 }, { compactKeepRecentGroups: -1 }, { compactKeepRecentGroups: 21 }, { compactKeepRecentGroups: 2.5 }, { customInstructions: SUBAGENT_END }, { unexpected: 1 }]) {
     await api('subagent/apply', { ...req, ...patch }, 400);
   }
   const f = subagentPaths(); write(f.cursorMcp, '{invalid secret: ' + secret); const error = await api('subagent/apply', { ...req, targets: ['codex','cursor'] }, 409); noSecrets(error, secret);

@@ -1,10 +1,26 @@
-# Phuket Switch v1.1.4 · 2026-11-27
+# Phuket Switch v1.1.5 · 2026-11-27
+
+- **子代理 1M 上下文与动态调整**：内置 Astra MCP 服务升级为 **v1.6.0**。会话上下文默认仍为 272K，最高可设为 **1M（1,000,000 词元）**；配置面板新增 `400K` 和 `1M` 快捷预设。主模型可在 `astra_run_task` 或 `astra_spawn_worker` 中传入 `max_context_tokens` 指定会话上限。子代理也可通过 `compact_context(action="set_limit", max_context_tokens=...)` 实时调整当前会话上限，自动压缩的触发阈值随之重算。
+- **独立「用量」页面**：左侧导航新增「用量」，按来源分别统计：
+  - **PhuketAI 账户**：查看当前余额，按今天、近 7 天或近 30 天查看消耗与请求趋势、模型消耗明细及近期调用日志。
+  - **本地代理**：汇总最近 1,000 条本地请求日志的输入、输出和缓存 Token，以及平均耗时与首字延迟。缓存命中率仅统计有缓存读数的请求，按输入 Token 加权。
+  - **子代理**：从本地快照只读汇总各会话及模型的累计 Token 和缓存命中率，列出会话上下文占比、压缩次数与最近的后台 Worker 记录。Worker 用量不重复计入总量。
+
+## 下载与更新
+
+Windows x64 安装版：**`Phuket.Switch.Setup.1.1.5.exe`**；便携版：**`Phuket.Switch.1.1.5.exe`**。安装版可在「扩展与设置 → 偏好设置 → 软件更新」检查更新；便携版请从[官方发布页](https://github.com/qazplm1208-tech/phuket-switch/releases)下载后手动替换。
+
+已有子代理部署请在「子代理」页重新应用配置：选中原客户端，点击「部署到所选客户端」，即可同步 Astra MCP v1.6.0。
+
+---
+
+## Phuket Switch v1.1.4 · 2026-11-27
 
 - **Gemini 分组**：`0.6 gemini`、`0.35 Gemini` 等分组现可用于 Claude Code CLI 和 Claude Desktop，通过 PhuketAI 的 `/v1/messages` 调用 Gemini 模型；继续支持 Gemini CLI、Antigravity 和 Codex。
 - **模型推荐与映射**：仅有 Gemini 模型时，默认模型、Opus 和 Sonnet 优先选择非 Lite 的旗舰对话模型；Haiku 优先使用非 Lite 的 Flash，没有 Flash 时沿用 Sonnet。推荐和映射均排除生图模型。
 - **添加配置**：优先预选当前客户端的原生分组；仍可手动选择其他兼容分组并绑定或新建密钥。
 
-## 下载与更新
+### 下载与更新
 
 Windows x64 安装版：**`Phuket.Switch.Setup.1.1.4.exe`**；便携版：**`Phuket.Switch.1.1.4.exe`**。安装版可在「扩展与设置 → 偏好设置 → 软件更新」检查更新；便携版请从[官方发布页](https://github.com/qazplm1208-tech/phuket-switch/releases)下载后手动替换。
 

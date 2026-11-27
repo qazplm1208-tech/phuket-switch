@@ -53,13 +53,19 @@ class AstraTests(unittest.TestCase):
     def test_real_stdio_initialize_and_tools_reflect_environment(self):
         init, tools = self.handshake(ASTRA_MODEL='  custom-8b  ', ASTRA_PROTOCOL='OPENAI-CHAT')
         self.assertEqual(init['protocolVersion'], '2025-11-25')
-        self.assertEqual(init['serverInfo']['version'], '1.5.0')
+        self.assertEqual(init['serverInfo']['version'], '1.6.0')
+        self.assertEqual(len(tools), 6)
         self.assertEqual(init['_meta'], {'model': 'custom-8b', 'api_format': 'openai-chat'})
         self.assertEqual({t['name'] for t in tools}, {'astra_run_task', 'astra_spawn_worker', 'astra_worker_status', 'astra_wait_worker', 'astra_list_sessions', 'astra_compact_session'})
         for t in tools:
             self.assertIn('custom-8b (openai-chat)', t['description'])
         for t in tools[:2]:
-            self.assertIn('model', t['inputSchema']['properties'])
+            props = t['inputSchema']['properties']
+            self.assertIn('model', props)
+            cap = props['max_context_tokens']
+            self.assertEqual((cap['type'], cap['minimum'], cap['maximum']), ('integer', 5712, 1_000_000))
+            self.assertNotIn('default', cap)
+            self.assertNotIn('max_context_tokens', t['inputSchema']['required'])
             self.assertIn('none', t['inputSchema']['properties']['reasoning_effort']['enum'])
             self.assertEqual(t['inputSchema']['properties']['max_steps'], {
                 'type': 'integer', 'minimum': 0, 'default': 0,
@@ -68,6 +74,8 @@ class AstraTests(unittest.TestCase):
             self.assertIn('watch_command', next(t['description'] for t in tools if t['name'] == name))
         schema = next(t for t in tools if t['name'] == 'astra_compact_session')['inputSchema']['properties']
         self.assertEqual(schema['mode']['default'], 'full')
+        self.assertEqual(schema['max_context_tokens']['maximum'], 1_000_000)
+        self.assertNotIn('default', schema['max_context_tokens'])
         self.assertTrue({'label', 'summary', 'chunk_groups', 'keep_recent_groups', 'focus'} <= schema.keys())
         self.assertFalse((self.home / 'data').exists(), 'handshake must not create sessions')
         for t in tools[:2]:
@@ -98,11 +106,13 @@ class AstraTests(unittest.TestCase):
             groups, names, prompt = json.loads(proc.stdout)
             self.assertEqual((groups, len(names), 'compact_context' in names, 'compact_context' in prompt),
                              (expected, 7 if enabled else 6, enabled, enabled))
+            self.assertEqual('compact_context(action="set_limit", max_context_tokens=...)' in prompt, enabled)
         with patch.object(astra, 'ALLOW_MODEL_COMPACTION', False), patch.object(astra, 'call_subagent_api', side_effect=[
-                {'output': [astra.call_item('compact_context', {}, 'disabled')]}, {'output_text': 'done'}]):
+                {'output': [astra.call_item('compact_context', {'action': 'set_limit', 'max_context_tokens': 1_000_000}, 'disabled')]}, {'output_text': 'done'}]):
             r = self.tool('astra_run_task', {'task': 'test'})
         s = astra._load_session(r['session_id'])
         self.assertIn('disabled', json.loads(s.input_history[-2]['output'])['error'])
+        self.assertIsNone(s.max_context_tokens)
         self.assertEqual(s.compactions, 0)
 
     def test_compact_context_malformed_chat_arguments_return_paired_errors(self):
@@ -539,6 +549,23 @@ class AstraTests(unittest.TestCase):
                     self.assertTrue(error, text); self.assertIn('max_steps', text)
         self.assertFalse(astra.WORKERS); self.assertFalse(astra.SESSIONS)
 
+    def test_bad_context_caps_rejected_before_work(self):
+        with patch.object(astra, 'call_subagent_api') as model, patch.object(astra.threading.Thread, 'start') as start:
+            for name in ('astra_run_task', 'astra_spawn_worker', 'astra_compact_session'):
+                for cap in (None, False, True, '1000000', 5712.0, 5711, 1_000_001):
+                    with self.subTest(tool=name, cap=cap):
+                        args = {'session_id': 'bad-cap', 'max_context_tokens': cap}
+                        if name != 'astra_compact_session':
+                            args.update(task='inspect', cwd=str(self.home))
+                        text, error = astra.handle_tool_call(name, args)
+                        self.assertTrue(error, text)
+                        self.assertIn('max_context_tokens', json.loads(text)['error'])
+            model.assert_not_called()
+            start.assert_not_called()
+        self.assertFalse(astra.WORKERS)
+        self.assertFalse(astra.SESSIONS)
+        self.assertFalse((self.home / 'data').exists())
+
     def test_load_resume_and_round_trip_legacy_snapshot(self):
         file = astra._session_file('legacy')
         # v1.2 snapshots have explicit permission and accounting fields, but no routing fields.
@@ -589,7 +616,7 @@ class AstraTests(unittest.TestCase):
             saved.append((state['steps_used'], state['status'], worker.done_event.is_set()))
         def gateway(**kwargs):
             if not any(i.get('type') == 'function_call_output' for i in kwargs['input_items']):
-                return {'output': [astra.call_item('list_dir', {}, 'ls')]}
+                return {'output': [astra.call_item('compact_context', {'action': 'set_limit', 'max_context_tokens': 512_000}, 'set')]}
             entered.set()
             if not release.wait(10):
                 raise TimeoutError('test did not release worker')
@@ -604,6 +631,8 @@ class AstraTests(unittest.TestCase):
                 self.assertTrue(entered.wait(10)); running = json.loads(path.read_bytes())
                 self.assertEqual((running['status'], running['steps_used'], running['owner_pid']), ('running', 2, os.getpid()))
                 self.assertIsNone(running['finished_at']); self.assertIsNone(running['result'])
+                self.assertEqual((info['context_limit_tokens'], running['context_limit_tokens']), (astra.MAX_CONTEXT_TOKENS, 512_000))
+                self.assertEqual(self.tool('astra_worker_status', {'worker_id': wid})['context_limit_tokens'], 512_000)
                 with subprocess.Popen(info['watch_argv'] + ['--poll-interval', '0.05'], cwd=self.home, env=watcher_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as watcher:
                     try:
                         with self.assertRaises(subprocess.TimeoutExpired):
@@ -617,6 +646,7 @@ class AstraTests(unittest.TestCase):
                 release.set(); self.assertTrue(astra.WORKERS[wid].done_event.wait(10))
         final = json.loads(path.read_bytes()); self.assertEqual(json.loads(out), final)
         self.assertEqual(final['result']['final_response'], 'full report: \u5b8c\u6210')
+        self.assertEqual((final['context_limit_tokens'], final['result']['context_limit_tokens']), (512_000, 512_000))
         self.assertEqual(saved, [(0, 'running', False), (1, 'running', False), (2, 'running', False), (2, 'completed', False)])
         self.assertEqual(self.tool('astra_worker_status', {'worker_id': wid}), final)
         proc = subprocess.run([*astra.SHELL_PREFIX, info['watch_command']], cwd=self.home, env=watcher_env, capture_output=True, text=True, timeout=10, check=True)
@@ -711,6 +741,33 @@ class AstraTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 astra.run_astra_agent_turn(task='test', cwd=str(self.home), model='blocked')
             self.assertEqual(self.tool('astra_run_task', {'session_id': sid, 'task': 'continue'})['model'], 'custom-model')
+
+    def test_host_context_limit_persists_across_tasks_workers_and_reload(self):
+        with patch.object(astra, 'ALLOW_MODEL_COMPACTION', False), patch.object(astra, 'call_subagent_api', return_value={'output_text': 'ok'}):
+            # Host control is independent of model compaction permissions.
+            first = self.tool('astra_run_task', {'task': 'new', 'max_context_tokens': 1_000_000})
+            sid, key = first['session_id'], first['prompt_cache_key']
+            self.assertEqual(first['context_limit_tokens'], 1_000_000)
+            for tool, override, expected in [('astra_spawn_worker', {}, 1_000_000),
+                                             ('astra_run_task', {'max_context_tokens': 64_000}, 64_000),
+                                             ('astra_spawn_worker', {'max_context_tokens': 600_000}, 600_000),
+                                             ('astra_run_task', {}, 600_000)]:
+                with self.subTest(tool=tool, override=override):
+                    astra.SESSIONS.clear()  # Each continuation must recover the cap from disk.
+                    r = self.tool(tool, {'task': 'continue', 'session_id': sid, **override})
+                    self.assertEqual(r['context_limit_tokens'], expected)
+                    if tool == 'astra_spawn_worker':
+                        done = self.tool('astra_wait_worker', {'worker_id': r['worker_id'], 'timeout_seconds': 5})
+                        r = done['result']
+                        self.assertEqual((done['context_limit_tokens'], r['context_limit_tokens']), (expected, expected))
+                    self.assertEqual(r['prompt_cache_key'], key)
+                    self.assertEqual(astra._load_session(sid).max_context_tokens, expected)
+            other = self.tool('astra_spawn_worker', {'task': 'separate', 'max_context_tokens': 5712})
+            self.tool('astra_wait_worker', {'worker_id': other['worker_id'], 'timeout_seconds': 5})
+            self.assertEqual(astra._load_session(other['session_id']).max_context_tokens, 5712)
+            fresh = self.tool('astra_run_task', {'task': 'use default'})
+            self.assertIsNone(astra._load_session(fresh['session_id']).max_context_tokens)
+            self.assertEqual(fresh['context_limit_tokens'], astra.MAX_CONTEXT_TOKENS)
 
     def test_automatic_and_offline_compaction_keep_identity(self):
         s = astra.AstraSession('compact', str(self.home), 'readonly', 'none', False, model='summarizer', protocol='openai-chat',
@@ -875,6 +932,10 @@ class SessionCacheTests(unittest.TestCase):
         ])
         self.assertEqual(len(astra.build_openai_tools('edit', allow_model_compaction=False)), 6)
         self.assertEqual(len(astra.build_openai_tools('readonly', allow_model_compaction=True)), 7)
+        context = tools[-1]['parameters']['properties']
+        self.assertEqual(set(context['action']['enum']), {'compact', 'status', 'set_limit'})
+        cap = context['max_context_tokens']
+        self.assertEqual((cap['type'], cap['minimum'], cap['maximum']), ('integer', 5712, 1_000_000))
         self.assertEqual(wire(tools), wire(astra.build_openai_tools("readonly")))
         executor = astra.ToolExecutor(str(self.cwd), mode="readonly", allow_outside_cwd=False, logger=lambda msg: None)
         for name, args in [
@@ -993,14 +1054,16 @@ class SessionCacheTests(unittest.TestCase):
         path = astra._session_file(sid)
         old = self.snapshot(sid)
         # The fixture represents v1.1, predating both the v1.2 counters and v1.3 routing fields.
-        for key in ("last_input_tokens", "last_input_history_len", "compactions", "last_compacted_at", "model", "protocol", "chunk_compactions"):
+        for key in ("last_input_tokens", "last_input_history_len", "compactions", "last_compacted_at", "model", "protocol",
+                    "chunk_compactions", "max_context_tokens"):
             del old[key]
         path.write_text(json.dumps(old), encoding="utf-8")
         astra.SESSIONS.clear()
         loaded = astra._load_session(sid)
         self.assertEqual((loaded.last_input_tokens, loaded.last_input_history_len, loaded.compactions,
                           loaded.last_compacted_at), (0, 0, 0, None))
-        self.assertEqual((loaded.chunk_compactions, loaded.compactions), (0, 0))
+        self.assertEqual((loaded.chunk_compactions, loaded.compactions, loaded.max_context_tokens), (0, 0, None))
+        self.assertEqual(astra._chunk_status(loaded)['context_limit_tokens'], astra.MAX_CONTEXT_TOKENS)
         self.assertEqual(loaded.input_history, old["input_history"])
         self.assertEqual(self.turn("resume", session_id=sid)["prompt_cache_key"], old["prompt_cache_key"])
         for key in old:
@@ -1013,6 +1076,23 @@ class SessionCacheTests(unittest.TestCase):
                 path.write_text(json.dumps({**old, key: bad}), encoding="utf-8")
                 with self.assertRaises(ValueError):
                     astra._load_session(sid)
+
+    def test_bad_saved_cap_falls_back_without_discarding_history(self):
+        disk = self.make_session('bad-cap', astra.message('saved work', 'user'), max_context_tokens=1_000_000)
+        astra._save_session(disk)
+        state = self.snapshot(disk.session_id)
+        path = astra._session_file(disk.session_id)
+        for bad in (True, '750000', 30000.5, 1_000_001, 5711):
+            with self.subTest(cap=bad):
+                path.write_text(json.dumps({**state, 'max_context_tokens': bad}), encoding='utf-8')
+                loaded = astra._load_session(disk.session_id)
+                self.assertIsNone(loaded.max_context_tokens)
+                self.assertEqual(loaded.input_history, disk.input_history)
+                self.assertEqual(loaded.prompt_cache_key, disk.prompt_cache_key)
+                row, = self.listing()
+                self.assertEqual(row['context_limit_tokens'], astra.MAX_CONTEXT_TOKENS)
+        self.assertEqual(self.turn('resume', session_id=disk.session_id)['prompt_cache_key'], disk.prompt_cache_key)
+        self.assertIsNone(self.snapshot(disk.session_id)['max_context_tokens'])
 
     def test_estimates_use_unicode_opaque_discount_and_last_measured_prefix(self):
         self.assertEqual(astra.estimate_text_tokens("ASCII" + "\u754c" * 8), int(5 / 3.2 + 8 * 1.2))
@@ -1144,6 +1224,20 @@ class SessionCacheTests(unittest.TestCase):
         self.assertEqual(astra.estimate_session_context_tokens(saved), result["context_tokens_est"])
         self.assertIn("COMPACT DONE items=", saved.log_path.read_text(encoding="utf-8"))
 
+    def test_million_token_session_compacts_at_its_own_trigger(self):
+        cap, trigger = 1_000_000, 880_000
+        cost = astra.estimate_item_tokens({'role': 'user', 'content': 'continue'})
+        for estimate, expected in [(300_000, 0), (trigger - 1, 0), (trigger, 1)]:
+            with self.subTest(estimate=estimate):
+                s = self.make_session(f'high-{estimate}', astra.message('old goal', 'user'), max_context_tokens=cap,
+                                      last_input_tokens=estimate-cost, last_input_history_len=2, last_mode='readonly')
+                astra._save_session(s)
+                r = self.turn('continue', session_id=s.session_id, mode='readonly')
+                self.assertEqual((r['context_limit_tokens'], r['trigger_tokens'], r['compactions_this_turn']), (cap, trigger, expected))
+                saved = astra._load_session(s.session_id)
+                self.assertEqual(any(map(astra._is_compacted_summary, saved.input_history)), bool(expected))
+                self.assertEqual(saved.prompt_cache_key, s.prompt_cache_key)
+
     def test_only_context_http_400_retries_once_without_replaying_tools(self):
         def bad(message):
             return astra.urllib.error.HTTPError("https://offline.invalid/", 400, "Bad Request", {}, io.BytesIO(message.encode()))
@@ -1168,6 +1262,65 @@ class SessionCacheTests(unittest.TestCase):
                 self.turn("small task", session_id=sid)
             self.assertEqual(self.urlopen.call_count, attempts)
             self.assertEqual(self.snapshot(sid)["compactions"], attempts - 1)
+
+    def test_set_limit_persists_only_complete_history_and_returns_status(self):
+        sid = 'set-limit'
+        checkpoints = []
+        save = astra._save_session
+        def checkpoint(session, *, completed_len=None):
+            save(session, completed_len=completed_len)
+            if completed_len is not None:
+                checkpoints.append(self.snapshot(sid))
+        calls = [astra.call_item('compact_context', {'action': 'status'}, 'before'),
+                 astra.call_item('compact_context', {'action': 'set_limit', 'max_context_tokens': 1_000_000}, 'set'),
+                 astra.call_item('compact_context', {'action': 'status'}, 'after')]
+        bad_inputs = [{}, *({'max_context_tokens': v} for v in (None, False, '900000', 8000.5, 5711, 1_000_001))]
+        calls.extend(astra.call_item('compact_context', {'action': 'set_limit', **args}, f'bad-{i}') for i, args in enumerate(bad_inputs))
+        with patch.object(astra, '_save_session', side_effect=checkpoint), patch.object(astra, 'call_subagent_api', side_effect=[{'output': calls}, {'output_text': 'ok'}]):
+            r = self.turn('adjust cap', session_id=sid, mode='readonly')
+        mid, = checkpoints
+        self.assertEqual(mid['max_context_tokens'], 1_000_000)
+        self.assertFalse(any('call_id' in item for item in mid['input_history']))
+        s = astra._load_session(sid)
+        self.assertEqual(s.input_history[:len(mid['input_history'])], mid['input_history'])
+        results = {i['call_id']: json.loads(i['output']) for i in s.input_history if i.get('type') == 'function_call_output'}
+        self.assertEqual(list(results), [c['call_id'] for c in calls])
+        self.assertEqual(results['before']['context_limit_tokens'], 272000)
+        for k in ('set', 'after'):
+            status = results[k]
+            self.assertEqual((status['context_limit_tokens'], status['trigger_tokens'], status['hard_max_context_tokens']), (1_000_000, 880_000, 1_000_000))
+            self.assertEqual(status['usage_pct'], round(100 * status['estimated_context_tokens'] / 1_000_000, 1))
+        for i in range(len(bad_inputs)):
+            self.assertIn('max_context_tokens', results[f'bad-{i}']['error'])
+        self.assertEqual((r['context_limit_tokens'], s.max_context_tokens, s.compactions), (1_000_000, 1_000_000, 0))
+        self.assertEqual(s.prompt_cache_key, r['prompt_cache_key'])
+        self.assertIn('1000000', s.log_path.read_text(encoding='utf-8'))
+
+    def test_raising_and_lowering_context_limit_affects_the_next_request(self):
+        # A measured count above the global trigger must fit a raised cap. Conversely a
+        # count below the global trigger must compact immediately after a model lowers it.
+        for case, initial, new, measured, compactions in [('raise', 272_000, 1_000_000, 300_000, 0),
+                                                         ('lower', 1_000_000, 16_000, 15_000, 1)]:
+            with self.subTest(case=case):
+                s = self.make_session(case, astra.message('history ' * 3000, 'user'), max_context_tokens=initial)
+                astra._save_session(s)
+                agent_inputs = []
+                def model(**req):
+                    if not req['tools']:
+                        self.assertLess(astra.estimate_history_tokens(req['input_items']), new)
+                        return {'output_text': 'older history'}
+                    agent_inputs.append(list(req['input_items']))
+                    if len(agent_inputs) == 1:
+                        return {'usage': {'input_tokens': measured}, 'output': [
+                            astra.call_item('compact_context', {'action': 'set_limit', 'max_context_tokens': new}, 'set')]}
+                    return {'output_text': 'ok'}
+                with patch.object(astra, 'call_subagent_api', side_effect=model):
+                    r = self.turn('continue', session_id=case)
+                self.assertEqual((r['context_limit_tokens'], r['compactions_this_turn']), (new, compactions))
+                self.assertEqual(len(agent_inputs), 2)
+                self.assertEqual(any(map(astra._is_compacted_summary, agent_inputs[1])), bool(compactions))
+                self.assertLess(astra.estimate_history_tokens(agent_inputs[1]), new)
+                self.assertEqual(astra._load_session(case).max_context_tokens, new)
 
     def test_model_status_and_chunk_mid_step_keep_siblings_and_exact_savings(self):
         reason = {'type': 'reasoning', 'summary': [{'text': 'phase complete'}], 'encrypted_content': 'opaque'}
@@ -1320,7 +1473,8 @@ class SessionCacheTests(unittest.TestCase):
         self.assertEqual(fallback[1], 'deterministic'); self.assertIn('audit', fallback[0][1]['content'])
         # Exact serialized estimates include escaped characters and the protected suffix.
         trailing = s.input_history[-1]
-        h, method, info = astra.compact_session_chunk_history(s, summary='\u754c\n"' * 20000, max_context_tokens=6000, keep_recent_groups=0, upto_index=2)
+        s.max_context_tokens = 6000
+        h, method, info = astra.compact_session_chunk_history(s, summary='\u754c\n"' * 20000, keep_recent_groups=0, upto_index=2)
         self.assertEqual((info['mode'], method), ('chunk', 'model_supplied'))
         self.assertIs(h[-1], trailing); self.assertLess(astra.estimate_history_tokens(h), 6000)
         self.assertTrue(h[1]['content'].endswith(astra._CHUNK_END_TAG))
@@ -1329,6 +1483,29 @@ class SessionCacheTests(unittest.TestCase):
         self.assertEqual((info['mode'], method), ('full', 'deterministic'))
         self.assertTrue(astra._is_compacted_summary(h[1])); self.assertLess(astra.estimate_history_tokens(h), 6000)
         self.assertIs(h[-1], trailing)
+
+    def test_maintenance_and_listing_honor_each_cap_and_one_time_override(self):
+        for sid, cap in [('small', 12_000), ('large', 1_000_000)]:
+            astra._save_session(self.make_session(sid, astra.message('history ' * 6000, 'user'), max_context_tokens=cap,
+                                                  last_input_tokens=300_000, last_input_history_len=2))
+        rows = {r['session_id']: r for r in self.listing()}
+        for sid, cap, trigger, over in [('small', 12_000, 10_560, True), ('large', 1_000_000, 880_000, False)]:
+            row = rows[sid]
+            self.assertEqual((row['context_limit_tokens'], row['trigger_tokens'], row['over_context_limit']), (cap, trigger, over))
+            self.assertEqual(row['usage_pct'], round(100 * row['estimated_context_tokens'] / cap, 1))
+        large = self.snapshot('large')
+        report = astra.astra_compact_session(all_over_limit=True)
+        r, = report['compacted']
+        self.assertEqual((r['session_id'], report['skipped']), ('small', 1))
+        self.assertLess(r['after_est_tokens'], 10_560)
+        self.assertEqual(self.snapshot('large'), large)
+        self.assertEqual(astra.astra_compact_session('large')['max_context_tokens'], 1_000_000)
+        override, = astra.astra_compact_session('large', max_context_tokens=10_000)['compacted']
+        self.assertLess(override['after_est_tokens'], 10_000)
+        self.assertEqual((override['max_context_tokens'], override['context_limit_tokens']), (10_000, 1_000_000))
+        self.assertEqual(self.snapshot('large')['max_context_tokens'], 1_000_000)
+        self.assertEqual(astra.astra_compact_session('small', max_context_tokens=999_000)['compacted'], [])
+        self.assertEqual(self.snapshot('small')['max_context_tokens'], 12_000)
 
     def test_bulk_compaction_uses_strict_limit_and_separate_byte_exact_backups(self):
         limit = astra.MAX_CONTEXT_TOKENS
@@ -1412,17 +1589,21 @@ class SessionCacheTests(unittest.TestCase):
     def test_env_parsing_and_maintenance_bounds(self):
         keys = ["ASTRA_MAX_CONTEXT_TOKENS", "ASTRA_COMPACT_TRIGGER_TOKENS", "ASTRA_COMPACT_TARGET_TOKENS", "ASTRA_COMPACT_TAIL_TOKENS"]
         probe = [sys.executable, "-c", "from subagent import astra_mcp_server as a; "
-                 "print(a.MAX_CONTEXT_TOKENS,a.COMPACT_TRIGGER_TOKENS,a.COMPACT_TARGET_TOKENS,a.COMPACT_TAIL_TOKENS)"]
-        for values, want in [(["invalid"] * 4, [272000, 239360, 48000, 28000]),
-                             (["900000", "900000", "900000", "-1"], [272000, 272000, 271999, 0]),
-                             (["16000", "14000", "8000", "1400"], [16000, 14000, 8000, 1400])]:
+                 "print(a.MAX_CONTEXT_TOKENS,a.COMPACT_TRIGGER_TOKENS,a.COMPACT_TARGET_TOKENS,a.COMPACT_TAIL_TOKENS,a._compact_trigger(1000000))"]
+        clean_env = {k: v for k, v in os.environ.items() if k not in keys}
+        for values, want in [([], [272000, 239360, 48000, 28000, 880000]),
+                             (["invalid"] * 4, [272000, 239360, 48000, 28000, 880000]),
+                             (["1000000"], [1000000, 880000, 48000, 28000, 880000]),
+                             (["2000000", "2000000", "2000000", "-1"], [1000000, 1000000, 999999, 0, 1000000]),
+                             (["900000", "900000", "900000", "-1"], [900000, 900000, 899999, 0, 1000000]),
+                             (["16000", "14000", "8000", "1400"], [16000, 14000, 8000, 1400, 875000])]:
             with self.subTest(values=values):
-                proc = subprocess.run(probe, env={**os.environ, **dict(zip(keys, values))}, capture_output=True,
+                proc = subprocess.run(probe, env={**clean_env, **dict(zip(keys, values))}, capture_output=True,
                                       text=True, check=True, timeout=20)
                 self.assertEqual(list(map(int, proc.stdout.split())), want)
-        for kw in [{"max_context_tokens": 4000}, {"max_context_tokens": 272001}, {"all_over_limit": "false"}]:
+        for kw in [{"max_context_tokens": 4000}, {"max_context_tokens": 1_000_001}, {"all_over_limit": "false"}]:
             with self.subTest(kw=kw), self.assertRaises(ValueError):
-                astra.astra_compact_session(**kw)
+                astra.astra_compact_session(session_id="cli", **kw)
 
     def test_maintenance_cli_and_wait_default(self):
         # Tiny history stays entirely in the tail; this subprocess needs no API.
@@ -1432,6 +1613,12 @@ class SessionCacheTests(unittest.TestCase):
         for args, count in [(cmd, 0), (cmd + ["--force"], 1)]:
             proc = subprocess.run(args, capture_output=True, text=True, env=env, timeout=20, check=True)
             self.assertEqual(len(json.loads(proc.stdout)["compacted"]), count)
+        s = self.make_session('cli', max_context_tokens=7000, last_input_tokens=7001)
+        astra._save_session(s)
+        inherited = subprocess.run([sys.executable, astra.__file__, '--compact-over-limit', '--session-id', 'cli'],
+                                   capture_output=True, text=True, env=env, timeout=20, check=True)
+        self.assertEqual(len(json.loads(inherited.stdout)['compacted']), 1)
+        self.assertEqual(self.snapshot('cli')['max_context_tokens'], 7000)
         worker = astra.BackgroundWorker("w", "test", "cli", str(self.cwd), "readonly", "max")
         with patch.dict(astra.WORKERS, w=worker), patch.object(worker.done_event, "wait", return_value=False) as wait:
             text, error = astra.handle_tool_call("astra_wait_worker", {"worker_id": "w"})

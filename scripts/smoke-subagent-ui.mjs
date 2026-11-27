@@ -10,11 +10,56 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 const root = path.resolve(import.meta.dirname, '..'), secret = 'opaque-ui-only-credential-93', customBase = 'https://api.deepseek.com/v1';
 const fixtureProxyPort = 31847;
+function seedAstraUsage(data, home) {
+  const stamp = Date.now() / 1000, model = 'fixture-astra', sessionId = 'fixture-session';
+  const snapshot = (dir, id, value) => {
+    fs.mkdirSync(path.join(data, dir), { recursive: true });
+    fs.writeFileSync(path.join(data, dir, `${id}.json`), JSON.stringify(value));
+  };
+  snapshot('sessions', sessionId, { session_id: sessionId, cwd: home, mode: 'readonly', reasoning_effort: 'high', model,
+    protocol: 'openai-responses', turns: 4, last_input_tokens: 125000, max_context_tokens: 1000000, compactions: 1, chunk_compactions: 2,
+    total_input_tokens: 200000, total_cached_tokens: 50000, total_output_tokens: 3500, total_reasoning_tokens: 350, updated_at: stamp });
+  snapshot('workers', 'fixture-worker', { worker_id: 'fixture-worker', worker_name: 'fixture-review', session_id: sessionId,
+    status: 'completed', model, api_format: 'openai-responses', steps_used: 3, elapsed_s: 2.5, started_at: stamp - 2.5, finished_at: stamp,
+    usage: { input_tokens: 900, cached_tokens: 450, output_tokens: 100, reasoning_tokens: 20 } });
+}
+function seedProxyUsage(db) {
+  const base = { createdAt: new Date().toISOString(), appType: 'codex', protocol: 'openai-responses', providerId: null,
+    model: 'requested-model', effectiveModel: 'proxy-model', statusCode: 200, latencyMs: 100, failoverCount: 0 };
+  db.addLog({ ...base, id: 'legacy', model: 'legacy-model', effectiveModel: '', statusCode: 502, totalTokens: 77 });
+  db.addLog({ ...base, id: 'without-cache', inputTokens: 80, outputTokens: 10 });
+  db.addLog({ ...base, id: 'reported', translatedFrom: 'anthropic-messages', inputTokens: 120, cachedTokens: 60, outputTokens: 20, ttftMs: 8 });
+  db.addLog({ ...base, id: 'miss', translatedFrom: 'anthropic-messages', inputTokens: 40, cachedTokens: 0, outputTokens: 5 });
+}
+function accountUsageFixture(url, reads) {
+  const start = url.searchParams.get('start_date'), end = url.searchParams.get('end_date');
+  const days = 1 + (Date.parse(end) - Date.parse(start)) / 86400000;
+  const sample = { requests: 12, input_tokens: 300, cache_read_tokens: 100, cache_creation_tokens: 10, output_tokens: 60, actual_cost: 3.25 };
+  switch (url.pathname) {
+    case '/api/v1/usage/dashboard/stats': return { total_requests: 42, today_requests: 12, total_tokens: 460, today_tokens: 120,
+      total_input_tokens: 300, total_cache_read_tokens: 100, total_actual_cost: 12.5, today_actual_cost: 3.25 };
+    case '/api/v1/usage/dashboard/trend': return { trend: [{ ...sample, date: start }] };
+    case '/api/v1/usage/dashboard/models':
+      reads.set(days, (reads.get(days) ?? 0) + 1);
+      return { models: [{ ...sample, model: `account-${days}d` }] };
+    case '/api/v1/usage': return { items: [18, 19].map(id => ({ id, api_key_id: id, model: 'account-call', input_tokens: 25,
+      output_tokens: 10, duration_ms: 60, actual_cost: 0.12, created_at: `${end}T12:00:00Z` })) };
+    default: return {};
+  }
+}
 async function host() {
   const scratch = path.join(root, '.desktop'); fs.mkdirSync(scratch, { recursive: true });
-  const temp = fs.mkdtempSync(path.join(scratch, 'subagent-ui-')), home = path.join(temp, 'user');
-  Object.assign(process.env, { PHUKET_SWITCH_USER_HOME: home, PHUKET_SWITCH_HOME: path.join(temp, 'db'), TMP: temp, TEMP: temp, ASTRA_API_KEY: 'fixture-env-token' });
+  const temp = fs.mkdtempSync(path.join(scratch, 'subagent-ui-'));
+  try { await exercise(temp); }
+  finally { fs.rmSync(temp, { recursive: true, force: true, maxRetries: 6, retryDelay: 150 }); }
+}
+async function exercise(temp) {
+  const home = path.join(temp, 'user'), data = path.join(temp, 'plugin-data');
+  Object.assign(process.env, { PHUKET_SWITCH_USER_HOME: home, PHUKET_SWITCH_HOME: path.join(temp, 'db'), PLUGIN_DATA: data,
+    TMP: temp, TEMP: temp, TMPDIR: temp, PYTHONUTF8: '1', PYTHONDONTWRITEBYTECODE: '1', ASTRA_API_KEY: 'fixture-env-token' });
   fs.mkdirSync(path.join(home, '.cursor'), { recursive: true });
+  seedAstraUsage(data, home);
+  const usageReads = new Map();
   const { createRuntime, createManagementApp } = await import('../dist/server/app.js');
   // Gemini is deliberately first: native group defaults must not depend on catalog order.
   const group = { id: 124, name: '测试 Gemini 分组', platform: 'gemini', status: 'active', models: ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-9-image', 'gemini-8-flash-lite', 'gemini-other'].map(name => ({ name })) };
@@ -28,6 +73,7 @@ async function host() {
     if (url.hostname === 'catalog.invalid') { assert.equal(new Headers(init.headers).get('authorization'), 'Bearer fixture-provider-credential'); return Response.json({ data: [] }); }
     if (url.href === customBase + '/models') { assert.equal(new Headers(init.headers).get('authorization'), `Bearer ${secret}`); return Response.json({ data: [] }); }
     assert.equal(url.origin, 'https://ai.pukitcore.com');
+    value = accountUsageFixture(url, usageReads);
     if (url.pathname.endsWith('/model-plaza') || url.pathname.endsWith('/groups/available')) value = groups;
     if (url.pathname.endsWith('/keys')) {
       if (init.method === 'POST') {
@@ -37,22 +83,25 @@ async function host() {
         keys.unshift({ ...value, key: '****' }); // Only the issue response contains the full new key.
       } else value = { items: keys, total: keys.length };
     }
-    if (url.pathname.endsWith('/auth/me')) value = { id: 221, email: 'desktop@example.invalid' };
+    if (url.pathname.endsWith('/auth/me')) value = { id: 221, email: 'desktop@example.invalid', balance: 82.5, total_recharged: 95 };
     return Response.json({ data: value });
   } });
   runtime.db.createProvider({ name: '测试供应商', appType: 'codex', protocol: 'openai-responses', baseUrl: 'https://catalog.invalid/v1', apiKey: 'fixture-provider-credential', model: 'provider-model', availableModels: ['provider-other'] });
   const server = http.createServer(createManagementApp(undefined, runtime));
   runtime.db.setState('proxySettings', { ...runtime.db.state('proxySettings'), port: fixtureProxyPort });
-  const requests = {}, tests = [];
-  server.prependListener('request', req => { const route = req.url; if (!['/api/subagent/apply','/api/subagent/preview-diff','/api/subagent/test'].includes(route)) return;
+  const requests = {}, tests = []; let lastPath = '(no requests)';
+  server.prependListener('request', req => { const route = req.url; lastPath = route.split('?')[0]; if (!['/api/subagent/apply','/api/subagent/preview-diff','/api/subagent/test'].includes(route)) return;
     let body = ''; req.on('data', b => body += b); req.on('end', () => { const data = JSON.parse(body); if (route === '/api/subagent/test') tests.push(data); else requests[route] = data; }); });
   let child;
   try {
+    seedProxyUsage(runtime.db);
     await runtime.directBypass.updateConfig({ interfaceName: 'Fixture Ethernet' }); // Saved adapter is offline in this fixture.
     server.listen(0, '127.0.0.1'); await once(server, 'listening');
     const env = { ...process.env, PHUKET_UI_TEST_ORIGIN: `http://127.0.0.1:${server.address().port}` }; delete env.ELECTRON_RUN_AS_NODE;
     child = spawn(createRequire(import.meta.url)('electron'), [`--user-data-dir=${path.join(temp, 'chromium')}`, '--no-proxy-server', '--disable-background-networking', import.meta.filename], { env, stdio: 'inherit', windowsHide: true });
-    const timer = setTimeout(() => child.kill(), 70000); try { assert.equal((await once(child, 'exit'))[0], 0); } finally { clearTimeout(timer); }
+    const timer = setTimeout(() => { console.error('UI smoke timed out; last request:', lastPath); child.kill(); }, 90000);
+    try { assert.equal((await once(child, 'exit'))[0], 0); } finally { clearTimeout(timer); }
+    assert.ok(usageReads.get(1) >= 1 && usageReads.get(7) >= 1 && usageReads.get(30) >= 2, 'dated dashboards and manual refresh reached the upstream');
     assert.deepEqual(requests['/api/subagent/apply'], requests['/api/subagent/preview-diff']);
     assert.equal(requests['/api/subagent/apply'].enableChunkCompaction, false);
     assert.equal(requests['/api/subagent/apply'].compactTriggerPct, 75); assert.equal(requests['/api/subagent/apply'].compactKeepRecentGroups, 0);
@@ -75,17 +124,21 @@ async function host() {
   } finally {
     if (child && child.exitCode === null && !child.killed) child.kill();
     server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); await runtime.close();
-    fs.rmSync(temp, { recursive: true, force: true, maxRetries: 6, retryDelay: 150 });
   }
 }
 async function renderer({ app, BrowserWindow, session }) {
   const origin = process.env.PHUKET_UI_TEST_ORIGIN; assert.ok(origin && process.env.PHUKET_SWITCH_USER_HOME);
   await app.whenReady(); session.defaultSession.webRequest.onBeforeRequest((d, cb) => cb({ cancel: !d.url.startsWith(origin + '/') }));
   const w = new BrowserWindow({ show: false, width: 1060, height: 820, webPreferences: { sandbox: true, nodeIntegration: false, contextIsolation: true } });
+  const errors = [];
+  w.webContents.on('console-message', event => { if (event.level === 'error') errors.push(event.message); });
+  w.webContents.on('render-process-gone', (_event, details) => errors.push(`Renderer exited: ${details.reason}`));
   const js = code => w.webContents.executeJavaScript(code), wait = async (code, what) => { for (let i=0;i<240;i++) { if (await js(code)) return; await delay(40); } throw Error('UI timeout: ' + what); };
   async function page() {
     await w.loadURL(origin + '/subagent'); await wait("document.querySelectorAll('.subagent-harness').length === 9", 'nine targets');
-    await js(`window.btn = (s, parent=document) => [...parent.querySelectorAll('button')].find(x=>x.textContent.trim()===s);
+    await js(`addEventListener('error', e => console.error('Page error:', e.message));
+      addEventListener('unhandledrejection', e => console.error('Unhandled rejection:', e.reason));
+      window.btn = (s, parent=document) => [...parent.querySelectorAll('button')].find(x=>x.textContent.trim()===s);
       window.field = name => [...document.querySelectorAll('.field')].find(l=>l.querySelector('span')?.textContent===name)?.querySelector('input,select,textarea');
       window.setValue = (el,v) => { Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el),'value').set.call(el,v);el.dispatchEvent(new Event(el.tagName==='SELECT'?'change':'input',{bubbles:true})); };
       window.setField = (name,v) => setValue(field(name),v);
@@ -128,6 +181,44 @@ async function renderer({ app, BrowserWindow, session }) {
     await set('名称', 'Desktop issued'); await click('创建密钥');
     await wait("!!document.querySelector('.issued')", 'one-time key available'); await click('导入到供应商');
     await wait("btn('已导入')?.disabled===true", 'new key imported for Claude Desktop');
+  }
+  async function usagePage() {
+    const metrics = () => js("[...document.querySelectorAll('.usage-view .metric strong')].map(el => el.textContent)");
+    const cells = n => js(`[...document.querySelectorAll('.usage-view table')[${n}].tBodies[0].rows].map(r => [...r.cells].map(c => c.textContent))`);
+    const nav = path => js(`document.querySelector('.sidebar a[href="${path}"]').click()`);
+    await nav('/usage');
+    await wait("btn('PhuketAI 账户')?.ariaSelected==='true' && document.querySelector('.usage-view')?.textContent.includes('测试密钥')", 'account tab and active key name');
+    assert.deepEqual(await metrics(), ['82.5 credits','3.25 credits','12.5 credits','12','120','100']);
+    assert.deepEqual((await cells(1)).map(row => row[2]), ['测试密钥','#19']);
+    assert.ok(await js("document.querySelector('.usage-view .metrics').textContent.includes('占输入 25%')"));
+    for (const [days, name] of [[7,'近 7 天'],[1,'今天'],[30,'近 30 天']]) {
+      await click(name);
+      await wait(`!!document.querySelector('[aria-label="${name}消耗与请求趋势"] svg') && !!document.querySelector('progress[aria-label="account-${days}d 费用占比"]')`, name + ' dashboard');
+    }
+    await js("document.querySelector('[aria-label=刷新账户用量]').click()");
+    await wait("!document.querySelector('[aria-label=刷新账户用量]').disabled", 'refreshed dashboard');
+    await click('本地代理');
+    await wait("location.hash==='#proxy' && document.querySelector('.usage-view tbody')?.textContent.includes('legacy-model')", 'proxy usage');
+    assert.deepEqual(await metrics(), ['4','75%','352','37.5%','100 ms']);
+    assert.ok(await js("['已上报 2 次','8 ms'].every(detail => document.querySelector('.usage-view .metrics').textContent.includes(detail))"));
+    assert.ok((await cells(0)).some(r => r[0] === 'proxy-model' && r[1] === 'Claude Code'));
+    const requests = await cells(1);
+    assert.equal(requests.length, 4);
+    assert.deepEqual(requests.find(r => r[2] === 'legacy-model').slice(3,8), ['502','—','—','—','77']);
+    await click('子代理');
+    await wait("location.hash==='#subagent' && document.querySelector('.usage-view')?.textContent.includes('fixture-review')", 'session and worker usage');
+    assert.deepEqual(await metrics(), ['1','200,000','25%','3,500','203,500']);
+    assert.deepEqual((await cells(0))[0].slice(-2), ['3,500含推理 350','203,500']);
+    const [session] = await cells(1), [worker] = await cells(2);
+    assert.deepEqual(session.slice(0,2), ['fixture-session','fixture-astra']);
+    assert.ok(session[5].includes('125,000 / 1,000,000') && session[5].includes('12.5%'));
+    assert.deepEqual(worker.slice(0,7), ['fixture-review','已完成','fixture-astra','3','2.5 s','1,000','50%']);
+    assert.ok(await js("document.querySelector('main').scrollWidth <= document.querySelector('main').clientWidth+1"), 'usage tables stay inside the page');
+    await click('前往子代理配置'); await wait("!!btn('查看用量')", 'subagent config'); await click('查看用量');
+    await wait("location.pathname==='/usage' && location.hash==='#subagent' && btn('子代理')?.ariaSelected==='true'", 'subagent usage shortcut');
+    await nav('/groups'); await wait("!!btn('账户与用量')", 'group tabs'); await click('账户与用量');
+    await wait("!!btn('查看完整用量与调用明细')", 'account overview shortcut'); await click('查看完整用量与调用明细');
+    await wait("location.pathname==='/usage' && location.hash==='#phuket' && btn('PhuketAI 账户')?.ariaSelected==='true'", 'account usage shortcut');
   }
   async function downloadPage() {
     assert.equal(await js("fetch('/api/direct-download').then(r=>r.status)"), 200);
@@ -178,7 +269,8 @@ async function renderer({ app, BrowserWindow, session }) {
   try {
     await page(); assert.deepEqual(await js(`[...document.querySelectorAll('.sidebar nav a')].slice(-3).map(x=>x.pathname)`), ['/lab','/subagent','/extensions']);
     await click('验证子代理'); await wait("document.querySelector('.subagent-result')?.textContent.includes('astra_wait_worker')", 'handshake');
-    assert.ok(await js("document.querySelector('.subagent-result').textContent.includes('1.5.0')"));
+    const { SUBAGENT_VERSION } = await import('../dist/shared/constants.js');
+    assert.ok(await js(`document.querySelector('.subagent-result').textContent.includes(${JSON.stringify(SUBAGENT_VERSION)})`));
     assert.ok(await js("document.querySelector('.subagent-metrics').textContent.includes('已开启 · 88% 兜底') && document.querySelector('.subagent-compaction').textContent.includes('239,360')"));
     const localPreset = `http://127.0.0.1:${fixtureProxyPort}`;
     await wait(`field('接口 Base URL')?.placeholder===${JSON.stringify(localPreset)}`, 'configured local proxy port');
@@ -193,6 +285,8 @@ async function renderer({ app, BrowserWindow, session }) {
     await set('新地址 API 密钥','invalid key'); assert.ok(await js("btn('预览变更 Diff').disabled && document.querySelector('.subagent-test-actions input').disabled"));
     await set('新地址 API 密钥', secret); await click('验证子代理'); await wait("document.querySelector('.subagent-result')?.textContent.includes('未探测')", 'local-only test'); await probe();
     await click('PhuketAI 分组'); await wait("!!btn('登录 PhuketAI')", 'guest login action'); await click('登录 PhuketAI'); await wait("!!document.querySelector('dialog[open]')", 'login dialog'); await js("document.querySelector('dialog[open] button[aria-label=关闭]').click()");
+    await js("document.querySelector('.sidebar a[href=\"/usage\"]').click()");
+    await wait("document.querySelector('.usage-view .empty')?.textContent.includes('登录 PhuketAI 查看账户与调用明细')", 'guest usage login gate');
     await js(`fetch('/api/phuket/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:'offline-guest-access'})}).then(r=>{if(!r.ok)throw Error('test login')})`);
     await page(); await set('凭据选择','env'); await set('接口 Base URL', customBase);
     assert.ok(await js("field('新地址 API 密钥')?.type==='password' && btn('预览变更 Diff').disabled"));
@@ -205,7 +299,13 @@ async function renderer({ app, BrowserWindow, session }) {
     assert.ok(await js(`field('接口 Base URL').value===${JSON.stringify(customBase)} && field('接口协议').value==='openai-chat' && field('默认子代理模型').value==='my-custom:8b' && field('新地址 API 密钥').value===''`));
     await set('新地址 API 密钥', secret); await js("document.querySelector('[aria-label=\"显示新地址 API 密钥\"]').click()");
     assert.equal(await js("field('新地址 API 密钥').type"), 'text'); await js("document.querySelector('[aria-label=\"隐藏新地址 API 密钥\"]').click()");
-    await probe(); await click('128K');
+    await probe(); await click('勾选已检测'); await click('1M');
+    const context = '上下文上限（词元）';
+    assert.equal(await js(`field(${JSON.stringify(context)}).value`), '1000000');
+    assert.ok(await js("!btn('预览变更 Diff').disabled && document.querySelector('.subagent-compaction').textContent.includes('880,000')"));
+    await set(context,'1000001');
+    assert.ok(await js("btn('预览变更 Diff').disabled && document.querySelector('.subagent-footer-state').textContent.includes('1,000,000')"));
+    await click('128K');
     await click('75%'); await set('分块保留最近交互组','0');
     await js("document.querySelector('[role=switch][aria-label=允许模型自主分块压缩]').click()");
     assert.ok(await js("document.querySelector('.subagent-compaction').textContent.includes('96,000')"));
@@ -241,6 +341,7 @@ async function renderer({ app, BrowserWindow, session }) {
     assert.deepEqual(await js("[...document.querySelectorAll('.subagent-harness input:checked')].map(el=>el.ariaLabel)"), ['选择 Windsurf']);
     assert.ok(await js("field('默认子代理模型').value==='new-model' && field('接口 Base URL').value==='https://openrouter.ai/api/v1' && field('接口协议').value==='openai-chat' && field('新地址 API 密钥').value==='new-origin-only'"));
     await click('移除全部已部署'); await click('确认移除'); await wait("document.querySelectorAll('.subagent-harness .badge.good').length===0", 'all removed');
+    await usagePage();
     await js("document.querySelector('.sidebar a[href=\"/proxy\"]').click()");
     await wait("document.querySelector('.direct-shortcut .badge')?.textContent==='未启用'", 'direct shortcut');
     await click('详细设置');
@@ -283,7 +384,8 @@ async function renderer({ app, BrowserWindow, session }) {
     await geminiGroupFlows();
     await w.loadURL(origin+'/extensions#backups'); await wait("document.querySelector('.backup-list')?.textContent.includes('部署子代理插件与配置') && document.querySelector('.backup-list')?.textContent.includes('移除子代理配置')", 'backups');
     assert.ok(await js("['部署 AI 直连下载脚本与规则','移除 AI 直连下载规则'].every(s=>document.querySelector('.backup-list').textContent.includes(s)) && [...document.querySelectorAll('.backup-list .badge')].filter(b=>b.textContent==='AI 直连下载').length===3"));
-    console.log('Renderer passed: native group defaults, Gemini group Claude forms and key imports, provider and subagent origin-key guards, configured proxy preset, read-only discovery, redacted diff/apply, MCP handshake, chunk policy, draft-preserving removal, shared bypass settings, downloader apply/probe/selected and all removal, backups, route population without takeover, light/dark widths.');
+    assert.deepEqual(errors, [], 'renderer console and page errors');
+    console.log('Renderer passed: all three usage tabs, account periods and refresh, proxy cache reporting, Astra sessions and workers, 1M context validation, no renderer errors; native group defaults, Gemini group Claude forms and key imports, provider and subagent origin-key guards, configured proxy preset, read-only discovery, redacted diff/apply, MCP handshake, chunk policy, draft-preserving removal, shared bypass settings, downloader apply/probe/selected and all removal, backups, route population without takeover, light/dark widths.');
   } finally { w.destroy(); }
 }
 if (process.versions.electron) { const electron = await import('electron'); renderer(electron).then(() => electron.app.exit(0), e => { console.error(e); electron.app.exit(1); }); }

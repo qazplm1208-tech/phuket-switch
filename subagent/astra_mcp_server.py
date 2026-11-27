@@ -42,7 +42,7 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 SERVER_NAME = "gpt-astra-subagent"
-SERVER_VERSION = "1.5.0"
+SERVER_VERSION = "1.6.0"
 DEFAULT_MODEL = os.environ.get("ASTRA_MODEL", "gpt-6.2-astra").strip() or "gpt-6.2-astra"
 LOCKED_MODEL = DEFAULT_MODEL  # v1.2 import/patch compatibility
 _STARTUP_MODEL = DEFAULT_MODEL
@@ -63,7 +63,8 @@ if DEFAULT_EFFORT not in VALID_EFFORTS:
 
 # Includes the native Codex instructions and the canonical six-tool schema.
 BASE_PROMPT_OVERHEAD_TOKENS = 5200
-HARD_CONTEXT_TOKENS = 272_000
+DEFAULT_MAX_CONTEXT_TOKENS = 272_000
+HARD_CONTEXT_TOKENS = 1_000_000
 MIN_CONTEXT_TOKENS = BASE_PROMPT_OVERHEAD_TOKENS + 512
 
 
@@ -75,9 +76,10 @@ def _env_int(name: str, default: int, low: int, high: int) -> int:
     return max(low, min(value, high))
 
 
-MAX_CONTEXT_TOKENS = _env_int("ASTRA_MAX_CONTEXT_TOKENS", HARD_CONTEXT_TOKENS, MIN_CONTEXT_TOKENS, HARD_CONTEXT_TOKENS)
+MAX_CONTEXT_TOKENS = _env_int("ASTRA_MAX_CONTEXT_TOKENS", DEFAULT_MAX_CONTEXT_TOKENS, MIN_CONTEXT_TOKENS, HARD_CONTEXT_TOKENS)
 COMPACT_TRIGGER_TOKENS = _env_int("ASTRA_COMPACT_TRIGGER_TOKENS", int(MAX_CONTEXT_TOKENS * 0.88),
                                   BASE_PROMPT_OVERHEAD_TOKENS + 384, MAX_CONTEXT_TOKENS)
+COMPACT_TRIGGER_RATIO = COMPACT_TRIGGER_TOKENS / MAX_CONTEXT_TOKENS
 COMPACT_TARGET_TOKENS = _env_int("ASTRA_COMPACT_TARGET_TOKENS", 48_000,
                                  BASE_PROMPT_OVERHEAD_TOKENS + 256, COMPACT_TRIGGER_TOKENS - 1)
 COMPACT_TAIL_TOKENS = _env_int("ASTRA_COMPACT_TAIL_TOKENS", 28_000, 0, COMPACT_TARGET_TOKENS - BASE_PROMPT_OVERHEAD_TOKENS)
@@ -231,9 +233,9 @@ def build_developer_context(cwd: str, mode: str, allow_outside_cwd: bool) -> str
         )
     )
     compaction_guide = (
-        '- In edit and readonly modes, use compact_context(action="status") to check context usage. '
-        'Proactively compact completed research or implementation with mode="chunk", optionally supplying '
-        'a factual summary and label; there is no need to wait for the context cap.\n'
+        '- Use compact_context(action="status") to check usage. Freely adjust the session cap up to 1,000,000 tokens '
+        'with compact_context(action="set_limit", max_context_tokens=...). Proactively compact completed work '
+        'with mode="chunk", optionally supplying a factual summary and label.\n'
         if ALLOW_MODEL_COMPACTION else ""
     )
     download_script = os.environ.get('ASTRA_DIRECT_DOWNLOAD_SCRIPT', '').strip()
@@ -247,6 +249,10 @@ def build_developer_context(cwd: str, mode: str, allow_outside_cwd: bool) -> str
         f"{compaction_guide}{download_guide}"
         "- End your final response with a concise factual summary of changes, commands run, and verification results."
     )
+
+
+def _context_limit_schema(description: str) -> dict:
+    return {"type": "integer", "minimum": MIN_CONTEXT_TOKENS, "maximum": HARD_CONTEXT_TOKENS, "description": description}
 
 
 def _compaction_properties(default_mode: str) -> dict:
@@ -373,9 +379,10 @@ def build_openai_tools(mode: str, allow_model_compaction: bool | None = None) ->
     if allow_model_compaction:
         tools.append({
             "type": "function", "name": "compact_context",
-            "description": "Inspect context usage or compact completed history without splitting the current step.",
+            "description": "Inspect usage (status), adjust the session cap up to 1,000,000 tokens (set_limit), or compact completed history without splitting the current step.",
             "parameters": {"type": "object", "additionalProperties": False, "properties": {
-                "action": {"type": "string", "enum": ["compact", "status"], "default": "compact"},
+                "action": {"type": "string", "enum": ["compact", "status", "set_limit"], "default": "compact"},
+                "max_context_tokens": _context_limit_schema("New session context limit in tokens, required when action='set_limit'."),
                 **_compaction_properties("chunk"),
             }, "required": []},
         })
@@ -1279,17 +1286,20 @@ class AstraSession:
     model: str = field(default_factory=_default_model)
     protocol: str = field(default_factory=lambda: DEFAULT_PROTOCOL)
     chunk_compactions: int = 0
+    max_context_tokens: int | None = None
     lock: threading.RLock = field(init=False, default_factory=threading.RLock)
     log_path: Path = field(init=False)
 
     def __post_init__(self) -> None:
         _validate_session_id(self.session_id)
         self.log_path = _resolve_log_dir() / f"{self.session_id}.log"
+        self.logger = _make_logger(self.log_path)
 
 
 # Store constructor fields only; the lock and local log path are rebuilt on restore.
 _SESSION_FIELDS = tuple(f.name for f in fields(AstraSession) if f.init)
-_V12_FIELDS = {"last_input_tokens", "last_input_history_len", "compactions", "last_compacted_at"}
+_OPTIONAL_SESSION_FIELDS = {"last_input_tokens", "last_input_history_len", "compactions", "last_compacted_at",
+                            "model", "protocol", "chunk_compactions", "max_context_tokens"}
 
 
 def _session_file(session_id: str) -> Path:
@@ -1335,7 +1345,11 @@ def _load_session(session_id: str) -> AstraSession | None:
         raise ValueError(f"Session ID does not match snapshot: {path.name}")
     # Only post-v1.1 fields are optional. Never default a missing v1.1 cache key,
     # permission, usage counter or history, even if the constructor has a default.
-    data = {k: state[k] for k in _SESSION_FIELDS if k not in _V12_FIELDS | {"model", "protocol", "chunk_compactions"} or k in state}
+    data = {k: state[k] for k in _SESSION_FIELDS if k not in _OPTIONAL_SESSION_FIELDS or k in state}
+    try:
+        _context_limit(data.get("max_context_tokens"))
+    except ValueError:
+        data["max_context_tokens"] = None  # A bad optional cap must not discard a resumable history.
     if "model" in data:
         _validate_model(data["model"])
     if data.get("protocol", DEFAULT_PROTOCOL) not in VALID_PROTOCOLS:
@@ -1380,6 +1394,7 @@ class BackgroundWorker:
     status: str = "running"  # running | completed | failed
     model: str = field(default_factory=_default_model)
     protocol: str = field(default_factory=lambda: DEFAULT_PROTOCOL)
+    context_limit_tokens: int = field(default_factory=lambda: MAX_CONTEXT_TOKENS)
     steps_used: int = 0
     started_at: float = field(default_factory=time.time)
     finished_at: float | None = None
@@ -1502,12 +1517,42 @@ def estimate_session_context_tokens(session: AstraSession) -> int:
     return heuristic
 
 
-def _context_limit(value: int | None) -> int:
-    if value is None:
-        return MAX_CONTEXT_TOKENS
-    if type(value) is not int or not MIN_CONTEXT_TOKENS <= value <= MAX_CONTEXT_TOKENS:
-        raise ValueError(f"max_context_tokens must be an integer in [{MIN_CONTEXT_TOKENS}, {MAX_CONTEXT_TOKENS}]")
+def _required_context_limit(value: Any) -> int:
+    if type(value) is not int or not MIN_CONTEXT_TOKENS <= value <= HARD_CONTEXT_TOKENS:
+        raise ValueError(f"max_context_tokens must be an integer in [{MIN_CONTEXT_TOKENS}, {HARD_CONTEXT_TOKENS}]")
     return value
+
+
+def _context_limit(value: int | None) -> int:
+    return MAX_CONTEXT_TOKENS if value is None else _required_context_limit(value)
+
+
+def _session_context_limit(session: AstraSession, override: int | None = None) -> int:
+    return _context_limit(session.max_context_tokens if override is None else override)
+
+
+def _compact_trigger(limit: int) -> int:
+    if limit == MAX_CONTEXT_TOKENS:
+        return COMPACT_TRIGGER_TOKENS
+    return max(BASE_PROMPT_OVERHEAD_TOKENS + 384, min(limit, int(limit * COMPACT_TRIGGER_RATIO)))
+
+
+def _limit_status(limit: int) -> dict[str, int]:
+    return {"context_limit_tokens": limit, "trigger_tokens": _compact_trigger(limit), "hard_max_context_tokens": HARD_CONTEXT_TOKENS}
+
+
+def _set_session_context_limit(session: AstraSession, value: int, *, completed_len: int | None = None) -> None:
+    limit = _required_context_limit(value)
+    with session.lock:
+        old, updated = session.max_context_tokens, session.updated_at
+        session.max_context_tokens, session.updated_at = limit, time.time()
+        try:
+            # During a model tool call only checkpoint the completed prefix, never an unpaired call.
+            _save_session(session, completed_len=completed_len)
+        except BaseException:
+            session.max_context_tokens, session.updated_at = old, updated
+            raise
+        session.logger(f"CONTEXT LIMIT {_context_limit(old)} -> {limit} tokens")
 
 
 def _atomic_groups(items: list[dict]) -> list[list[dict]]:
@@ -1586,8 +1631,8 @@ def _chunk_status(session: AstraSession, *, upto_index: int | None = None) -> di
             match = re.search(r'\slabel="([^"]*)"', header)
             labels.append(html.unescape(match[1]) if match else "")
     _, _, raw = _chunk_parts(session.input_history[:upto_index])
-    return {"estimated_context_tokens": estimated, "context_limit_tokens": MAX_CONTEXT_TOKENS,
-            "trigger_tokens": COMPACT_TRIGGER_TOKENS, "usage_pct": round(100 * estimated / MAX_CONTEXT_TOKENS, 1),
+    limit = _session_context_limit(session)
+    return {**_limit_status(limit), "estimated_context_tokens": estimated, "usage_pct": round(100 * estimated / limit, 1),
             "compacted_chunks": len(labels), "chunk_labels": labels, "uncompacted_groups": len(raw)}
 
 
@@ -1786,10 +1831,11 @@ def compact_session_history(session: AstraSession, *, max_context_tokens: int | 
                             tail_budget: int | None = None, use_llm: bool = True, focus: str | None = None,
                             upto_index: int | None = None) -> tuple[list[dict], str]:
     """Build a bounded replacement history without changing session or its original items."""
-    limit = _context_limit(max_context_tokens)
+    limit = _session_context_limit(session, max_context_tokens)
     history = session.input_history[:upto_index]
     protected = session.input_history[upto_index:] if upto_index is not None else []
-    prefix_limit = limit - sum(map(estimate_item_tokens, protected))
+    protected_tokens = sum(map(estimate_item_tokens, protected))
+    prefix_limit = limit - protected_tokens
     prefix = _developer_prefix(history)
     groups = _atomic_groups(history[len(prefix):])
     header = (f"{_SUMMARY_TAG}\nActive settings: mode={session.mode}; "
@@ -1801,7 +1847,9 @@ def compact_session_history(session: AstraSession, *, max_context_tokens: int | 
     scaffold = estimate_history_tokens([*prefix, summary_item("")])
     if scaffold >= prefix_limit:
         raise ValueError("Context limit cannot fit the mandatory developer prefix, summary header and protected step")
-    target = min(prefix_limit - 1, max(COMPACT_TARGET_TOKENS, scaffold + 128))
+    # Leave headroom below this limit's trigger, accounting for the protected step.
+    target = min(COMPACT_TARGET_TOKENS, _compact_trigger(limit) - protected_tokens - 1)
+    target = min(prefix_limit - 1, max(target, scaffold + 128))
     available = target - scaffold
     budget = min(COMPACT_TAIL_TOKENS if tail_budget is None else max(0, tail_budget),
                  available - min(2048, available // 3))
@@ -1843,7 +1891,7 @@ def compact_session_chunk_history(session: AstraSession, *, label: str | None = 
                                   focus: str | None = None, max_context_tokens: int | None = None,
                                   use_llm: bool = True, upto_index: int | None = None) -> tuple[list[dict], str, dict]:
     """Replace the oldest eligible groups without modifying the live history or in-flight step."""
-    limit = _context_limit(max_context_tokens)
+    limit = _session_context_limit(session, max_context_tokens)
     if chunk_groups is not None and (type(chunk_groups) is not int or chunk_groups < 1):
         raise ValueError("chunk_groups must be a positive integer")
     if keep_recent_groups is not None and type(keep_recent_groups) is not int:
@@ -1911,7 +1959,7 @@ def _backup_session(session_id: str) -> str | None:
 def _commit_compaction(session: AstraSession, history: list[dict], method: str, info: dict, upto_index: int | None) -> dict:
     """Shared commit path; caller holds the session lock from planning through persistence."""
     before = estimate_session_context_tokens(session)
-    report = {**info, "session_id": session.session_id, "cwd": session.cwd, "model": session.model,
+    report = {**info, **_limit_status(_session_context_limit(session)), "session_id": session.session_id, "cwd": session.cwd, "model": session.model,
               "api_format": session.protocol, "before_items": len(session.input_history), "before_est_tokens": before,
               "before_last_input_tokens": session.last_input_tokens, "method": method, "backup_file": None}
     trailing = session.input_history[upto_index:] if upto_index is not None else []
@@ -1980,8 +2028,11 @@ def _model_compact_context(session: AstraSession, call: dict, step_start: int) -
         action = args.get("action", "compact")
         if action == "status":
             return _chunk_status(session, upto_index=step_start)
+        if action == "set_limit":
+            _set_session_context_limit(session, args.get("max_context_tokens"), completed_len=step_start)
+            return _chunk_status(session, upto_index=step_start)
         if action != "compact":
-            raise ValueError("action must be compact or status")
+            raise ValueError("action must be compact, status or set_limit")
         mode, focus = args.get("mode", "chunk"), args.get("focus")
         if focus is not None and not isinstance(focus, str):
             raise ValueError("focus must be a string")
@@ -2053,6 +2104,7 @@ def run_astra_agent_turn(
     session_id: str | None = None,
     model: str | None = None,
     max_steps: int | None = DEFAULT_MAX_STEPS,
+    max_context_tokens: int | None = None,
     allow_outside_cwd: bool = False,
     worker_ref: BackgroundWorker | None = None,
     cancel_event: threading.Event | None = None,
@@ -2065,16 +2117,21 @@ def run_astra_agent_turn(
     if model is not None:
         _requested_model(model)
     max_steps = _validate_max_steps(max_steps)
+    if max_context_tokens is not None:
+        _required_context_limit(max_context_tokens)
 
     sid = _validate_session_id(session_id) if session_id is not None else f"astra-{uuid.uuid4().hex[:10]}"
     with _cancel_scope(cancel_event), _turn_session(sid, cwd, mode, effort, allow_outside_cwd) as session:
         if Path(cwd).resolve() != Path(session.cwd).resolve():
             raise ValueError("Use a new session for a different workspace.")
+        if max_context_tokens is not None:
+            _set_session_context_limit(session, max_context_tokens)
         if model is not None:
             session.model = model
         if worker_ref is not None:
             worker_ref.model, worker_ref.protocol = session.model, session.protocol
-        logger = _make_logger(session.log_path)
+            worker_ref.context_limit_tokens = _session_context_limit(session)
+        logger = session.logger
         logger(
             f"=== NEW TURN session={session.session_id} model={session.model} api_format={session.protocol} "
             f"effort={effort} mode={mode} cwd={session.cwd} ==="
@@ -2123,7 +2180,8 @@ def run_astra_agent_turn(
 
                 for attempt in range(2):
                     est = estimate_session_context_tokens(session)
-                    if attempt or est >= COMPACT_TRIGGER_TOKENS or est > MAX_CONTEXT_TOKENS:
+                    limit = _session_context_limit(session)  # A tool in the previous step can change it.
+                    if attempt or est >= _compact_trigger(limit) or est > limit:
                         # On a gateway rejection, shrink even a tail that our estimator thought fit.
                         budget = min(COMPACT_TAIL_TOKENS // 2, max(0, est - BASE_PROMPT_OVERHEAD_TOKENS) // 2) if attempt else None
                         compact_session(session, tail_budget=budget)
@@ -2212,6 +2270,8 @@ def run_astra_agent_turn(
                     elif fn_name == "compact_context":
                         trailing_len = len(session.input_history) - step_group_start
                         report = _model_compact_context(session, session.input_history[-1], step_group_start)
+                        if worker_ref is not None:
+                            worker_ref.context_limit_tokens = _session_context_limit(session)
                         step_group_start = len(session.input_history) - trailing_len
                         if report.get("compacted"):
                             compactions_this_turn += 1
@@ -2273,7 +2333,7 @@ def run_astra_agent_turn(
             "status": status,
             "steps_used": step,
             "context_tokens_est": estimate_session_context_tokens(session),
-            "context_limit_tokens": MAX_CONTEXT_TOKENS,
+            **_limit_status(_session_context_limit(session)),
             "compactions_this_turn": compactions_this_turn,
             "chunk_compactions_this_turn": chunk_compactions_this_turn,
             "compacted_chunks": sum(_is_compacted_chunk(i) for i in session.input_history),
@@ -2312,6 +2372,7 @@ def _mcp_tools():
     task = {"task": text("Self-contained brief with target files, constraints and verification commands."), "cwd": cwd,
             "mode": {"type": "string", "enum": ["edit", "readonly"], "default": DEFAULT_MODE},
             "model": text("Optional model. Omit to keep the saved session model or use the configured default for a new session."),
+            "max_context_tokens": _context_limit_schema(f"Optional sticky session cap up to 1,000,000 tokens. Omit to keep the saved cap or use the configured default ({MAX_CONTEXT_TOKENS:,} tokens) for a new session."),
             "reasoning_effort": {"type": "string", "enum": list(VALID_EFFORTS), "default": DEFAULT_EFFORT},
             "session_id": sid, "max_steps": {"type": "integer", "minimum": 0, "default": DEFAULT_MAX_STEPS,
                                              "description": "Optional step cap; 0 (default) means unlimited until the task completes."},
@@ -2325,7 +2386,7 @@ def _mcp_tools():
              {"worker_id": wid, "timeout_seconds": {"type": "integer", "default": DEFAULT_WAIT_SECONDS}}, ["worker_id"]),
         tool("compact_session", "Back up and compact a session or scan all over-limit sessions.",
              {"session_id": sid, "all_over_limit": {"type": "boolean", "default": False},
-              "max_context_tokens": {"type": "integer", "minimum": MIN_CONTEXT_TOKENS, "maximum": MAX_CONTEXT_TOKENS, "default": MAX_CONTEXT_TOKENS},
+              "max_context_tokens": _context_limit_schema("One-time limit for this operation. Omit to use each session's effective cap; does not change the saved cap."),
               "force": {"type": "boolean", "default": False, "description": "Compact this session_id even below the limit."},
               **_compaction_properties("full")}),
         tool("list_sessions", "List up to 30 recent sessions, newest first. Filter by cwd before resuming.", {"cwd": cwd}),
@@ -2349,7 +2410,8 @@ def astra_compact_session(session_id: str | None = None, *, all_over_limit: bool
         raise ValueError("label, summary and focus must be strings")
     if type(force) is not bool or type(all_over_limit) is not bool:
         raise ValueError("force and all_over_limit must be booleans")
-    limit = _context_limit(max_context_tokens)
+    if max_context_tokens is not None:
+        _required_context_limit(max_context_tokens)
     if session_id is not None:
         ids = [_validate_session_id(session_id)]
     elif all_over_limit:
@@ -2359,10 +2421,11 @@ def astra_compact_session(session_id: str | None = None, *, all_over_limit: bool
     else:
         raise ValueError("Specify session_id or all_over_limit=true")
 
-    def eligible(s: AstraSession) -> bool:
+    def eligible(s: AstraSession, limit: int) -> bool:
         return (mode == "chunk" or (force and session_id is not None) or s.last_input_tokens > limit
                 or estimate_session_context_tokens(s) > limit)
 
+    limits = set()
     compacted = []
     errors = {}
     skipped = 0
@@ -2373,7 +2436,9 @@ def astra_compact_session(session_id: str | None = None, *, all_over_limit: bool
                     session = _current_session(sid)
                     if session is None:
                         raise ValueError(f"Unknown session_id: {sid}")
-                    if not eligible(session):
+                    limit = _session_context_limit(session, max_context_tokens)
+                    limits.add(limit)
+                    if not eligible(session, limit):
                         skipped += 1
                         continue  # Don't pin every scanned snapshot in memory.
                     SESSIONS[sid] = session
@@ -2383,7 +2448,7 @@ def astra_compact_session(session_id: str | None = None, *, all_over_limit: bool
                 else:
                     result = compact_session(session, max_context_tokens=limit, focus=focus)
                 if result["compacted"]:
-                    compacted.append(result)
+                    compacted.append({**result, "max_context_tokens": limit})
                 else:
                     skipped += 1
         except (OSError, ValueError, KeyError, TypeError) as exc:
@@ -2391,7 +2456,9 @@ def astra_compact_session(session_id: str | None = None, *, all_over_limit: bool
                 raise
             errors[sid] = str(exc)
             skipped += 1
-    report = {"max_context_tokens": limit, "compacted": compacted, "skipped": skipped}
+    # A scan with mixed session caps has no single limit. Each result records the applied limit.
+    report_limit = next(iter(limits), _context_limit(max_context_tokens)) if len(limits) <= 1 else None
+    report = {"max_context_tokens": report_limit, "compacted": compacted, "skipped": skipped}
     if errors:
         report["errors"] = errors
     return report
@@ -2409,7 +2476,7 @@ def astra_list_sessions(cwd: str | None = None) -> dict[str, Any]:
         items.append({
             **status,
             "last_input_tokens": s.last_input_tokens,
-            "over_context_limit": s.last_input_tokens > MAX_CONTEXT_TOKENS or status["estimated_context_tokens"] > MAX_CONTEXT_TOKENS,
+            "over_context_limit": max(s.last_input_tokens, status["estimated_context_tokens"]) > status["context_limit_tokens"],
             "compactions": s.compactions, "chunk_compactions": s.chunk_compactions,
             "session_id": s.session_id,
             "prompt_cache_key": s.prompt_cache_key,
@@ -2455,6 +2522,7 @@ def _serialize_worker(w: BackgroundWorker, include_result: bool = True) -> dict[
         "session_id": w.session_id,
         "model": w.model,
         "api_format": w.protocol,
+        **_limit_status(w.context_limit_tokens),
         "reasoning_effort": w.reasoning_effort,
         "mode": w.mode,
         "cwd": w.cwd,
@@ -2509,6 +2577,8 @@ def _watch_command(argv: list[str]) -> str:
 
 def handle_tool_call(name: str, arguments: dict[str, Any], *, cancel_event=None) -> tuple[str, bool]:
     try:
+        if name in ("astra_run_task", "astra_spawn_worker", "astra_compact_session"):
+            cap = _required_context_limit(arguments["max_context_tokens"]) if "max_context_tokens" in arguments else None
         if name in ("astra_run_task", "astra_spawn_worker") and type(arguments.get("allow_outside_cwd", False)) is not bool:
             raise ValueError("allow_outside_cwd must be a boolean.")
         if name == "astra_run_task":
@@ -2520,6 +2590,7 @@ def handle_tool_call(name: str, arguments: dict[str, Any], *, cancel_event=None)
                 session_id=arguments.get("session_id"),
                 model=_requested_model(arguments["model"]) if "model" in arguments else None,
                 max_steps=arguments.get("max_steps", DEFAULT_MAX_STEPS),
+                max_context_tokens=cap,
                 allow_outside_cwd=bool(arguments.get("allow_outside_cwd", False)),
                 cancel_event=cancel_event,
             )
@@ -2557,6 +2628,7 @@ def handle_tool_call(name: str, arguments: dict[str, Any], *, cancel_event=None)
                 cwd=str(resolved_cwd),
                 model=model if model is not None else existing.model if existing else _default_model(),
                 protocol=existing.protocol if existing else DEFAULT_PROTOCOL,
+                context_limit_tokens=_session_context_limit(existing, cap) if existing else _context_limit(cap),
                 mode=mode,
                 reasoning_effort=effort,
             )
@@ -2578,6 +2650,7 @@ def handle_tool_call(name: str, arguments: dict[str, Any], *, cancel_event=None)
                         session_id=sid,
                         model=model,
                         max_steps=max_steps,
+                        max_context_tokens=cap,
                         allow_outside_cwd=allow_outside,
                         worker_ref=worker,
                         cancel_event=worker.cancel_event,
@@ -2886,7 +2959,7 @@ def _maintenance_cli() -> None:
     parser.add_argument("--any", action="store_true", help="Return when any requested worker finishes (default: all)")
     parser.add_argument("--poll-interval", type=float, default=1.0, metavar="SECONDS")
     parser.add_argument("--plugin-data", type=Path, help="Plugin data root for worker snapshots (defaults to the server's PLUGIN_DATA location)")
-    parser.add_argument("--limit", type=int, default=MAX_CONTEXT_TOKENS)
+    parser.add_argument("--limit", type=int, help="One-time context limit; defaults to each session's cap")
     parser.add_argument("--session-id")
     parser.add_argument("--force", action="store_true", help="Compact the specified session even below the limit")
     args = parser.parse_args()

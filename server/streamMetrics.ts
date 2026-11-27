@@ -1,4 +1,9 @@
-import { asNumber, isRecord, own } from './common.js';
+import { asNumber, cacheHitRatePct, isRecord, own } from './common.js';
+
+function tokens(value: unknown): number | null {
+  const n = asNumber(value);
+  return n !== null && Number.isSafeInteger(n) && n >= 0 ? n : null;
+}
 
 // Bounded SSE event decoder. Oversized events are skipped for telemetry, never
 // withheld from the proxy client. Handles split UTF-8, delimiters and multiline data.
@@ -6,7 +11,10 @@ export class StreamMetrics {
   private readonly decoder = new TextDecoder();
   private line = ''; private data: string[] = []; private size = 0; private discard = false; private pendingCR = false;
   firstByteMs: number | null = null; firstTokenMs: number | null = null;
-  outputTokens: number | null = null; inputTokens: number | null = null; totalTokens: number | null = null;
+  outputTokens: number | null = null; inputTokens: number | null = null; cachedTokens: number | null = null; totalTokens: number | null = null;
+  private rawInput: number | null = null;
+  private cacheReadInput = 0; private cacheCreationInput = 0;
+  get cacheHitRatePct() { return this.cachedTokens !== null && this.inputTokens !== null ? cacheHitRatePct(this.cachedTokens, this.inputTokens) : null; }
   text = ''; failed = false;
   constructor(private readonly start: number, private readonly textLimit = 0) {}
   private time() { return Math.round(performance.now() - this.start); }
@@ -15,12 +23,23 @@ export class StreamMetrics {
     this.firstTokenMs ??= this.time();
     if (this.text.length < this.textLimit) this.text += value.slice(0, this.textLimit - this.text.length);
   }
+  private observeUsage(u: Record<string, any>) {
+    this.rawInput = tokens(u.promptTokenCount ?? u.input_tokens ?? u.prompt_tokens) ?? this.rawInput;
+    // Anthropic reports uncached input separately from cache reads and cache writes.
+    // Its final SSE message_delta can contain only output_tokens, so keep each component.
+    const read = tokens(u.cache_read_input_tokens);
+    this.cacheReadInput = read ?? this.cacheReadInput;
+    this.cacheCreationInput = tokens(u.cache_creation_input_tokens) ?? this.cacheCreationInput;
+    if (this.rawInput !== null) this.inputTokens = this.rawInput + this.cacheReadInput + this.cacheCreationInput;
+    this.cachedTokens = read ?? tokens(u.cachedContentTokenCount ?? u.input_tokens_details?.cached_tokens ?? u.prompt_tokens_details?.cached_tokens) ?? this.cachedTokens;
+    const output = tokens(u.candidatesTokenCount ?? u.output_tokens ?? u.completion_tokens);
+    if (output !== null) this.outputTokens = output + (tokens(u.thoughtsTokenCount) ?? 0);
+    this.totalTokens = tokens(u.totalTokenCount ?? u.total_tokens) ?? (this.inputTokens !== null && this.outputTokens !== null ? this.inputTokens + this.outputTokens : this.totalTokens);
+  }
   observe(value: unknown, event = '') {
     const v = own(value), type = v.type || event, response = own(v.response ?? v.message);
-    const usage = own(v.usageMetadata ?? response.usage ?? v.usage);
-    this.inputTokens = asNumber(usage.promptTokenCount ?? usage.input_tokens ?? usage.prompt_tokens) ?? this.inputTokens;
-    this.outputTokens = asNumber(usage.candidatesTokenCount ?? usage.output_tokens ?? usage.completion_tokens) ?? this.outputTokens;
-    this.totalTokens = asNumber(usage.totalTokenCount ?? usage.total_tokens) ?? (this.inputTokens !== null && this.outputTokens !== null ? this.inputTokens + this.outputTokens : this.totalTokens);
+    const usage = v.usageMetadata ?? response.usageMetadata ?? response.usage ?? v.usage;
+    if (isRecord(usage)) this.observeUsage(usage);
     if (Array.isArray(v.candidates)) for (const candidate of v.candidates) {
       if (Array.isArray(candidate?.content?.parts)) for (const part of candidate.content.parts) this.token(part?.text);
     }

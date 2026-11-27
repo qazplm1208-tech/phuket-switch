@@ -1,6 +1,6 @@
 import { useId, useLayoutEffect, useRef, useState } from 'react';
 import { ChevronDown, ChevronUp, Eye, EyeOff, KeyRound, LogIn } from 'lucide-react';
-import { allowedGroupModels, DEFAULT_PROXY_PORT, isAstraModel, isOnlyAstraGroup, MODEL_SLUG, providerModelNames } from '@shared/constants';
+import { allowedGroupModels, DEFAULT_PROXY_PORT, isAstraModel, isOnlyAstraGroup, MAX_SUBAGENT_CONTEXT_TOKENS, MIN_SUBAGENT_CONTEXT_TOKENS, MODEL_SLUG, providerModelNames } from '@shared/constants';
 import { subagentProtocols, type PhuketApiKeyView, type PhuketGroup, type ProviderView, type SubagentStatus } from '@shared/types';
 import { appName } from '../lib/display';
 import { endpointPresets, fallbacks, groupDefaults, maskOnly, needsOriginKey, origin, protocols, providerDefaults, resolvedEndpointPreview, triggerTokenHint, type Draft } from '../lib/subagent';
@@ -100,8 +100,8 @@ export default function SubagentConfigPanel({ d, status, edit, busy, groups, act
         </div>
         <Field label="默认推理强度" hint="非推理模型可选择 none。"><select value={d.reasoningEffort} onChange={e => edit({ reasoningEffort: e.target.value as Draft['reasoningEffort'] })}>{['max','xhigh','high','medium','low','none'].map(v => <option key={v}>{v}</option>)}</select></Field>
         <Field label="默认执行模式"><select value={d.defaultMode} onChange={e => edit({ defaultMode: e.target.value as Draft['defaultMode'] })}><option value="edit">edit · 可读写文件与运行命令</option><option value="readonly">readonly · 只读分析</option></select></Field>
-        <div><Field label="上下文上限（词元）"><input type="number" min={5712} max={272000} step={1} value={d.context} onChange={e => edit({ context: e.target.value })} /></Field>
-          <div className="subagent-chips" aria-label="上下文预设">{[128,200,272].map(k => <button className="subagent-chip" key={k} type="button" aria-pressed={+d.context === k * 1000} onClick={() => edit({ context: String(k * 1000) })}>{k}K</button>)}</div>
+        <div><Field label="上下文上限（词元）" hint="默认会话上限；模型也可按任务自由调整（最高 1M）。"><input type="number" min={MIN_SUBAGENT_CONTEXT_TOKENS} max={MAX_SUBAGENT_CONTEXT_TOKENS} step={1} value={d.context} onChange={e => edit({ context: e.target.value })} /></Field>
+          <div className="subagent-chips" aria-label="上下文预设">{[128, 200, 272, 400, 1000].map(k => <button className="subagent-chip" key={k} type="button" aria-pressed={+d.context === k * 1000} onClick={() => edit({ context: String(k * 1000) })}>{k === 1000 ? '1M' : `${k}K`}</button>)}</div>
         </div>
       </div>
       <section className="subagent-compaction" aria-labelledby="compaction-title">
